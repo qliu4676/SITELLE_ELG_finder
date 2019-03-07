@@ -4,6 +4,7 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.stats import mad_std
 import scipy.stats as stats
+import re
 
 from utils import *
 
@@ -14,7 +15,7 @@ class Read_Raw_Datacube:
         self.name = name
         
         # Pixel scale, Step of wavenumber, Start of wavenumber, Number of steps
-        self.pix_scale = self.hdu[0].header["PIXSCAL1"] #arcsec/pixel
+#             self.pix_scale = self.hdu[0].header["PIXSCAL1"] #arcsec/pixel
         self.d_wavn = self.hdu[0].header["CDELT3"] #cm^-1 / pixel
         self.wavn_start = self.hdu[0].header["CRVAL3"] #cm^-1
         self.nstep = self.hdu[0].header["STEPNB"] 
@@ -30,19 +31,19 @@ class Read_Raw_Datacube:
         self.raw_datacube = self.hdu[0].data[wavn_eff_range][::-1]
         self.raw_stack_field = self.raw_datacube.sum(axis=0)
         
-        # Field edge to be masked
+        # Field edge/saturations to be masked
         self.mask_edge = self.raw_stack_field < 3*mad_std(self.raw_stack_field)
-        
+
         self.hdu_header_new = self.hdu[0].header.copy()
         self.hdu_header_new["CRVAL3"] = self.wavn[wavn_eff_range][0]  # New minimum wavenumber in cm-1
         self.hdu_header_new["STEPNB"] = np.sum(wavn_eff_range)   # New step
         
-    def display(self, img, vmax=None):
+    def display(self, img, vmax=None, a=0.1):
         # Display a image
         plt.figure(figsize=(12,12))
-        if vmax==None: vmax=vmax_2sig(img)
-        plt.imshow(img, vmin=0.,vmax=vmax, origin="lower",cmap="gray")
-        plt.show()
+#         if vmax==None: vmax=vmax_2sig(img)
+        norm = ImageNormalize(stretch=AsinhStretch(a=a))
+        plt.imshow(img, vmin=0.,vmax=vmax, norm=norm, origin="lower",cmap="gray")
         
     def save_mask_edge(self, save_path = './'):
         # Save the edge mask to be read later
@@ -71,11 +72,15 @@ class Read_Raw_Datacube:
             
             # Save background subtraction
             if plot:
-                display_background_sub(field, back)
+                fig = display_background_sub(field, back)
                 plt.savefig(save_path + "bkg_sub_channel%d.png"%(i+1),dpi=150)
                 plt.close(fig)  
                 
         self.stack_field = self.datacube_bkg_sub.sum(axis=0)
+        
+        # Possible Sources to be masked
+        mask_source = self.stack_field > 3*mad_std(self.stack_field)
+        self.mask_source = np.logical_or(mask_source, self.mask_edge)
 
     def remove_fringe(self, skip_frames=[None], box_size=8, filter_size=1, n_iter=5, save_path = None, plot=False):
         # Remove fringe and artifacts (high-frequency component)
@@ -86,13 +91,13 @@ class Read_Raw_Datacube:
             if i in skip_frames:
                 self.datacube_bkg_fg_sub[i] = field
             else:
-                field_sub, back = background_sub_SE(field, mask=self.mask_edge, 
+                field_sub, back = background_sub_SE(field, mask=self.mask_source, 
                                                     b_size=box_size, f_size=filter_size, n_iter=n_iter)
                 self.datacube_bkg_fg_sub[i] = field_sub
                 
                 # Save fringe subtraction
                 if plot:
-                    display_background_sub(field, back)
+                    fig = display_background_sub(field, back)
                     plt.savefig(save_path + "fg_sub_channel%d.png"%(i+1),dpi=150)
                     plt.close(fig)  
                     
@@ -115,9 +120,9 @@ class Read_Datacube:
         self.datacube = self.hdu[0].data
         self.name = name
         self.z0 = z0
+      
         
         # Pixel scale, Step of wavenumber, Start of wavenumber, Number of steps
-        self.pix_scale = self.hdu[0].header["PIXSCAL1"] #arcsec/pixel
         self.d_wavn = self.hdu[0].header["CDELT3"] #cm^-1 / pixel
         self.wavn_start = self.hdu[0].header["CRVAL3"] #cm^-1
         self.nstep = self.hdu[0].header["STEPNB"] 
@@ -133,10 +138,19 @@ class Read_Datacube:
         # If run SE twice, read the second run SE catalog. Format should be ascii.sextractor
         self.Tab_SE = Table.read(SE_catalog, format="ascii.sextractor")
         
+        # For generating different templates 
         self.Temp_Lib = {}
         self.wavl_temps = {}
         self.Stddev_Temps = {}
         self.Line_ratios_Temps = {}
+        
+        # Fot CC using different templates
+        self.CC_zccs_Temps = {}
+        self.CC_Rs_Temps = {}
+        self.CC_SNRs_Temps = {}
+        self.CC_SNR_ps_Temps = {}
+        self.CCs_Temps  = {}
+        
         
     def read_mask(self, file_path):
         # Open edge mask
@@ -149,12 +163,16 @@ class Read_Datacube:
         self.img_seg = hdu_seg[0].data
         
     def calculate_seeing(self, R_pix = 10, mag_cut=0.25, sigma_guess=1., plot=False):
-        """Use the brigh star-like objects (class_star>0.7) to calculate 
-        # median seeing fwhm by fitting gaussian profiles
-        # R_pix : max range of profiles to be fitted (in pixel)
-        # magcut : percentage of cut in isophotal magnitude
-        # sigma_guess : initial guess of sigma of gaussian profile (in pixel) 
-        # plot : plot radial profile for each object in use"""
+        """ Use the brigh star-like objects (class_star>0.7) to calculate 
+            median seeing fwhm by fitting gaussian profiles.
+            
+        Parameters
+        ----------
+        R_pix : max range of profiles to be fitted (in pixel)
+        magcut : percentage of cut in isophotal magnitude
+        sigma_guess : initial guess of sigma of gaussian profile (in pixel) 
+        plot : plot radial profile for each object in use
+        """
         
         from scipy.optimize import curve_fit
         def gaussian_func(x, a, sigma):
@@ -169,51 +187,58 @@ class Read_Datacube:
                     & (np.sqrt(self.Tab_SE["A_IMAGE"]**2+self.Tab_SE["B_IMAGE"]**2)<self.Tab_SE["KRON_RADIUS"])
         
         self.Tab_star = self.Tab_SE[star_cond]
-        
-        FWHMs = np.array([])
-        for star in self.Tab_star:
+        if len(self.Tab_star)<5:
+            print("Mag cut too low. No enough target stars.")
+        else:
+            FWHMs = np.array([])
+            for star in self.Tab_star:
 
-            x_c, y_c = coord_ImtoArray(star["X_IMAGE"], star["Y_IMAGE"])
-            x_min, x_max = (x_c-R_pix).astype("int"), (x_c+R_pix).astype("int")
-            y_min, y_max = (y_c-R_pix).astype("int"), (y_c+R_pix).astype("int")
-            if (np.min([x_min, y_min])<=0) | (np.max([x_max, y_max])>=np.min(self.datacube.shape[1:])): # ignore edge
-                continue
-                
-            cube_thumb = self.datacube[:,x_min:x_max, y_min:y_max]
-            img_thumb = cube_thumb.sum(axis=0)
-            
-            x, y = np.indices((img_thumb.shape))
-            rr = np.sqrt((x - (x_c-x_min))**2 + (y - (y_c-y_min))**2)
-            x, y = rr.ravel()/rr.max(), img_thumb.ravel()/img_thumb.ravel().max()
-            
-            # Fit the profile with gaussian and return seeing FWHM in arcsec
-            initial_guess = [1,sigma_guess/rr.max()]
-            popt, pcov = curve_fit(gaussian_func, x, y, p0=initial_guess)
-            sig_pix = abs(popt[1])*rr.max()  # sigma of seeing in pixel
-            FWHM = 2.355*sig_pix*0.322
-            FWHMs = np.append(FWHMs, FWHM)
-            self.seeing_fwhm = np.median(FWHMs)    
-            
-            if plot:
-                xplot = np.linspace(0,1,1000)
-                plt.scatter(x, y)
-                plt.plot(xplot, gaussian_func(xplot,*popt),"k")
-                plt.show() 
-                plt.close()
-                print(FWHM)  # seeing FWHM in arcsec
-              
-        print("Median seeing FWHM in arcsec: %.3f"%self.seeing_fwhm)
+                x_c, y_c = coord_ImtoArray(star["X_IMAGE"], star["Y_IMAGE"])
+                x_min, x_max = (x_c-R_pix).astype("int"), (x_c+R_pix).astype("int")
+                y_min, y_max = (y_c-R_pix).astype("int"), (y_c+R_pix).astype("int")
+                if (np.min([x_min, y_min])<=0) | (np.max([x_max, y_max])>=np.min(self.datacube.shape[1:])): # ignore edge
+                    continue
+
+                cube_thumb = self.datacube[:,x_min:x_max, y_min:y_max]
+                img_thumb = cube_thumb.sum(axis=0)
+
+                x, y = np.indices((img_thumb.shape))
+                rr = np.sqrt((x - (x_c-x_min))**2 + (y - (y_c-y_min))**2)
+                x, y = rr.ravel()/rr.max(), img_thumb.ravel()/img_thumb.ravel().max()
+
+                # Fit the profile with gaussian and return seeing FWHM in arcsec
+                initial_guess = [1,sigma_guess/rr.max()]
+                popt, pcov = curve_fit(gaussian_func, x, y, p0=initial_guess)
+                sig_pix = abs(popt[1])*rr.max()  # sigma of seeing in pixel
+                FWHM = 2.355*sig_pix*0.322
+                FWHMs = np.append(FWHMs, FWHM)
+                self.seeing_fwhm = np.median(FWHMs)    
+
+                if plot:
+                    xplot = np.linspace(0,1,1000)
+                    plt.scatter(x, y)
+                    plt.plot(xplot, gaussian_func(xplot,*popt),"k")
+                    plt.show() 
+                    plt.close()
+                    print(FWHM)  # seeing FWHM in arcsec
+
+            print("Median seeing FWHM in arcsec: %.3f"%self.seeing_fwhm)
         
     def spec_extraction(self, num, ext_type='opt', 
                         ks = np.arange(1.,4.5,0.2), k1=5., k2=8.,
                         print_out=False, plot=False, display=False):
         """Extract spectal using an optimal aperture, local background evaluated from (k1, k2) annulus
-        # num : SE object number
-        # ks : a set of aperture ring (in SE petrosian radius) to determined the optimized aperture
-        # k1, k2 : inner/outer radius (in SE petrosian radius) of annulus for evaluate background RMS
-        # print_out : print out the optimized k and S/N
-        # plot : plot the S/N vs k curve
-        # display: display the image thumbnail with apertures"""
+        
+        Parameters
+        
+        num : SE object number
+        ks : a set of aperture ring (in SE petrosian radius) to determined the optimized aperture
+        k1, k2 : inner/outer radius (in SE petrosian radius) of annulus for evaluate background RMS
+        print_out : print out the optimized k and S/N
+        plot : whether to plot the S/N vs k curve
+        display: whether to display the image thumbnail with apertures
+        
+        """
         
         tab = self.Tab_SE[self.Tab_SE["NUMBER"]==num]
         obj_SE = Object_SE(tab, cube=self.datacube, img_seg=self.img_seg, mask_field=self.mask_edge)
@@ -266,8 +291,25 @@ class Read_Datacube:
             
             
     def fit_continuum(self, spec, model='GP', edge_ratio=0.15, kernel_scale=100, kenel_noise=1e-3, plot=True):
-       
-        # Fit continuum    y: residual x: rebinned wavl in log linear
+        """Fit continuum for the extracted spectrum
+        
+        Parameters
+        ----------
+        spec : extracted spectrum
+        model : continuum model used to subtract from spectrum
+            "GP": flexible non-parametric continuum fitting
+                edge_ratio : filter band edge threshold (above which the edge is replaced with a median to avoid egde issue). 
+                             If None, use the meadian edge ratio determined from spectra of all detections.
+                kernel_scale : kernel scale of the RBF kernel
+                kenel_noise : noise level of the white kernel
+            "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted by a constant slope
+            
+        Returns
+        ----------
+        res : residual spectra
+        wavl_rebin : rebinned wavl in log linear
+        """
+        
         res, wavl_rebin, cont_range = fit_cont(spec, self.wavl, 
                                                model=model, edge_ratio=edge_ratio,
                                                kernel_scale=kernel_scale,  kenel_noise=kenel_noise, 
@@ -278,7 +320,19 @@ class Read_Datacube:
     def fit_continuum_all(self, model='GP', edge_ratio=None,
                           kernel_scale=100, kenel_noise=1e-3, 
                           plot=False, save_path=None):   
-    
+        """Fit continuum for all the detections
+        
+        Parameters
+        ----------
+        model : continuum model used to subtract from spectrum
+            "GP": flexible non-parametric continuum fitting
+                edge_ratio : filter band edge threshold (above which the edge is replaced with a median to avoid egde issue). 
+                             If None, use the meadian edge ratio determined from spectra of all detections.
+                kernel_scale : kernel scale of the RBF kernel
+                kenel_noise : noise level of the white kernel
+            "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted by a constant slope
+        """
+        
         if edge_ratio is None:
             # Stacked spectra to estimate edge ratio
             self.spec_stack = (self.obj_specs_opt/self.obj_specs_opt.max(axis=1).reshape(-1,1)).sum(axis=0)
@@ -294,7 +348,7 @@ class Read_Datacube:
                                                  plot=plot)
             self.obj_res_opt = np.vstack((self.obj_res_opt, res)) if num>1 else [res]
             if plot:
-                plt.savefig(save_path+"SE#%d.png"%(num),dpi=150)
+                plt.savefig(save_path+"SE#%d.png"%(num),dpi=100)
                 plt.close()
             print ("#%d spectra continuum fitted"%(num))
             
@@ -315,7 +369,7 @@ class Read_Datacube:
         hdu_wavl_rebin = fits.ImageHDU(data=self.wavl_rebin)
         
         hdul = fits.HDUList(hdus=[hdu_num, hdu_spec, hdu_aper, hdu_spec_opt, hdu_aper_opt, hdu_res_opt, hdu_wavl_rebin])
-        hdul.writeto(save_path+'%s-spec%s.fits'%(self.name, suffix), overwrite=True)
+        hdul.writeto(save_path+'%s-spec_%s.fits'%(self.name, suffix), overwrite=True)
         
         
     def read_spec(self, file_path):
@@ -334,44 +388,68 @@ class Read_Datacube:
         self.wavl_rebin = hdu_spec[6].data
         
         
-    def generate_template(self, temp_type="Ha-NII", line_ratio=[1,9,3], width=4, upper_ratio = 9,
-                          sig_gauss=3, model="gaussian", prior="sdss", n_intp=2, number=400):
-        """Generate template for with line ratio [Ha, NII6548, NII6584] and width [width]
-        # - For Gaussian models, fwhm(=2.355*sigma) between spectral resolution to galaxy broadening v=250km/s.
+    def generate_template(self, n_ratio=20, n_stddev=15,
+                          temp_type="Ha-NII", 
+                          temp_model="gauss", 
+                          ratio_prior="uniform", 
+                          ratio_range = (1.2, 9), n_intp=3, 
+                          sigma=3, line_ratio=[1,1,1], box_width=4):
+        
+        """Generate template(s) for cross-correlation.
+        
+        Parameters
+        ----------
+        temp_type : template type ("Ha-NII" or "Hb-OIII" or "OII")
+        temp_model : template line profile model ("gauss", "sincgauss" or "delta")
+        n_stddev/n_ratio : number of template=n_stddev*n_ratio, if >1 generate a template library 
+        n_intp : time of interpolation (controling the smoothness of CC function), 1 means no interpolation
+        
+        ratio_prior : template line ratios prior type ("sdss": sdss line ratio from MPA-JHU catalog, "uniform": uniform grid)  
+        ratio_range : range of line ratio (lower, upper) (only for the template library with "uniform" prior)
+        
+        line_ratio : template line ratio for three lines, from left to right (only used for single template)
+        sigma : template broadening (only used for single gauss template)
+        box_width : template width (only used for single delta/box template)     
+        
+        # For Gaussian models, fwhm(=2.355*sigma) between spectral resolution to galaxy broadening v=300km/s.
         # sigma_v = (v)/sqrt(3), sigma_gal = sigma_v/3e5 * 6563*(1+z_cluster) 
-        # - For delta function width=line_width"""
-        self.temp_type = temp_type
-        self.temp_model = model
         
-        self.n_intp = n_intp  #n_intp = 1 : no interpolation
+        # For delta function width=box_width"""
+
         
-        box_wid = np.max([width, self.d_wavl])
-        self.temp, self.wavl_temp = generate_template(self.wavl, z=0, n_intp=n_intp,
-                                                      temp_type=temp_type, line_ratio=line_ratio, 
-                                                      sig_gauss=sig_gauss, line_width=box_wid, model=model)
+        self.n_intp = n_intp
+        
+        box_wid = np.max([box_width, self.d_wavl])
+        
+        if temp_type=="OII":
+            number = n_stddev
+        else:
+            number = n_ratio * n_stddev
+        print("Template: %s_%s  Total Number: %d"%(temp_type, temp_model, number))
         self.num_temp = number
-        if number>1:
-            
+        
+        if number>1:  # template library
             sig_gal = 300./np.sqrt(3)/3e5 * 6563*(1+self.z0)
-            if model=="gaussian":
+            if temp_model=="gauss":
                 sig_min = self.d_wavl/2.355
-            elif model=="sincgauss":
+            elif temp_model=="sincgauss":
                 sig_min = 0.1
             sig_max = np.sqrt(sig_min**2 + sig_gal**2)
             
-            if prior=="sdss":
+            if ratio_prior=="sdss":
                 self.Stddevs = stats.uniform.rvs(size=number) * (sig_max-sig_min) + sig_min
                 dist_line_ratio = np.loadtxt("./%s/SDSS-DR7_line_ratio.txt"%self.name)
                 line_ratios = np.random.choice(dist_line_ratio, size=number)   # note: Ha_NII6584 ratios
 #                 line_ratios = stats.lognorm.rvs(0.64, loc=1.81, scale=1.24, size=number)
-            elif prior=="uniform":    
-                stddevs = np.linspace(sig_min, sig_max, 20)
-                if temp_type=="OII":  # Single peaks
+
+            elif ratio_prior=="uniform":    
+                stddevs = np.linspace(sig_min, sig_max, n_stddev)
+                if temp_type=="OII":    # Single peaks
                     self.Stddevs = stddevs
-                else: # Triple peaks
-                    self.Stddevs = np.repeat(stddevs, number//20).reshape(number//20, 20).T.ravel()
-                    line_ratio = np.linspace(1.2, upper_ratio, number//20)  #[1, 10]
-                    line_ratios = np.repeat(line_ratio, 20).ravel()
+                else:    # Triple peaks
+                    self.Stddevs = np.repeat(stddevs, n_ratio).reshape(n_ratio, n_stddev).T.ravel()
+                    line_ratio = np.linspace(ratio_range[0], ratio_range[1])[::-1]  # line ratio from high to low
+                    line_ratios = np.repeat(line_ratio, n_stddev).ravel()
                 
             if temp_type=="Ha-NII":
                 self.Line_ratios = np.vstack([[1, 3*ratio, 3] for ratio in line_ratios])
@@ -379,144 +457,214 @@ class Read_Datacube:
                 z_temp = 6563*(1+self.z0)/6563.-1
                 
             elif temp_type=="Hb-OIII":        
-                self.Line_ratios = np.vstack([[1, 3, 3*ratio] for ratio in line_ratios])
-                z_temp = 6563*(1+self.z0)/4934.-1
+                self.Line_ratios = np.vstack([[1., 3, 3*ratio] for ratio in line_ratios])
+                z_temp = 6563*(1+self.z0)/4939.-1
                 
             elif temp_type=="OII":
-                number = len(self.Stddevs)
+                
                 self.Line_ratios = np.vstack([[1] for k in range(number)])
                 z_temp = 6563*(1+self.z0)/3727.-1
                 
             n_temp = int(len(self.wavl)) * n_intp +1
             temps = np.empty((number, n_temp))
+            
             for i, (lr, stddev) in enumerate(zip(self.Line_ratios, self.Stddevs)):
                 temps[i], self.wavl_temp = generate_template(self.wavl, z=z_temp, 
-                                                n_intp=n_intp, temp_type=temp_type,
-                                                line_ratio=lr, sig_gauss=stddev, 
-                                                line_width=box_wid, model=model, plot=False)
+                                                             temp_model=temp_model, temp_type=temp_type,
+                                                             line_ratio=lr, sigma=stddev, box_wid=box_wid, 
+                                                             n_intp=n_intp,  plot=False)
             self.temps = temps
-        else:
-            self.temps = self.temp
             
-        self.Temp_Lib[temp_type+"_"+model] = self.temps
-        self.wavl_temps[temp_type+"_"+model] = self.wavl_temp
-        self.Stddev_Temps[temp_type+"_"+model] = self.Stddevs
-        self.Line_ratios_Temps[temp_type+"_"+model] = self.Line_ratios
+        else:  # single template
+            self.temps, self.wavl_temp = generate_template(self.wavl, z=0, n_intp=n_intp,
+                                                          temp_type=temp_type, temp_model=temp_model, 
+                                                          line_ratio=line_ratio, sigma=sigma, box_wid=box_wid, 
+                                                          plot=False)
+            self.Stddevs, self.Line_ratios = 3, line_ratio
             
-    def cross_correlation(self, num, temp_type="Ha-NII", model="gaussian", thre=85, h_contrast=0.1, rv=None, method_intp="linear", plot=True):
-        """Cross-correlation for one SE detection
-        # rv : relative redshift and velocity to z=z0, keep None if not known (the first object in batch)
-        # w_l : half-width (in AA, rest-frame) of vicinity around Ha to be excluded when measuring noise RMS""" 
-
-        spec = self.obj_specs_opt[self.obj_nums==num][0]
+        typ_mod = temp_type + "_" + temp_model
+        
+        self.Temp_Lib[typ_mod] = self.temps
+        self.wavl_temps[typ_mod] = self.wavl_temp
+        self.Stddev_Temps[typ_mod] = self.Stddevs
+        self.Line_ratios_Temps[typ_mod] = self.Line_ratios
+            
+            
+    def cross_correlation(self, num, 
+                          temp_type="Ha-NII", 
+                          temp_model="gauss", 
+                          h_contrast=0.1, 
+                          kind_intp="linear", 
+                          rv=None, plot=True):
+        
+        """Cross-correlation for one SE detection.
+        
+        Parameters
+        ----------
+        num : number of object in the SE catalog
+        temp_type : template type ("Ha-NII" or "Hb-OIII" or "OII")
+        temp_model : template line profile model ("gauss", "sincgauss" or "delta")
+        kind_intp : scipy interp1d kind, default is "linear"
+        h_contrast : threshold of CC peak finding, relative to the highest peak
+        rv : relative velocity to z=z0, None if not computed yet (e.g. the first trial in the library, or single template)
+        
+        Returns
+        ----------
+        ccs : cross-correlation functions for each template
+        rv : relative velocity to z_sys
+        z_ccs : matched redshift for each template
+        Rs : peak significance for each template
+        Contrasts : peak contrast (peak_1/peak_2) for each template
+        SNRs : detection S/N (masking signal) for each template
+        SNR_ps : peak S/N (masking peak) for each template
+        """ 
             
         if plot:    
             fig, (ax1,ax2) = plt.subplots(nrows=2, ncols=1,figsize=(9,7))
         else:
             fig, (ax1,ax2) = None, (None, None)
-            
-#         y, x, cont_range = fit_continuum(spec, self.wavl, model=model, 
-#                                          kernel_scale=kernel_scale,  kenel_noise=kenel_noise, edge_ratio=edge_ratio,
-#                                          print_out=False, plot=plot, fig=fig, ax=ax0)
         
-        res = self.obj_res_opt[self.obj_nums==num][0]  # residual spectra
+        res = self.obj_res_opt[self.obj_nums==num][0]  # Read residual spectra
         
-        if self.num_temp==1:
-            self.Stddevs, self.Line_ratios = 3, None
+        # Read the template information, and pass to cross-correlation
+        temps = self.Temp_Lib[temp_type + "_" + temp_model]
+        wavl_temp = self.wavl_temps[temp_type + "_" + temp_model]
+        stddevs = self.Stddev_Temps[temp_type + "_" + temp_model]
+        line_ratios = self.Line_ratios_Temps[temp_type + "_" + temp_model]
         
-        temps = self.Temp_Lib[temp_type+"_"+model]
-        wavl_temp = self.wavl_temps[temp_type+"_"+model]
-        stddevs = self.Stddev_Temps[temp_type+"_"+model]
-        line_ratios = self.Line_ratios_Temps[temp_type+"_"+model]
-        
-        ccs, rv, z_ccs, Rs, SNRs, Contrasts, ind_best = xcor_SNR(res=res, wavl_rebin=self.wavl_rebin, 
-                                                temps=temps, wavl_temp=wavl_temp, 
-                                                n_intp=self.n_intp, 
-                                                method_intp=method_intp,
-                                                d_wavl=self.d_wavl, z_sys=self.z0, rv=rv, 
-                                                temp_type=temp_type, model=model,
-                                                temps_stddev=stddevs, 
-                                                temps_ratio=line_ratios, 
-                                                thre=thre,
-                                                h_contrast=h_contrast,
-                                                plot=plot, fig=fig, axes=(ax1,ax2))
+        ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps = xcor_SNR(res=res, wavl_rebin=self.wavl_rebin, 
+                                                               temps=temps, wavl_temp=wavl_temp, 
+                                                               d_wavl=self.d_wavl, z_sys=self.z0, 
+                                                               n_intp=self.n_intp, kind_intp=kind_intp,                                                                 
+                                                               temp_type=temp_type, temp_model=temp_model,
+                                                               temps_stddev=stddevs, temps_ratio=line_ratios, 
+                                                               h_contrast=h_contrast, rv=rv, 
+                                                               plot=plot, fig=fig, axes=(ax1,ax2))
         if plot: plt.tight_layout()
-        
-        z_best = z_ccs[np.argmax(SNRs)]
-        line_at_edge = ((1+z_best)*6563.<(self.wavl[0]+20)) | ((1+z_best)*6563.>(self.wavl[-1]-20))
-                                
-        print ("SE Objects #%d  Peak S/N med: %.3g  max: %.3g  Detction S/N: %.3f"%(num, np.median(SNRs), np.max(SNRs), SNRs[ind_best]))
-        
-        if line_at_edge: 
-            flag = 2  # near the wavelength edge, raise caution
-        else: 
-            flag = 0
             
-        return ccs, rv, z_ccs, Rs, SNRs, Contrasts, ind_best, flag
+        r_max = np.argmax(Rs)    
+        print ("SE Object #%d  z: %.3f  Peak R: %.3f  Detction S/N: %.3f Peak S/N: %.3f"\
+                               %(num, z_ccs[r_max], Rs[r_max], SNRs[r_max], SNR_ps[r_max]))
+        
+#         z_best = z_ccs[r_max]
+#         line_at_edge = ((1+z_best)*6563.<(self.wavl[0]+20)) | ((1+z_best)*6563.>(self.wavl[-1]-20))   
+#         if line_at_edge: 
+#             flag = 2  # near the filter edge, raise caution
+#         else: 
+#             flag = 0
+            
+        return ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps
 
-    def cross_correlation_all(self, temp_type="Ha-NII", model="gaussian"):
-        self.cc_nums = np.array([], dtype="int")
+    def cross_correlation_all(self, 
+                              temp_type="Ha-NII", 
+                              temp_model="gauss",
+                              kind_intp="linear",
+                              h_contrast=0.1):
+        """Cross-correlation for all SE detections in the catalog.
+        
+        Parameters
+        ----------
+        temp_type : template type ("Ha-NII" or "Hb-OIII" or "OII")
+        temp_model : template line profile model ("gauss", "sincgauss" or "delta")
+        kind_intp : scipy interp1d kind, default is "linear"
+        h_contrast : threshold of CC peak finding, relative to the highest peak
+        """ 
+        
+        self.temp_type = temp_type
+        self.temp_model = temp_model
+        typ_mod = temp_type + "_" + temp_model
+        self.typ_mod = typ_mod
+        
+        self.temps = self.Temp_Lib[typ_mod]
+        
+        self.cc_nums = np.array([], dtype="int64")
         self.CC_zccs = np.zeros((len(self.obj_nums), len(self.temps)))
+        self.CC_Rs = np.zeros((len(self.obj_nums), len(self.temps)))
         self.CC_SNRs = np.zeros((len(self.obj_nums), len(self.temps)))
-        self.cc_inds = np.array([], dtype="int")
-        self.cc_flags = np.array([], dtype="int")
+        self.CC_SNR_ps = np.zeros((len(self.obj_nums), len(self.temps)))
+        
       
         for j, num in enumerate(self.obj_nums):
             if j==0:
-                ccs, rv0, z_ccs, Rs, SNRs, Contrasts, ind_best, flag = self.cross_correlation(num, temp_type=temp_type, model=model,rv=None, plot=False)
+                ccs, rv0, z_ccs, Rs, Contrasts, SNRs, SNR_ps = self.cross_correlation(num, h_contrast=h_contrast, 
+                                                                              temp_type=temp_type, temp_model=temp_model, 
+                                                                              kind_intp=kind_intp, rv=None, plot=False)
                 self.rv = rv0
             else:
-                ccs, rv, z_ccs, Rs, SNRs, Contrasts, ind_best, flag = self.cross_correlation(num, temp_type=temp_type, model=model, rv=self.rv, plot=False)
+                ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps = self.cross_correlation(num, h_contrast=h_contrast, 
+                                                                             temp_type=temp_type, temp_model=temp_model, 
+                                                                             kind_intp=kind_intp, rv=self.rv, plot=False)
                
             self.CC_zccs[j] = z_ccs
+            self.CC_Rs[j] = Rs
             self.CC_SNRs[j] = SNRs
+            self.CC_SNR_ps[j] = SNR_ps
             self.CCs = np.concatenate([self.CCs, [ccs]]) if len(self.cc_nums)>0 else [ccs]
-            self.cc_inds = np.append(self.cc_inds, ind_best)
-            self.cc_flags = np.append(self.cc_flags, flag)
             
             self.cc_nums = np.append(self.cc_nums, num)
-
+        
+        
+        
+        self.CC_zccs_Temps[typ_mod] = self.CC_zccs
+        self.CC_Rs_Temps[typ_mod] = self.CC_Rs
+        self.CC_SNRs_Temps[typ_mod] = self.CC_SNRs
+        self.CC_SNR_ps_Temps[typ_mod] = self.CC_SNR_ps
+        self.CCs_Temps[typ_mod] = self.CCs
+        
             
     def save_cc_fits(self, save_path='./', suffix=""): 
-        """Save cross-correlation results (SNR, z, CC funtion, flag, index) as fits"""
-        hdu_cc_nums = ffits.PrimaryHDU(self.cc_nums)
+        """Save cross-correlation results as fits"""
+        
+        hdu_cc_nums = fits.PrimaryHDU(np.int64(self.cc_nums))
+        hdu_CC_Rs = fits.ImageHDU(data=self.CC_Rs)
         hdu_CC_SNRs = fits.ImageHDU(data=self.CC_SNRs)
+        hdu_CC_SNR_ps = fits.ImageHDU(data=self.CC_SNR_ps)
         hdu_CC_zccs = fits.ImageHDU(data=self.CC_zccs)
-        hdu_CCs = fits.ImageHDU(data=self.CCs)
-        hdu_cc_flag = fits.BinTableHDU.from_columns([fits.Column(name="cc_flags",array=self.cc_flags,format="J")])
-        hdu_cc_nums = fits.BinTableHDU.from_columns([fits.Column(name="cc_nums",array=self.cc_nums,format="J")])
+#         hdu_CCs = fits.ImageHDU(data=self.CCs)
 
-        hdul = fits.HDUList(hdus=[hdu_cc_nums, hdu_CC_SNRs, hdu_CC_zccs, hdu_CCs, hdu_cc_flag])
-        hdul.writeto(save_path+'%s-cc%s.fits'%(self.name, suffix), overwrite=True) 
+        hdul = fits.HDUList(hdus=[hdu_cc_nums, hdu_CC_Rs, hdu_CC_SNRs, hdu_CC_SNR_ps, hdu_CC_zccs])
+        print("Saving cross-correlation results for %s using %s templates"%(self.name, self.typ_mod))
+        hdul.writeto(save_path+'%s-cc_%s_%s.fits'%(self.name, self.typ_mod, suffix), overwrite=True) 
         
-    def read_cc(self, filepath):
-        hdu_cc = fits.open(filepath)
+    def read_cc(self, filename):
+        """Read cross-correlation results""" 
         
-        self.CC_SNRs = hdu_cc[0].data
-        self.CC_SNR_max = np.max(self.CC_SNRs, axis=1)
-        sn_max = np.argmax(self.CC_SNRs, axis=1)
+        _, temp_type, temp_model, _ = re.split(r'\s|_', filename)
+        typ_mod = temp_type + "_" + temp_model
+        self.typ_mod = typ_mod
+        print("Read cross-correlation result... Template:%s"%(typ_mod))
         
-        self.CC_zccs = hdu_cc[1].data
-        self.z_best = np.array([self.CC_zccs[i, sn_max[i]] for i in range(len(self.CC_SNRs))])
+        hdu_cc = fits.open(filename)
+        self.cc_nums = hdu_cc[0].data
         
-        self.CCs = hdu_cc[2].data
-        self.CC_best = np.array([self.CCs[i, sn_max[i]] for i in range(len(self.CC_SNRs))])
+        self.CC_Rs = hdu_cc[1].data
+        inds_best = np.argmax(self.CC_Rs, axis=1)
         
-        self.cc_flags = hdu_cc[3].data['cc_flags']
-        self.cc_nums = hdu_cc[4].data['cc_nums']
+        self.CC_SNRs = hdu_cc[2].data
+        self.SNR_best = np.array([self.CC_SNRs[i, inds_best[i]] for i in range(len(self.cc_nums))])
         
-#         self.cc_nums = hdu_cc[0].data
-#         self.CC_SNRs = hdu_cc[1].data
-#         self.CC_SNR_max = np.max(self.CC_SNRs, axis=1)
-#         sn_max = np.argmax(self.CC_SNRs, axis=1)
+        self.CC_SNR_ps = hdu_cc[3].data
+        self.SNRp_best = np.array([self.CC_SNR_ps[i, inds_best[i]] for i in range(len(self.cc_nums))])
         
-#         self.CC_zccs = hdu_cc[2].data
-#         self.z_best = np.array([self.CC_zccs[i, sn_max[i]] for i in range(len(self.CC_SNRs))])
+        self.CC_zccs = hdu_cc[4].data
+        self.z_best = np.array([self.CC_zccs[i, inds_best[i]] for i in range(len(self.cc_nums))])
         
-#         self.CCs = hdu_cc[3].data
-#         self.CC_best = np.array([self.CCs[i, sn_max[i]] for i in range(len(self.CC_SNRs))])
+        self.line_stddev_best = self.Stddev_Temps[self.typ_mod][inds_best]
         
-#         self.cc_flags = hdu_cc[4].data['cc_flags']
+        if np.ndim(self.Line_ratios_Temps[self.typ_mod])==2:
+            self.line_ratio_best = (self.Line_ratios_Temps[self.typ_mod].max(axis=1)/3.)[inds_best]
+        else:
+            self.line_ratio_best = np.ones_like(self.cc_nums)*10
+        
+#         CCs = hdu_cc[5].data
+#         self.CC_best = np.array([CCs[i, inds_best[i]] for i in range(len(self.cc_nums))])
+        
+        self.CC_zccs_Temps[typ_mod] = self.CC_zccs
+        self.CC_Rs_Temps[typ_mod] = self.CC_Rs
+        self.CC_SNRs_Temps[typ_mod] = self.CC_SNRs
+        self.CC_SNR_ps_Temps[typ_mod] = self.CC_SNR_ps
+        
+        
     
     def read_cluster_boundary(self, filepath):
         """Read Cluster boundary map and BCG position, only for double cluster"""
@@ -524,19 +672,65 @@ class Read_Datacube:
         
     def assign_BCG_position(self, id_BCG):
         """Assign BCG position (x, y) in pixel from id_BCG, ((x1,y1),(x2,y2)) for double cluster"""
-        if np.ndim(id_BCG)==0:
-            self.pos_BCG = (self.Tab_SE[id_BCG]["X_IMAGE"], self.Tab_SE[id_BCG]["Y_IMAGE"])
-        elif np.ndim(id_BCG)==1:
-            pos_BCG1 = (self.Tab_SE[id_BCG[0]]["X_IMAGE"], self.Tab_SE[id_BCG[0]]["Y_IMAGE"])
-            pos_BCG2 = (self.Tab_SE[id_BCG[1]]["X_IMAGE"], self.Tab_SE[id_BCG[1]]["Y_IMAGE"])
-            self.pos_BCG = np.vstack([pos_BCG1,pos_BCG2])
+        if id_BCG is not None:
+            if np.ndim(id_BCG)==0:
+                self.pos_BCG = (self.Tab_SE[id_BCG]["X_IMAGE"], self.Tab_SE[id_BCG]["Y_IMAGE"])
+            elif np.ndim(id_BCG)==1:
+                pos_BCG1 = (self.Tab_SE[id_BCG[0]]["X_IMAGE"], self.Tab_SE[id_BCG[0]]["Y_IMAGE"])
+                pos_BCG2 = (self.Tab_SE[id_BCG[1]]["X_IMAGE"], self.Tab_SE[id_BCG[1]]["Y_IMAGE"])
+                self.pos_BCG = (pos_BCG1,pos_BCG2)
+            return self.pos_BCG
+        else:
+            print("BCG is not in the field. Assign BCG position mannually: Datacube.pos_BCG=(x,y) (in pix)")
+            
+    def assign_BCG_coordinate(self, coord_BCG):
+        """Assign BCG position (ra, dec) in deg from id_BCG, ((ra1,dec1),(ra2,dec2)) for double cluster""" 
+        # WCS
+        self.wcs = WCS(self.hdu[0].header, naxis=2)
+        if np.ndim(coord_BCG)==1:
+            self.coord_BCG = SkyCoord(coord_BCG[0], coord_BCG[1], frame='icrs', unit="deg")
+            print("BCG coordinate: ", self.coord_BCG.to_string('hmsdms'))
+        elif np.ndim(coord_BCG)==2:
+            coord_BCG1 = SkyCoord(coord_BCG[0][0], coord_BCG[0][1], frame='icrs', unit="deg")
+            coord_BCG2 = SkyCoord(coord_BCG[1][0], coord_BCG[1][1], frame='icrs', unit="deg")
+            self.coord_BCG = (coord_BCG1, coord_BCG2)
+            print("BCG1 coordinate: ", coord_BCG1.to_string('hmsdms'))
+            print("BCG2 coordinate: ", coord_BCG2.to_string('hmsdms'))
         
-    def centroid_analysis(self, num, z=None, k_wid=5, centroid_type="ISO2", plot=True):
+        
+    def centroid_analysis(self, num, z=None, k_wid=5, 
+                          centroid_type="APER", coord_type="angular",
+                          fix_window=True, plot=True):
+        """Centroid analysis for one candidate.
+        
+        Parameters
+        ----------
+        num : number of object in the SE catalog
+        z : candidate redshift
+        k_wid : half-width of the thumbnail (note: not to be too small)
+        centroid_type : method of computing centroid position for emission and continua
+            "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
+            "ISO2" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
+        coord_type : method of computing cluster-centric vector 
+            "angular" : use wcs coordinate (TAN-SIP corrected)
+            "euclid" : use pixel position
+        fix_window : whether to fix the emission window. True for non-candidate.
+        
+        Returns
+        ----------
+        d_angle : angle difference between emission-to-continuum vector and cluster-centric vector
+        offset : centroid offset of emission and contiuum distribution (in pixel)
+        dist_clus : distance to cluster center (in pixel)
+        """ 
+        
         ind = (self.obj_nums==num)
+        
         obj_SE = Object_SE(self.Tab_SE[ind], k_wid=k_wid, cube=self.datacube,
                            img_seg=self.img_seg, mask_field=self.mask_edge)
+        self.obj_SE=obj_SE
+
         spec = self.obj_specs_opt[ind][0]
-        
+
         if centroid_type == "APER":
             k_aper =  self.k_apers_opt[ind][0]
         else:
@@ -551,53 +745,129 @@ class Read_Datacube:
             boundary_map = None
             
         try:
+            snr = self.SNR_best[ind]
+            if fix_window:
+                lstd, lr = 4., 10.
+            else:
+                lstd, lr = self.line_stddev_best[ind], self.line_ratio_best[ind]
+
             d_angle, offset, dist_clus = compute_centroid_offset(obj_SE, spec=spec, wavl=self.wavl, 
-                                                                 z_cc=z, centroid_type=centroid_type, k_aper=k_aper, 
-                                                                 pos_BCG = self.pos_BCG, affil_map=boundary_map, plot=plot)
+                                                                 k_aper=k_aper, z_cc=z,
+                                                                 pos_BCG = self.pos_BCG,
+                                                                 coord_BCG = self.coord_BCG, 
+                                                                 wcs = self.wcs, 
+                                                                 centroid_type=centroid_type, 
+                                                                 coord_type=coord_type, 
+                                                                 line_snr=snr, line_stddev=lstd, line_ratio=lr,
+                                                                 affil_map=boundary_map, plot=plot)
             return (d_angle, offset, dist_clus)
         
         except (ValueError, TypeError) as error:
             print("Unable to compute centroid! Error raised.")
             return (np.nan, np.nan, np.nan)
     
-    def centroid_analysis_all(self, k_wid=5, snr_control=3, centroid_type="ISO2", plot=False):
-        """Compute centroid offset and angle for all SE detections"""
+    def centroid_analysis_all(self, Num_v, k_wid=5, 
+                              centroid_type="APER", coord_type="angular", 
+                              plot=False):
+        """Compute centroid offset and angle for all SE detections
+        
+        Parameters
+        ----------
+        Num_v : number list of target candiate in the SE catalog
+        k_wid : half-width of the thumbnail (note: not to be too small)
+        centroid_type : method of computing centroid position for emission and continua
+            "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
+            "ISO2" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
+        coord_type : method of computing cluster-centric vector 
+            "angular" : use wcs coordinate (TAN-SIP corrected)
+            "euclid" : use pixel position
+        """
+        
         self.centroid_type = centroid_type
         self.diff_angles = np.array([]) 
         self.diff_centroids = np.array([])
         self.dist_clus_cens = np.array([])
+        print("Current Model: ", self.typ_mod)
         for num in self.obj_nums:
             print("#EL-%1d"%num)
             ind = (self.obj_nums==num)
-            snr_max = self.CC_SNR_max[ind]
 
-            if snr_max < snr_control:  # For non-emission galaxies, pick a random window excluding the edge
-                z = np.random.uniform(low=(self.wavl[0]+75)/6563.-1, 
-                                      high=(self.wavl[-1]-75)/6563.-1)
-            else: # For emission galaxies, pick a window 70A aorund emission
-                z = self.z_best[ind]          
-
+            if num in Num_v:  # For emission galaxies, pick a window 70A aorund emission
+                z = self.z_best[ind]
+                fix_w = False
+          
+            else:  # For non-emission galaxies, pick a random window excluding the edge 
+                z = np.random.uniform(low=(self.wavl[0]+50)/6563.-1, 
+                                      high=(self.wavl[-1]-50)/6563.-1)
+                fix_w = True
+                
             diff_angle, centroid_offset, dist_clus_cen = self.centroid_analysis(num, z=z, k_wid=k_wid, 
-                                                                                centroid_type=centroid_type, plot=False)
+                                                                                centroid_type=centroid_type, 
+                                                                                coord_type=coord_type,
+                                                                                fix_window=fix_w, plot=False)
+                
             self.diff_angles = np.append(self.diff_angles, diff_angle)
             self.diff_centroids = np.append(self.diff_centroids, centroid_offset)
             self.dist_clus_cens = np.append(self.dist_clus_cens, dist_clus_cen)
         
-    def construct_control(self, bootstraped=False, mag_per=(2.5, 97.5), snr_control=3, n_boot=100):
-        """Construct control sample for comparison"""
+    def construct_control(self, Num_v, mag_cut=None, dist_cut=25, bootstraped=False, n_boot=100):
+        """Construct control sample for comparison
+        
+        Parameters
+        ----------
+        Num_v : number list to be excluded in the control sample in the SE catalog
+        mag_cut: magnitude range (lower, upper)
+        dist_cut : minium distance (in pixel) to the field edge
+        
+        """
         # remove nan values that fail in centroid analysis
-        Num_c = np.setdiff1d(self.Tab_SE["NUMBER"][self.CC_SNR_max<snr_control], 
-                             1+np.where(np.isnan(self.diff_centroids))[0])
+        Num_not_v = np.setdiff1d(self.Tab_SE["NUMBER"], Num_v)
+        ind_not_v = Num_not_v - 1
+        Num_c_all = np.setdiff1d(self.Tab_SE["NUMBER"][ind_not_v], 
+                                 1 + np.where(np.isnan(self.diff_centroids))[0])
         
         # magnitude cut
         mag = -2.5*np.log10(self.Tab_SE["FLUX_AUTO"])
         mag_no_nan = mag[~np.isnan(mag)]
-        mag_cut = (np.percentile(mag_no_nan, mag_per[0]), np.percentile(mag_no_nan, mag_per[1]))
-        num_mag = self.Tab_SE["NUMBER"][(mag>mag_cut[0])&(mag<mag_cut[1])]
-        Num_c = np.intersect1d(Num_c, num_mag)
+        
+        if mag_cut is None:
+            mag_cut = (mag.min(),mag.max())
+            
+        Num_mag_ctrl = self.Tab_SE["NUMBER"][(mag>mag_cut[0])&(mag<mag_cut[1])]
+        Num_c = np.intersect1d(Num_c_all, Num_mag_ctrl)
+        
+        # area cut
+        thre_iso_area = np.percentile(self.Tab_SE["ISOAREA_IMAGE"],25)
+        print("Isophotal area threshold: ", thre_iso_area)
+        Num_area_ctrl = self.Tab_SE["NUMBER"][[self.Tab_SE["ISOAREA_IMAGE"]>thre_iso_area]]
+        
+        Num_c = np.intersect1d(Num_c, Num_area_ctrl)
+        
+#         # SNR cut
+#         thre_snr = np.percentile(self.SNRp_best,90)
+#         print("peak S/N threshold: ", thre_iso_area)
+#         Num_snr_ctrl = self.Tab_SE["NUMBER"][(self.SNRp_best<thre_snr)]
+#         Num_c = np.intersect1d(Num_c, Num_snr_ctrl)
+        
+        # elongation cut < 2 sigma
+        thre_elong = np.percentile(self.Tab_SE["ELONGATION"],97.5)
+        Num_elong_ctrl = self.Tab_SE["NUMBER"][self.Tab_SE["ELONGATION"]<thre_elong]
+        Num_c = np.intersect1d(Num_c, Num_elong_ctrl)
+        
+        # edge cut
+        Y_pix, X_pix = np.indices(self.mask_edge.shape)
+        dist_edge = np.array([np.sqrt((X_pix[~self.mask_edge]-gal["X_IMAGE"])**2 + \
+                              (Y_pix[~self.mask_edge]-gal["Y_IMAGE"])**2).min() \
+                              for gal in self.Tab_SE])
+        self.dist_edge = dist_edge
+        print("Distance to field edge threshold: ", dist_cut)
+        Num_edge_ctrl = self.Tab_SE["NUMBER"][dist_edge>dist_cut]
+        Num_c = np.intersect1d(Num_c, Num_edge_ctrl)
         
         print('Control Sample : n=%d'%len(Num_c))
+        self.Num_c = Num_c
         ind_c = Num_c - 1
+        
         self.diff_angles_c = self.diff_angles[ind_c]
         self.diff_centroids_c = self.diff_centroids[ind_c]
         self.dist_clus_cens_c = self.dist_clus_cens[ind_c]
