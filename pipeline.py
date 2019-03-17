@@ -9,7 +9,7 @@ import re
 from utils import *
 
 class Read_Raw_Datacube: 
-    def __init__(self, file_path, name):
+    def __init__(self, file_path, name, wavn_range=[12100, 12550]):
         self.hdu = fits.open(file_path)
         self.header = self.hdu[0].header
         self.name = name
@@ -24,7 +24,7 @@ class Read_Raw_Datacube:
         self.wavn = np.linspace(self.wavn_start, self.wavn_start+(self.nstep-1)*self.d_wavn, self.nstep)  #cm^-1
         
         # Effective data range from 12100 cm^-1 to 12550 cm^-1 
-        wavn_eff_range = (self.wavn>12100) & (self.wavn<12550)
+        wavn_eff_range = (self.wavn>wavn_range[0]) & (self.wavn<wavn_range[1])
         self.wavl = 1./self.wavn[wavn_eff_range][::-1]*1e8
         
         # Raw effective datacube and stack field in wavelength
@@ -114,13 +114,16 @@ class Read_Raw_Datacube:
         hdu_stack.writeto(save_path + '%s_stack%s.fits'%(self.name, suffix),overwrite=True)
         
 class Read_Datacube:
-    def __init__(self, file_path, name, SE_catalog, z0=None):
-        self.hdu = fits.open(file_path)
+    def __init__(self, cube_path, name, SE_catalog, deep_frame=None, z0=None):
+        self.hdu = fits.open(cube_path)
         self.header = self.hdu[0].header
         self.datacube = self.hdu[0].data
         self.name = name
         self.z0 = z0
-      
+        if deep_frame is not None:
+            self.deep_frame = fits.open(deep_frame)[0].data
+        else:
+            self.deep_frame = None
         
         # Pixel scale, Step of wavenumber, Start of wavenumber, Number of steps
         self.d_wavn = self.hdu[0].header["CDELT3"] #cm^-1 / pixel
@@ -369,7 +372,7 @@ class Read_Datacube:
         hdu_wavl_rebin = fits.ImageHDU(data=self.wavl_rebin)
         
         hdul = fits.HDUList(hdus=[hdu_num, hdu_spec, hdu_aper, hdu_spec_opt, hdu_aper_opt, hdu_res_opt, hdu_wavl_rebin])
-        hdul.writeto(save_path+'%s-spec_%s.fits'%(self.name, suffix), overwrite=True)
+        hdul.writeto(save_path+'%s-spec%s.fits'%(self.name, suffix), overwrite=True)
         
         
     def read_spec(self, file_path):
@@ -698,9 +701,9 @@ class Read_Datacube:
             print("BCG2 coordinate: ", coord_BCG2.to_string('hmsdms'))
         
         
-    def centroid_analysis(self, num, z=None, k_wid=5, 
+    def centroid_analysis(self, num, z=None, k_wid=6, 
                           centroid_type="APER", coord_type="angular",
-                          fix_window=True, plot=True):
+                          fix_window=True, emission_type="subtract", aperture_type="separate",plot=True):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -726,7 +729,7 @@ class Read_Datacube:
         ind = (self.obj_nums==num)
         
         obj_SE = Object_SE(self.Tab_SE[ind], k_wid=k_wid, cube=self.datacube,
-                           img_seg=self.img_seg, mask_field=self.mask_edge)
+                           img_seg=self.img_seg, deep_frame=self.deep_frame, mask_field=self.mask_edge)
         self.obj_SE=obj_SE
 
         spec = self.obj_specs_opt[ind][0]
@@ -751,6 +754,10 @@ class Read_Datacube:
             else:
                 lstd, lr = self.line_stddev_best[ind], self.line_ratio_best[ind]
 
+            if plot:
+                deep_img = obj_SE.deep_thumb
+            else:
+                deep_img = None
             d_angle, offset, dist_clus = compute_centroid_offset(obj_SE, spec=spec, wavl=self.wavl, 
                                                                  k_aper=k_aper, z_cc=z,
                                                                  pos_BCG = self.pos_BCG,
@@ -759,14 +766,18 @@ class Read_Datacube:
                                                                  centroid_type=centroid_type, 
                                                                  coord_type=coord_type, 
                                                                  line_snr=snr, line_stddev=lstd, line_ratio=lr,
-                                                                 affil_map=boundary_map, plot=plot)
+                                                                 affil_map=boundary_map, 
+                                                                 deep_img=deep_img, 
+                                                                 emission_type=emission_type,
+                                                                 aperture_type=aperture_type,
+                                                                 plot=plot)
             return (d_angle, offset, dist_clus)
         
         except (ValueError, TypeError) as error:
             print("Unable to compute centroid! Error raised.")
-            return (np.nan, np.nan, np.nan)
+            return (np.nan, 0, np.nan)
     
-    def centroid_analysis_all(self, Num_v, k_wid=5, 
+    def centroid_analysis_all(self, Num_v, k_wid=6, 
                               centroid_type="APER", coord_type="angular", 
                               plot=False):
         """Compute centroid offset and angle for all SE detections
@@ -795,22 +806,30 @@ class Read_Datacube:
             if num in Num_v:  # For emission galaxies, pick a window 70A aorund emission
                 z = self.z_best[ind]
                 fix_w = False
-          
+                emission_type="subtract"
+                aperture_type = "separate"
+#                 emission_type = "narrowband"
+                
             else:  # For non-emission galaxies, pick a random window excluding the edge 
-                z = np.random.uniform(low=(self.wavl[0]+50)/6563.-1, 
-                                      high=(self.wavl[-1]-50)/6563.-1)
+                z = np.random.uniform(low=(self.wavl[0]+25)/6563.-1, 
+                                      high=(self.wavl[-1]-25)/6563.-1)
                 fix_w = True
+                emission_type = "narrowband"
+                aperture_type = "single"
                 
             diff_angle, centroid_offset, dist_clus_cen = self.centroid_analysis(num, z=z, k_wid=k_wid, 
                                                                                 centroid_type=centroid_type, 
                                                                                 coord_type=coord_type,
-                                                                                fix_window=fix_w, plot=False)
+                                                                                fix_window=fix_w, 
+                                                                                emission_type=emission_type,
+                                                                                aperture_type=aperture_type,
+                                                                                plot=False)
                 
             self.diff_angles = np.append(self.diff_angles, diff_angle)
             self.diff_centroids = np.append(self.diff_centroids, centroid_offset)
             self.dist_clus_cens = np.append(self.dist_clus_cens, dist_clus_cen)
         
-    def construct_control(self, Num_v, mag_cut=None, dist_cut=25, bootstraped=False, n_boot=100):
+    def construct_control(self, Num_v, mag_cut=None, mag0=25.2, dist_cut=25, bootstraped=False, n_boot=100):
         """Construct control sample for comparison
         
         Parameters
@@ -827,7 +846,7 @@ class Read_Datacube:
                                  1 + np.where(np.isnan(self.diff_centroids))[0])
         
         # magnitude cut
-        mag = -2.5*np.log10(self.Tab_SE["FLUX_AUTO"])
+        mag = -2.5*np.log10(self.Tab_SE["FLUX_AUTO"])+mag0
         mag_no_nan = mag[~np.isnan(mag)]
         
         if mag_cut is None:
@@ -837,9 +856,9 @@ class Read_Datacube:
         Num_c = np.intersect1d(Num_c_all, Num_mag_ctrl)
         
         # area cut
-        thre_iso_area = np.percentile(self.Tab_SE["ISOAREA_IMAGE"],25)
+        thre_iso_area = 10.
         print("Isophotal area threshold: ", thre_iso_area)
-        Num_area_ctrl = self.Tab_SE["NUMBER"][[self.Tab_SE["ISOAREA_IMAGE"]>thre_iso_area]]
+        Num_area_ctrl = self.Tab_SE["NUMBER"][self.Tab_SE["ISOAREA_IMAGE"]>thre_iso_area]
         
         Num_c = np.intersect1d(Num_c, Num_area_ctrl)
         
@@ -848,6 +867,10 @@ class Read_Datacube:
 #         print("peak S/N threshold: ", thre_iso_area)
 #         Num_snr_ctrl = self.Tab_SE["NUMBER"][(self.SNRp_best<thre_snr)]
 #         Num_c = np.intersect1d(Num_c, Num_snr_ctrl)
+        
+        # radius cut
+        Num_rp_ctrl = self.Tab_SE["NUMBER"][(self.Tab_SE["PETRO_RADIUS"]>0)&(self.Tab_SE["PETRO_RADIUS"]<10)]        
+        Num_c = np.intersect1d(Num_c, Num_rp_ctrl)      
         
         # elongation cut < 2 sigma
         thre_elong = np.percentile(self.Tab_SE["ELONGATION"],97.5)
