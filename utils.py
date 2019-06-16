@@ -61,7 +61,7 @@ def display_background_sub(field, back):
     # Display and save background subtraction result with comparison 
     fig, (ax1,ax2,ax3) = plt.subplots(nrows=1,ncols=3,figsize=(16,5))
     ax1.imshow(field, origin="lower",cmap="gray", vmin=0., vmax=vmax_3sig(field))
-    ax2.imshow(back, origin='lower', cmap='gray', vmin=0., vmax=vmax_3sig(field))
+    ax2.imshow(back, origin='lower', cmap='gray', vmin=0., vmax=vmax_3sig(back))
     ax3.imshow(field - back, origin='lower', cmap='gray', vmin=0., vmax=vmax_3sig(field))
     plt.tight_layout()
     return fig
@@ -97,7 +97,7 @@ def measure_EW(spec, wavl, z, line_stddev=3, plot=False):
     
 # SE Object Pipeline start from here
 class Object_SE:
-    def __init__(self, obj, k_wid=8, cube=None, img_seg=None, deep_frame= None, mask_field=None):
+    def __init__(self, obj, k_wid=6, cube=None, img_seg=None, deep_frame= None, mask_field=None):
         self.num = obj["NUMBER"][0]
         self.X_IMAGE, self.Y_IMAGE = obj["X_IMAGE"][0], obj["Y_IMAGE"][0]
         self.x_c, self.y_c = coord_ImtoArray(self.X_IMAGE, self.Y_IMAGE)
@@ -123,6 +123,7 @@ class Object_SE:
         self.mask_seg_obj = (self.seg_thumb==obj["NUMBER"])
         
         self.cube_thumb = cube[:,self.x_min:(self.x_max+1), self.y_min:(self.y_max+1)]
+        self.img_thumb = self.cube_thumb.sum(axis=0)
         
         if deep_frame is not None:
             self.deep_thumb = deep_frame[self.x_min:(self.x_max+1), self.y_min:(self.y_max+1)]
@@ -721,10 +722,6 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
     
     if emission_type=="subtract":
         img_em = img_em - img_con
-    elif emission_type=="pixel":
-        img_em = img_em - np.min(img_em)
-        img_con = img_con - np.min(img_con)
-        img_em = img_em - img_con
     else:
         img_em = img_em
     
@@ -1026,29 +1023,29 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
     #------------#
     
     if plot:
-        plt.figure(figsize=(14,12))
+        plt.figure(figsize=(13,12))
         ax0 = plt.subplot2grid((3, 3), (0, 0), colspan=3, rowspan=1)
-        ax0.plot(wavl, spec, "whitesmoke",alpha=0.7,lw=2)
-        ax0.plot(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=2)
-        ax0.plot(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=2)
+        ax0.plot(wavl, spec, "k",alpha=0.7,lw=3)
+        ax0.plot(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=3)
+        ax0.plot(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=3)
         ax0.plot(wavl[em],spec[em],"steelblue",alpha=1,lw=2.5)
         ax0.axvline(np.max([wavl[0], em_range[0]]), color="steelblue", lw=1.5, ls="-.", alpha=0.7)
         ax0.axvline(np.min([wavl[-1], em_range[1]]), color="steelblue", lw=1.5, ls="-.", alpha=0.7)
-        ax0.set_xlabel('Wavelength ($\AA$)',fontsize=16)
-        ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2$)',fontsize=16)
-        ax0.text(0.9,0.9,"z = %.3f"%z_cc,color="k",fontsize=15,transform=ax0.transAxes)
+        ax0.set_xlabel('Wavelength ($\AA$)',fontsize=26)
+        ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2$)',fontsize=22)
+        ax0.text(0.85,0.85,"z = %.3f"%z_cc,color="k",fontsize=22,transform=ax0.transAxes)
 
         ax1 = plt.subplot2grid((3, 3), (1, 2), colspan=1, rowspan=1)
-        s = ax1.imshow(img_em, origin="lower",cmap="viridis",vmin=0.,vmax=2*vmax_5sig(img_em))
-        ax1.plot(x1, y1, "violet", marker="+", ms=10, mew=3,alpha=0.95)
+        s = ax1.imshow(img_em, origin="lower",cmap="viridis",vmin=0.,vmax=vmax_5sig(img_em))
+        ax1.plot(x1, y1, "violet", marker="+", ms=15, mew=3,alpha=0.95)
        
         loc = plticker.MultipleLocator(base=10) # this locator puts ticks at regular intervals
         ax1.xaxis.set_major_locator(loc)
         ax1.yaxis.set_major_locator(loc)
-        ax1.set_xticklabels(ax1.get_xticks().astype("int")+obj_SE.y_min,fontsize=10)
-        ax1.set_yticklabels(ax1.get_yticks().astype("int")+obj_SE.x_min,fontsize=10)
-        ax1.set_title("Emisson",color="k",fontsize=18)
-        plt.colorbar(s)
+        ax1.set_xticklabels(ax1.get_xticks().astype("int")+obj_SE.y_min,fontsize=15)
+        ax1.set_yticklabels(ax1.get_yticks().astype("int")+obj_SE.x_min,fontsize=15)
+#         ax1.set_title("Emisson",color="k",fontsize=18)
+#         plt.colorbar(s)
         if centroid_type != "APER":
             ax1s = plt.subplot2grid((3, 3), (1, 0), colspan=1, rowspan=1)
             ax1s.imshow(data_em, origin="lower",cmap="viridis",vmin=0,vmax=vmax_5sig(data_em))
@@ -1058,14 +1055,14 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
             
             
         ax2 = plt.subplot2grid((3, 3), (2, 2), colspan=1, rowspan=1)
-        s = ax2.imshow(img_con*np.sum(con), origin="lower",cmap="hot",vmin=0.,vmax=2*vmax_5sig(img_con*np.sum(con)))
-        ax2.plot(x2, y2, "lightgreen", marker="+", ms=10, mew=3,alpha=0.95)
+        s = ax2.imshow(img_con*np.sum(con), origin="lower",cmap="hot",vmin=0.,vmax=vmax_5sig(img_con*np.sum(con)))
+        ax2.plot(x2, y2, "lightgreen", marker="+", ms=15, mew=3,alpha=0.95)
         ax2.xaxis.set_major_locator(loc)
         ax2.yaxis.set_major_locator(loc)
-        ax2.set_xticklabels(ax2.get_xticks().astype("int")+obj_SE.y_min,fontsize=10)
-        ax2.set_yticklabels(ax2.get_yticks().astype("int")+obj_SE.x_min,fontsize=10)
-        ax2.set_title("Continuum",color="k",fontsize=18)
-        plt.colorbar(s)
+        ax2.set_xticklabels(ax2.get_xticks().astype("int")+obj_SE.y_min,fontsize=15)
+        ax2.set_yticklabels(ax2.get_yticks().astype("int")+obj_SE.x_min,fontsize=15)
+#         ax2.set_title("Continuum",color="k",fontsize=18)
+#         plt.colorbar(s)
         if centroid_type != "APER":
             ax2s = plt.subplot2grid((4, 3), (3, 2), colspan=1, rowspan=1)
             ax2s.imshow(data_con, origin="lower",cmap="hot",vmin=0.,vmax=vmax_5sig(data_con))
@@ -1087,29 +1084,30 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
 #             img_g = (img_con+img_em)/2.
 #             img_rgb = make_lupton_rgb(img_con, img_g, img_em, stretch=0.05, Q=10)
 #             ax.imshow(img_rgb, origin="lower", vmin=0., vmax=vmax_5sig(img_rgb), norm=norm)
-            ax.imshow(obj_SE.img_thumb, origin="lower", cmap="gray", vmin=0., vmax=2*vmax_5sig(obj_SE.img_thumb), norm=norm)
+            img = img_con*np.sum(con)
+            ax.imshow(img, origin="lower", cmap="gray", vmin=0., vmax=vmax_5sig(img))
         else:
-            ax.imshow(deep_img, origin="lower", cmap="gray", vmin=0., vmax=2*vmax_5sig(deep_img), norm=norm)
+            ax.imshow(deep_img, origin="lower", cmap="gray", vmin=0., vmax=vmax_5sig(deep_img), norm=norm)
         
         xlim,ylim = ax.get_xlim(),ax.get_ylim()
         if centroid_type == "APER":
-            for k, (aper1, aper2) in enumerate(zip(aper_ems,aper_cons)):
-                try:
-                    ls1 = '-' if (use_value_1[k]==True) else '--'
-                    ls2 = '-' if (use_value_2[k]==True) else '--'
-                    aper1.plot(color='violet',lw=1,ls=ls1,ax=ax1,alpha=0.9)
-                    aper2.plot(color='darkseagreen',lw=1,ls=ls2,ax=ax2,alpha=0.9) 
-                except AttributeError:
-                    pass                    
-            aper_em.plot(color='violet',lw=3,ax=ax,alpha=0.95)
-            aper_con.plot(color='darkseagreen',lw=3,ax=ax,alpha=0.95)
-        ax.contour(data_em,colors="lightblue",alpha=0.95, linewidths=2.5,
-                  levels = [0.25*data_em.max(),0.5*data_em.max(),0.75*data_em.max(),data_em.max()])
+#             for k, (aper1, aper2) in enumerate(zip(aper_ems,aper_cons)):
+#                 try:
+#                     ls1 = '-' if (use_value_1[k]==True) else '--'
+#                     ls2 = '-' if (use_value_2[k]==True) else '--'
+#                     aper1.plot(color='violet',lw=1,ls=ls1,ax=ax1,alpha=0.9)
+#                     aper2.plot(color='darkseagreen',lw=1,ls=ls2,ax=ax2,alpha=0.9) 
+#                 except AttributeError:
+#                     pass                    
+            aper_em.plot(color='violet',lw=3,ax=ax1,alpha=0.95)
+            aper_con.plot(color='darkseagreen',lw=3,ax=ax2,alpha=0.95)
+        ax.contour(data_em,colors="gold",alpha=0.9, linewidths=3.5,
+                  levels = [0.1*data_em.max(),0.45*data_em.max(),0.8*data_em.max(),data_em.max()])
         
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
-        ax.set_xlabel("X (pix)",fontsize=15)
-        ax.set_ylabel("Y (pix)",fontsize=15)
+        ax.set_xlabel("X (pix)",fontsize=28)
+        ax.set_ylabel("Y (pix)",fontsize=28)
         
 #         for k in range(len(aper_size)):
 #             for j in range(n_rand):
@@ -1119,28 +1117,28 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
 #         ax2.scatter(obj_SE.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj_SE.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=1)
 #         ax.scatter(obj_SE.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj_SE.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=5)
         
-        ax.plot(x1, y1, color="violet", marker="+", ms=20,mew=4,alpha=0.95, zorder=4)
-        ax.plot(x2, y2, color="lightgreen", marker="+", ms=20,mew=4,alpha=0.95, zorder=3)
+        ax.plot(x1, y1, color="violet", marker="+", ms=25,mew=5,alpha=0.95, zorder=4)
+        ax.plot(x2, y2, color="lightgreen", marker="+", ms=25,mew=5,alpha=0.95, zorder=3)
         ax.set_xticklabels(ax.get_xticks().astype("int")+obj_SE.y_min)
         ax.set_yticklabels(ax.get_yticks().astype("int")+obj_SE.x_min)
         if coord_type=="euclid":
-            ax.arrow(0.9,0.1,np.sin(pa)/15,np.cos(pa)/15,color="skyblue",
+            ax.arrow(0.85,0.15,np.sin(pa)/10,np.cos(pa)/10,color="skyblue",
                      head_width=0.02, head_length=0.02,transform=ax.transAxes)
-            ax.arrow(0.9,0.1,np.sin(clus_cen_angle)/15,np.cos(clus_cen_angle)/15,color="gold",
+            ax.arrow(0.85,0.15,np.sin(clus_cen_angle)/10,np.cos(clus_cen_angle)/10,color="orange",
                      head_width=0.02, head_length=0.02,transform=ax.transAxes)
         elif coord_type=="angular":
-            ax.arrow(0.9,0.1,-np.sin(pa*np.pi/180)/15,np.cos(pa*np.pi/180)/15,color="skyblue",
-                     head_width=0.02, head_length=0.02,transform=ax.transAxes,alpha=0.95)
-            ax.arrow(0.9,0.1,-np.sin(clus_cen_angle*np.pi/180)/15,np.cos(clus_cen_angle*np.pi/180)/15,color="gold",
-                     head_width=0.02, head_length=0.02,transform=ax.transAxes,alpha=0.95)
+            ax.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="skyblue",
+                     head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
+            ax.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
+                     head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
         
-        ax.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=16,transform=ax.transAxes)
-        ax.text(0.05,0.1,r"$\bf \Delta\,d:{\ }%.1f$"%centroid_offset,color="lavender",fontsize=16,transform=ax.transAxes)
+        ax.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=25,transform=ax.transAxes)
+        ax.text(0.05,0.12,r"$\bf \Delta\,d:{\ }%.1f$"%centroid_offset,color="lavender",fontsize=25,transform=ax.transAxes)
         mag_auto = -2.5*np.log10(obj_SE.flux_auto) + mag0
         #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
         if np.ndim(coord_BCG)>0:
             text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'lightblue')
-            ax.text(0.9, 0.9, text, color=color, fontsize=18, transform=ax.transAxes)
+            ax.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
         plt.subplots_adjust(left=0.05,right=0.95,top=0.95, bottom=0.05, wspace=0.2, hspace=0.25)
     
     return diff_angle, centroid_offset, dist_clus_cen, pa, clus_cen_angle, max_dev

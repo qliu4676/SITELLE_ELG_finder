@@ -73,7 +73,7 @@ class Read_Raw_Datacube:
             # Save background subtraction
             if plot:
                 fig = display_background_sub(field, back)
-                plt.savefig(save_path + "bkg_sub_channel%d.png"%(i+1),dpi=100)
+                plt.savefig(save_path + "bkg_sub_channel%d.pdf"%(i+1),dpi=100)
                 plt.close(fig)  
                 
         self.stack_field = self.datacube_bkg_sub.sum(axis=0)
@@ -553,7 +553,7 @@ class Read_Datacube:
                           temp_type="Ha-NII", 
                           temp_model="gauss", 
                           h_contrast=0.1, 
-                          edge=25,
+                          edge=30,
                           kind_intp="linear", 
                           rv=None, plot=True):
         
