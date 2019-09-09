@@ -1,9 +1,10 @@
+import os
+import re
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as plticker
-from scipy.optimize import curve_fit
 from scipy import interpolate, signal, integrate, stats
-from scipy.spatial.distance import pdist
 
 import pandas as pd
 
@@ -16,55 +17,237 @@ from astropy.modeling import models, fitting
 
 import astropy.units as u
 from astropy.wcs import WCS
-from astropy.coordinates import SkyCoord, ICRS, FK5
-from astropy.visualization import make_lupton_rgb, AsinhStretch
+from astropy.io import fits
+from astropy.visualization import LogStretch, SqrtStretch, AsinhStretch
 from astropy.visualization.mpl_normalize import ImageNormalize
+norm1 = ImageNormalize(stretch=LogStretch())
+norm2 = ImageNormalize(stretch=LogStretch())
 norm = ImageNormalize(stretch=AsinhStretch())
 
 from photutils import Background2D, SExtractorBackground
 from photutils import EllipticalAnnulus, EllipticalAperture, aperture_photometry
 
 from photutils import centroid_com, centroid_2dg
-from photutils import detect_sources, detect_threshold, deblend_sources, source_properties
+from photutils import detect_sources, deblend_sources, source_properties
 
+############################################
+# Basic
+############################################
+
+def sigmoid(x,x0=0):
+    return 1. / (1 + np.exp(-(x-x0)))
+
+def gaussian_func(x, a, sigma):
+            # Define a gaussian function with offset
+            return a * np.exp(-x**2/(2*sigma**2))
+        
+def colorbar(mappable, pad=0.2, size="5%", loc="right", **args):
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    ax = mappable.axes
+    fig = ax.figure
+    divider = make_axes_locatable(ax)
+    if loc=="bottom":
+        orent = "horizontal"
+        pad = 1.5*pad
+        rot = 75
+    else:
+        orent = "vertical"
+        rot = 0
+    cax = divider.append_axes(loc, size=size, pad=pad)
+    cb = fig.colorbar(mappable, cax=cax, orientation=orent, **args)
+    cb.ax.set_xticklabels(cb.ax.get_xticklabels(),rotation=rot)
+    return cb
 
 def vmax_3sig(img):
     # upper limit of visual imshow defined by 3 sigma above median
-    return np.median(img)+3*np.std(img)
+    return np.median(img)+3*mad_std(img)
 
 def vmax_5sig(img):
     # upper limit of visual imshow defined by 5 sigma above median
-    return np.median(img)+5*np.std(img)
+    return np.median(img)+5*mad_std(img)
 
 def vmin_5sig(img):
     # lower limit of visual imshow defined by 5 sigma below median
-    return np.median(img)-5*np.std(img)
+    return np.median(img)-5*mad_std(img)
+
+def vmin_3sig(img):
+    # lower limit of visual imshow defined by 5 sigma below median
+    return np.median(img)-3*mad_std(img)
 
 def printsomething():
     print("Print")
-    
-def coord_ImtoArray(X_IMAGE, Y_IMAGE):
-    # Convert image coordniate to numpy array coordinate
-    x_arr, y_arr = Y_IMAGE-1, X_IMAGE-1
+
+def coord_Im2Array(X_IMAGE, Y_IMAGE):
+    """ Convert image coordniate to numpy array coordinate """
+    x_arr, y_arr = int(max(round(Y_IMAGE)-1, 0)), int(max(round(X_IMAGE)-1, 0))
     return x_arr, y_arr
 
-def background_sub_SE(field, mask=None, b_size=64, f_size=3, n_iter=5):
-    # Subtract background using SE estimator with mask
-    Bkg = Background2D(field, mask=mask, bkg_estimator=SExtractorBackground(),
-                       box_size=(b_size, b_size), filter_size=(f_size, f_size),
-                       sigma_clip=SigmaClip(sigma=3., maxiters=n_iter))
-    back = Bkg.background * ~mask
-    field_sub = field - back
-    return field_sub, back
+def coord_Array2Im(x_arr, y_arr):
+    """ Convert image coordniate to numpy array coordinate """
+    X_IMAGE, Y_IMAGE = y_arr+1, x_arr+1
+    return X_IMAGE, Y_IMAGE
 
-def display_background_sub(field, back):
+def check_save_path(dir_name)
+    if not os.path.exists(dir_name):
+        print("%s does not exist. Make a new directory."%dir_name)
+        os.makedirs(dir_name)
+
+############################################
+# Crosmatch & Preprocess
+############################################
+
+def query_vizier(catalog_name, RA, DEC, radius, columns, column_filters, unit=(u.hourangle, u.deg)):
+    """ Crossmatch with star catalog using Vizier. """
+    from astropy.coordinates import SkyCoord
+    from astroquery.vizier import Vizier
+    viz_filt = Vizier(columns=columns, column_filters=column_filters)
+    viz_filt.ROW_LIMIT = -1
+
+    field_coords = SkyCoord(RA + " " + DEC , unit=unit)
+
+    result = viz_filt.query_region(field_coords, 
+                                   radius=radius, 
+                                   catalog=[catalog_name])
+    return result
+
+def crossmatch_gaia2(RA, DEC, radius=6*u.arcmin, band='RPmag', mag_max=18):
+    result = query_vizier(catalog_name="I/345/gaia2", 
+                          RA=RA, DEC=DEC, radius=radius,
+                          columns=['RAJ2000', 'DEJ2000', band],
+                          column_filters={band:'{0} .. {1}'.format(5, mag_max)})    
+    return result[0]
+    
+def crossmatch_sdss12(self, RA, DEC, radius=6*u.arcmin, band='rmag', mag_max=18):
+    result = query_vizier(catalog_name="V/147/sdss12", 
+                          RA=RA, DEC=DEC, radius=radius,
+                          columns=['SDSS-ID', 'RA_ICRS', 'DE_ICRS', 'class', band],
+                          column_filters={'class':'=6', band:'{0} .. {1}'.format(5, mag_max)})
+    return result[0]
+    
+def mask_streak(file_path, threshold=5, shape_cut=0.15, area_cut=500, save_plot=True):
+    """ Mask stellar streaks using astride"""
+    
+    from astride import Streak
+    from scipy import ndimage as ndi
+
+    streak = Streak(file_path, contour_threshold=threshold, shape_cut=shape_cut, area_cut=area_cut)
+    streak.detect()
+    if save_plot:
+        streak.plot_figures()
+
+    mask_streak =  np.zeros_like(streak.image)
+
+    for s in streak.streaks:
+        for (X_e,Y_e) in zip(s['x'], s['y']):
+            x_e, y_e = coord_Im2Array(X_e, Y_e)
+            mask_streak[x_e, y_e] = 1
+            
+    mask_streak = ndi.binary_fill_holes(mask_streak)        
+    
+    return mask_streak
+
+def make_mask_map(image, sn_thre=3, b_size=50, npix=5):
+    """ Make mask map with S/N > sn_thre """
+    from photutils import detect_sources, deblend_sources
+    
+    # detect source
+    back, back_rms = background_sub_SE(image, b_size=b_size)
+    threshold = back + (sn_thre * back_rms)
+    segm0 = detect_sources(image, threshold, npixels=npix)
+    
+    segmap = segm0.data.copy()    
+    segmap[(segmap!=0)&(segm0.data==0)] = segmap.max()+1
+    mask_deep = (segmap!=0)
+    
+    return mask_deep, segmap
+
+def calculate_seeing(tab_star, image, seg_map, R_pix=15, sigma_guess=1, min_num=5, plot=True):
+    
+    """ Calculate seeing FWHM using the SE star table, image, and segmentation map """
+    from scipy.optimize import curve_fit
+    
+    if len(tab_star)<min_num:
+        print("No enough target stars. Decrease flux limit of stars.")
+    else:
+        FWHMs = np.array([])
+        for star in tab_star:
+            num = star["NUMBER"]
+            X_c, Y_c = star["X_IMAGE"], star["Y_IMAGE"]
+            x_c, y_c = coord_Im2Array(X_c, Y_c)
+            x_min, x_max = x_c - R_pix, x_c + R_pix
+            y_min, y_max = y_c - R_pix, y_c + R_pix
+            X_min, Y_min = coord_Array2Im(x_min, y_min)
+            cen = (X_c - X_min, Y_c - Y_min)
+            
+            # skip detection at edges
+            if (np.min([x_min, y_min])<=0) | (np.max([x_max, y_max])>= image.shape[1]): # ignore edge
+                continue
+            
+            # Crop image to thumb, mask nearby sources
+            img_thumb = image[x_min:x_max, y_min:y_max].copy()
+            seg_thumb = seg_map[x_min:x_max, y_min:y_max].copy()
+            mask = (seg_thumb!=num) & (seg_thumb!=0)
+
+            # build 2d map and turn into 1d
+            yy, xx = np.indices((img_thumb.shape))
+            rr = np.sqrt((xx - cen[0])**2 + (yy - cen[1])**2)
+            x0, y0 = rr[~mask].ravel(), img_thumb[~mask].ravel()
+            x, y = x0/rr.max(), y0/y0.max()
+
+            # Fit the profile with gaussian and return seeing FWHM in arcsec
+            initial_guess = [1, sigma_guess/rr.max()]
+            popt, pcov = curve_fit(gaussian_func, x, y, p0=initial_guess)
+            sig_pix = abs(popt[1])*rr.max()  # sigma of seeing in pixel
+            FWHM = 2.355*sig_pix*0.322
+            FWHMs = np.append(FWHMs, FWHM)  
+            
+            if plot:
+                xplot = np.linspace(0,1,1000)
+                plt.figure(figsize=(5,4))
+                plt.scatter(x, y, s=5, alpha=0.5)
+                plt.plot(xplot, gaussian_func(xplot,*popt),"k")
+                plt.title("FWHM: %.3f"%FWHM)  # seeing FWHM in arcsec
+                plt.show() 
+                plt.close()
+                
+        return FWHMs
+    
+    
+def background_sub_SE(field, mask=None, b_size=128, f_size=3, n_iter=10):
+    """ Subtract background using SE estimator with mask """ 
+    from photutils import Background2D, SExtractorBackground
+    try:
+        Bkg = Background2D(field, mask=mask, bkg_estimator=SExtractorBackground(),
+                           box_size=(b_size, b_size), filter_size=(f_size, f_size),
+                           sigma_clip=SigmaClip(sigma=3., maxiters=n_iter))
+        back = Bkg.background
+        back_rms = Bkg.background_rms
+    except ValueError:
+        img = field.copy()
+        if mask is not None:
+            img[mask] = np.nan
+        back, back_rms = np.nanmedian(field) * np.ones_like(field), np.nanstd(field) * np.ones_like(field)
+    if mask is not None:
+        back *= ~mask
+        back_rms *= ~mask
+    return back, back_rms
+
+def display_background_sub(field, back, vmax=1e3):
     # Display and save background subtraction result with comparison 
     fig, (ax1,ax2,ax3) = plt.subplots(nrows=1,ncols=3,figsize=(16,5))
-    ax1.imshow(field, origin="lower",cmap="gray", vmin=0., vmax=vmax_3sig(field))
-    ax2.imshow(back, origin='lower', cmap='gray', vmin=0., vmax=vmax_3sig(back))
-    ax3.imshow(field - back, origin='lower', cmap='gray', vmin=0., vmax=vmax_3sig(field))
+    im1 = ax1.imshow(field, origin="lower",cmap="gray", norm=norm1, vmin=vmin_5sig(back), vmax=vmax)
+    colorbar(im1)   
+    im2 = ax2.imshow(back, origin='lower', cmap='gray',vmin=vmin_5sig(back), vmax=vmax_5sig(back))
+    colorbar(im2)
+    im3 = ax3.imshow(field - back, origin='lower', cmap='gray', norm=norm2, vmin=0., vmax=vmax)
+    colorbar(im3)   
     plt.tight_layout()
     return fig
+
+
+############################################
+# Measurement
+############################################
 
 def measure_pa_offset(pos1, pos2, wcs, obj_SE):
     (x1, y1) = pos1 
@@ -163,10 +346,10 @@ class Object_SE:
         apers = [apertures, annulus_apertures]
         m0 = apers[0].to_mask(method='exact')[0]
         area_aper = m0.to_image(self.img_thumb.shape)
-        area_aper[~self.mask_thumb] = 0
+        area_aper[self.mask_thumb] = 0
         m1 = apers[1].to_mask(method='exact')[0]
         area_annu = m1.to_image(self.img_thumb.shape)
-        area_annu[~self.mask_thumb] = 0
+        area_annu[self.mask_thumb] = 0
 
         bkg = self.img_thumb[np.logical_and(area_annu>=0.5,self.mask_seg)]
         signal = self.img_thumb[np.logical_and(area_aper>=0.5,self.mask_seg)]
@@ -237,16 +420,34 @@ class Object_SE:
         area_aper = m0.to_image(self.img_thumb.shape)
         
         spec = self.cube_thumb[:,np.where(area_aper>=0.5)[0],np.where(area_aper>=0.5)[1]].sum(axis=1)
-#         if plot:
-#             fig,ax=plt.subplots(1,1)
-#             ax.plot(wavl,spec/spec.max(),lw=1)
         return spec  
     
 
-def fit_cont(spec, wavl, model='GP', 
-             kernel_scale=100, kenel_noise=1e-3, edge_ratio=0.15,
-             print_out=True, plot=True, fig=None, ax=None):
-    """Fit normalized continuum with Trapezoid1D model or Gaussian Process"""
+def fit_continuum(spec, wavl, model='GP', 
+                  kernel_scale=100, kenel_noise=1e-3, edge_ratio=0.15,
+                  verbose=True, plot=True, fig=None, ax=None):
+    """
+    Fit continuum of the spectrum with Trapezoid1D model or Gaussian Process
+
+    Parameters
+    ----------
+    spec : extracted spectrum
+    model : continuum model used to subtract from spectrum
+            "GP": flexible non-parametric continuum fitting
+                  edge_ratio : edge threshold of the filter band (above which the
+                               edge is replaced with a median to avoid egde issue).
+                  kernel_scale : kernel scale of the RBF kernel
+                  kenel_noise : noise level of the white kernel
+            "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted
+                       by a constant slope
+
+    Returns
+    ----------
+    res : residual spectra
+    wavl_rebin : wavelength rebinned in log linear
+    cont_fit : fitted continuum
+        
+    """
     
     # rebin wavelength linearly in log scale
     logwavl = np.log(wavl)
@@ -271,12 +472,13 @@ def fit_cont(spec, wavl, model='GP',
         model_fit = fitter(model_init, wavl_rebin, cont)
         cont_fit = model_fit(wavl_rebin)
         cont_range = (cont_fit==cont_fit.max())
-        if print_out:
+        if verbose:
             print(model_fit)
             
     elif model=='GP':
         # Fit continuum with Gaussian Process
-        if np.sum((y_intp - np.median(y_intp) <= -2.5*mad_std(y_intp)))> edge_ratio*n_wavl:  # For some special source with sharp edge
+        if np.sum((y_intp - np.median(y_intp) <= -2.5*mad_std(y_intp)))> edge_ratio*n_wavl:  
+            # For some special source with sharp edge
             # fit continuum where no drop or emission exist
             fit_range = abs(y_intp - np.median(y_intp)) <= mad_std(y_intp) 
         else:
@@ -299,7 +501,7 @@ def fit_cont(spec, wavl, model='GP',
         except ValueError:
             pass
         
-    res = (y_intp-cont_fit)
+    res = (y_intp - cont_fit)
     
     if plot:
         # Plot the data with the best-fit model
@@ -685,7 +887,7 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
                             emission_type="subtract", sum_type="weight", 
                             aperture_type="separate", multi_aper=False,
                             line_stddev=3, line_ratio=None, mag0=25.2, 
-                            plot=True, print_out=True):    
+                            plot=True, print_out=True, return_for_plot=False):    
     # Compute the centroid of emission and continua, and plot
     w_l = line_stddev * 3
 #     if line_ratio<3:
@@ -826,7 +1028,7 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
 
         
 
-    elif aperture_type== "single":
+    elif aperture_type== "single": #single aperture
         img = obj_SE.img_thumb
         x, y = obj_SE.center_pos
         for i in range(niter_aper):
@@ -1101,7 +1303,7 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
 #                     pass                    
             aper_em.plot(color='violet',lw=3,ax=ax1,alpha=0.95)
             aper_con.plot(color='darkseagreen',lw=3,ax=ax2,alpha=0.95)
-        ax.contour(data_em,colors="gold",alpha=0.9, linewidths=3.5,
+        ax.contour(data_em,colors="skyblue",alpha=0.9, linewidths=3.5,
                   levels = [0.1*data_em.max(),0.45*data_em.max(),0.8*data_em.max(),data_em.max()])
         
         ax.set_xlim(xlim)
@@ -1127,21 +1329,24 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
             ax.arrow(0.85,0.15,np.sin(clus_cen_angle)/10,np.cos(clus_cen_angle)/10,color="orange",
                      head_width=0.02, head_length=0.02,transform=ax.transAxes)
         elif coord_type=="angular":
-            ax.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="skyblue",
+            ax.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="lightblue",
                      head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
             ax.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
                      head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
         
         ax.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=25,transform=ax.transAxes)
         ax.text(0.05,0.12,r"$\bf \Delta\,d:{\ }%.1f$"%centroid_offset,color="lavender",fontsize=25,transform=ax.transAxes)
-        mag_auto = -2.5*np.log10(obj_SE.flux_auto) + mag0
+        #mag_auto = -2.5*np.log10(obj_SE.flux_auto) + mag0
         #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
         if np.ndim(coord_BCG)>0:
-            text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'lightblue')
+            text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
             ax.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
         plt.subplots_adjust(left=0.05,right=0.95,top=0.95, bottom=0.05, wspace=0.2, hspace=0.25)
     
-    return diff_angle, centroid_offset, dist_clus_cen, pa, clus_cen_angle, max_dev
+    if return_for_plot:
+        return (em, con), (img_em, img_con), data_em, (aper_em, aper_con), ((x1,y1),(x2,y2))
+    else:
+        return diff_angle, centroid_offset, dist_clus_cen, pa, clus_cen_angle
 
 
 

@@ -4,36 +4,229 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.stats import mad_std
 import scipy.stats as stats
+from astroquery.vizier import Vizier
 import re
 
 from utils import *
 
-class Read_Raw_Datacube: 
-    def __init__(self, file_path, name, wavn_range=[12100, 12550]):
+
+def read_SITELLE_DeepFrame(file_path, name, SE_catalog=None, seg_map=None, mask_edge=None):
+    """ 
+    Read raw SITELLE datacube.
+    
+    Parameters
+    ----------
+    file_path : deepframe path.
+    name : name of object for saving.
+    
+    SE_catalog : SExtractor table (None if reading raw).
+    seg_map : SExtractor segmentation map (None if reading raw).
+    mask_edge : edge mask (None if reading raw).
+
+    Returns
+    -------
+    deepframe: deepframe class.
+    
+    """
+    deepframe = DeepFrame(file_path, name, SE_catalog, seg_map, mask_edge)
+    return deepframe
+
+
+class DeepFrame: 
+    """ A class for SITTLE DeepFrame """
+    
+    def __init__(self, file_path, name, SE_catalog=None, seg_map=None, mask_edge=None):
+        self.hdu = fits.open(file_path)
+        self.header = self.hdu[0].header
+        self.image = self.hdu[0].data
+        self.name = name
+        
+        # WCS
+        self.RA, self.DEC = self.header["TARGETR"], self.header["TARGETD"]
+        self.wcs = WCS(self.header)
+
+        try:
+            # Read SE measurement
+            self.table = Table.read(SE_catalog, format="ascii.sextractor")
+            self.seg_map = fits.open(seg_map)[0].data
+            self.mask_edge = fits.open(mask_edge)[0].data.astype('bool') 
+        
+        except TypeError:
+            # none for raw frame
+            self.table = None
+            self.seg_map = None
+            self.mask_edge = self.image < 5*mad_std(self.image)
+        
+    def crossmatch_sdss(self, radius=6*u.arcmin, mag_max=18):
+        """ Match bright stars with SDSS (optional) """
+        tab_sdss = crossmatch_sdss12(self, self.RA, self.DEC, radius=radius, band='rmag', mag_max=mag_max)
+        return tab_sdss
+    
+    def make_mask_edge(self, save_path = './'):
+        """ Mask edges """
+        check_save_path(save_path)
+        hdu_edge = fits.PrimaryHDU(data=self.mask_edge.astype("float"))
+        hdu_edge.writeto(save_path + '%s_edge.fits'%self.name,overwrite=True)
+    
+    def make_mask_streak(self, file_path, threshold=5, shape_cut=0.15, area_cut=500,
+                         display=True, save_plot=True):
+        """ 
+        Mask bright star streaks (optional)
+        
+        Parameters
+        ----------
+        file_path : fits path
+        threshold : contour threshold
+        shape_cut : cut for shape factor
+        area_cut : cut for area inside each border
+        save_plot : save streak detection plot in file_path
+
+        """
+        self.mask_streak = mask_streak(file_path, threshold=threshold, 
+                                       shape_cut=shape_cut, area_cut=area_cut, save_plot=True)
+        if display:
+            plt.figure(figsize=(6, 6))   
+            plt.imshow(self.mask_streak, origin="lower")
+
+    def make_weight_map(self, thre=0.55, wt_min=1e-3, 
+                        display=True, save_path = './'):
+        """ Make weight map for SE, de-weighting edges / corners (/streaks) 
+            to reduce spurious detection """
+        image = self.image
+          
+        yy, xx = np.indices(image.shape)
+        cen = ((image.shape[1]-1)/2., (image.shape[0]-1)/2.)
+
+        rr = np.sqrt(((xx-cen[0])/image.shape[1])**2+((yy-cen[1])/image.shape[0])**2)
+
+        weight = (1-sigmoid(rr*100, thre*100)) * (1-wt_min) + wt_min
+        weight[self.mask_edge] = wt_min
+        
+        try:
+            weight[self.mask_streak] = wt_min
+        except AttributeError:
+            pass
+        
+        if display:
+            fig, (ax) = plt.subplots(1,1,figsize=(6,6))
+            im = ax.imshow(np.log10(weight), vmin=-5, vmax=0, origin="lower", cmap="rainbow")
+            colorbar(im)
+            
+        check_save_path(save_path)
+        hdu_weight_map = fits.PrimaryHDU(data=weight)
+        hdu_weight_map.writeto(save_path + 'weight_map_%s.fits'%self.name, overwrite=True)
+    
+    def subtract_background(self, b_size=128,
+                            display=True, plot=False, save_path = './', suffix=""):
+        """ Subtract background with a moving box. Edges masked. Sources masked if has SE table. """
+        field = self.image
+        
+        # Clean the spurious detection using the first measurement
+        if self.seg_map is None:
+            mask = self.mask_edge
+        else:
+            table = self.table
+            segmap2 = self.seg_map.copy()
+            num_defect = table["NUMBER"][(table["FLUX_AUTO"]<0)|(table["ELONGATION"]>10)]
+            for num in num_defect:
+                segmap2[segmap2==num] = 0               
+            mask = (segmap2!=0) | (self.mask_edge)
+        
+        # Subtract background, mask SE detections if has a first run
+        back, back_rms = background_sub_SE(field, mask=mask, b_size=b_size, f_size=3, n_iter=20)
+        field_sub = field - back
+        
+        if display:
+            display_background_sub(field, back, vmax=1e3)
+        if plot:
+            check_save_path(save_path)
+            hdu_new = fits.PrimaryHDU(data=field_sub, header=self.header)
+            hdu_new.writeto(save_path + '/' + '%s_DF%s.fits'%(self.name, suffix), overwrite=True)
+            print("Saved background subtracted image as %s_DF%s.fits"%(self.name, suffix))
+        
+        self.field_sub = field_sub    
+        
+    def calculate_seeing(self, R_pix=15, cut=[95,99.5], sigma_guess=1., plot=False):
+        """ 
+        Use the brigh star-like objects (class_star>0.7) to calculate 
+        median seeing fwhm by fitting gaussian profiles.
+            
+        Parameters
+        ----------
+        R_pix : max range of profiles to be fitted (in pixel)
+        cut : percentage of brightness cut
+        sigma_guess : initial guess of sigma of gaussian profile (in pixel) 
+        plot : plot radial profile for each object in use
+        
+        """
+        
+        if self.table is None:
+            print("No SE measurement. Pass.")
+            return None
+        else:
+            table = self.table
+
+        # Cut in CLASS_STAR, roundness and brightness
+        star_cond = (table["CLASS_STAR"]>0.7) & (table["PETRO_RADIUS"]>0) \
+                    & (table["B_IMAGE"]/table["A_IMAGE"]>0.8) & (table["FLAGS"] <4)
+        tab_star = table[star_cond]
+        F_limit = np.percentile(tab_star["FLUX_AUTO"], cut)
+        tab_star = tab_star[(tab_star["FLUX_AUTO"]>F_limit[0])&(tab_star["FLUX_AUTO"]<F_limit[1])]
+        
+        FWHM = calculate_seeing(tab_star, self.image, self.seg_map, 
+                                R_pix=R_pix, sigma_guess=sigma_guess, min_num=5, plot=True)
+        self.seeing_fwhm = np.median(FWHM)
+        print("Median seeing FWHM in arcsec: %.3f"%self.seeing_fwhm)
+        
+        
+
+def read_raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550]):
+    """ 
+    Read raw SITELLE datacube.
+    
+    Parameters
+    ----------
+    file_path: datacube path.
+    name: name of object for saving.
+    wavn_range: range of wave number (in cm^-1) to be used.
+
+    Returns
+    -------
+    raw_datacube: raw SITTLE datacube class.
+    
+    """
+    raw_datacube = Raw_Datacube(file_path, name, wavn_range=[12100, 12550])
+    return raw_datacube
+
+class Raw_Datacube: 
+    """ A class for raw SITTLE datacube """
+    
+    def __init__(self, file_path, name, wavn_range):
         self.hdu = fits.open(file_path)
         self.header = self.hdu[0].header
         self.name = name
         
         # Pixel scale, Step of wavenumber, Start of wavenumber, Number of steps
-#             self.pix_scale = self.hdu[0].header["PIXSCAL1"] #arcsec/pixel
-        self.d_wavn = self.hdu[0].header["CDELT3"] #cm^-1 / pixel
-        self.wavn_start = self.hdu[0].header["CRVAL3"] #cm^-1
+        self.pix_scale = self.hdu[0].header["PIXSCAL1"]   #arcsec/pixel
+        self.d_wavn = self.hdu[0].header["CDELT3"]        #cm^-1 / pixel
+        self.wavn_start = self.hdu[0].header["CRVAL3"]    #cm^-1
         self.nstep = self.hdu[0].header["STEPNB"] 
         
-        # Total wavenumber
+        # Wavenumber axis
         self.wavn = np.linspace(self.wavn_start, self.wavn_start+(self.nstep-1)*self.d_wavn, self.nstep)  #cm^-1
         
-        # Effective data range from 12100 cm^-1 to 12550 cm^-1 
+        # Effective wave number range
         wavn_eff_range = (self.wavn>wavn_range[0]) & (self.wavn<wavn_range[1])
         self.wavl = 1./self.wavn[wavn_eff_range][::-1]*1e8
         
-        # Raw effective datacube and stack field in wavelength
+        # Raw effective datacube and stack field
         self.raw_datacube = self.hdu[0].data[wavn_eff_range][::-1]
         self.raw_stack_field = self.raw_datacube.sum(axis=0)
         
         # Field edge/saturations to be masked
-        self.mask_edge = self.raw_stack_field < 3*mad_std(self.raw_stack_field)
-
+        self.mask_edge = self.raw_stack_field < 5 * mad_std(self.raw_stack_field)
+        
+        # Modify the fits for saving the new cube
         self.hdu_header_new = self.hdu[0].header.copy()
         self.hdu_header_new["CRVAL3"] = self.wavn[wavn_eff_range][0]  # New minimum wavenumber in cm-1
         self.hdu_header_new["STEPNB"] = np.sum(wavn_eff_range)   # New step
@@ -47,67 +240,81 @@ class Read_Raw_Datacube:
         
     def save_mask_edge(self, save_path = './'):
         # Save the edge mask to be read later
+        check_save_path(save_path)
         hdu_edge = fits.PrimaryHDU(data=self.mask_edge.astype("float")*10)
         hdu_edge.writeto(save_path + 'Raw_stack_%s_mask.fits'%self.name,overwrite=True)
         
-    def save_weight_map(self, region_path, weight=0.01, save_path = './'):
+    def save_weight_map(self, region_path, weight=0.001, save_path = './'):
         # Mask regions (eg. star spikes) by making a weight map for SE input
         import pyregion
         reg = pyregion.open(region_path)
         self.mymask = reg.get_mask(hdu=self.hdu[0], shape=self.hdu[0].shape[1:])
 
         weight_map =(~self.mymask).astype("float") + weight
-        hdu_weight_map = fits.PrimaryHDU(data=weight_map)
-        hdu_weight_map.writeto(save_path + 'Weight_map_stack_%s.fits'%self.name, overwrite=True)
         
-    def remove_background(self, box_size=64, filter_size=3, n_iter=5, save_path = None, plot=False):
-        # Remove background (low-frequency component) using SEXtractor estimator (filtering + mode)
+        check_save_path(save_path)
+        hdu_weight_map = fits.PrimaryHDU(data=weight_map)
+        hdu_weight_map.writeto(save_path + 'weight_map_stack_%s.fits'%self.name, overwrite=True)
+    
+    def remove_background(self, box_size=128, filter_size=3, n_iter=10, save_path=None, plot=False):
+        """ Remove background (low-frequency component) using SEXtractor estimator (filtering + mode) """
+        if plot:
+            check_save_path(save_path)
+        
         self.datacube_bkg_sub = np.empty_like(self.raw_datacube)
         for i, field in enumerate(self.raw_datacube):
-            if np.mod(i+1, 10)==0: print("Removing background...Frame: %d"%(i+1))
+            if np.mod(i+1, 10)==0: print("Removing background... Channel: %d"%(i+1))
             
-            field_sub, back = background_sub_SE(field, mask=self.mask_edge, 
-                                                b_size=box_size, f_size=filter_size, n_iter=n_iter)
+            back, back_rms = background_sub_SE(field, mask=self.mask_edge,
+                                               b_size=box_size, f_size=filter_size, n_iter=n_iter)
+            field_sub = field - back
+
             self.datacube_bkg_sub[i] = field_sub
             
             # Save background subtraction
             if plot:
-                fig = display_background_sub(field, back)
-                plt.savefig(save_path + "bkg_sub_channel%d.pdf"%(i+1),dpi=100)
+                fig = display_background_sub(field, back, vmax=1)
+                plt.savefig(save_path + "bkg_sub_channel%d.png"%(i+1),dpi=100)
                 plt.close(fig)  
                 
         self.stack_field = self.datacube_bkg_sub.sum(axis=0)
         
-        # Possible Sources to be masked
-        mask_source = self.stack_field > 3*mad_std(self.stack_field)
-        self.mask_source = np.logical_or(mask_source, self.mask_edge)
+    def remove_fringe(self, channels=None, sn_source=2,
+                      box_size=8, filter_size=1, n_iter=20, save_path=None, plot=False):
+        """ Remove fringe and artifacts for specified channels """
+        if channels is None: return None
+        
+        check_save_path(save_path)
+        
+        mask_source, segmap = make_mask_map(self.stack_field, sn_thre=sn_source, b_size=128)
+        mask = (self.mask_edge) | (mask_source)
+        
+        self.datacube_bkg_fg_sub = self.datacube_bkg_sub.copy()
+        for k in channels:
+            field = self.datacube_bkg_sub[k-1]
+            print("Removing fringe... Channel: %d"%k)
+                
+            back, back_rms = background_sub_SE(field, mask=mask,
+                                               b_size=box_size, f_size=filter_size, n_iter=n_iter)
+            self.datacube_bkg_fg_sub[k-1] = field - back
 
-    def remove_fringe(self, skip_frames=[None], box_size=8, filter_size=1, n_iter=20, save_path = None, plot=False):
-        # Remove fringe and artifacts (high-frequency component)
-        self.datacube_bkg_fg_sub = np.empty_like(self.datacube_bkg_sub)
-        for i, field in enumerate(self.datacube_bkg_sub):
-            if np.mod(i+1, 10)==0: print("Removing fringe...Frame: %d"%(i+1))
-                
-            if i in skip_frames:
-                self.datacube_bkg_fg_sub[i] = field
-            else:
-                field_sub, back = background_sub_SE(field, mask=self.mask_source, 
-                                                    b_size=box_size, f_size=filter_size, n_iter=n_iter)
-                self.datacube_bkg_fg_sub[i] = field_sub
-                
-                # Save fringe subtraction
-                if plot:
-                    fig = display_background_sub(field, back)
-                    plt.savefig(save_path + "fg_sub_channel%d.png"%(i+1),dpi=100)
-                    plt.close(fig)  
+            # Save fringe subtraction
+            if plot:
+                fig = display_background_sub(field, back, vmax=1)
+                plt.savefig(save_path + "fg_sub_channel%d.png"%k,dpi=100)
+                plt.close(fig)  
                     
         self.stack_field = self.datacube_bkg_fg_sub.sum(axis=0)
+        self.subtract_fringe = True
                     
     def save_fits(self, save_path = './', suffix=""):
         """Write Stacked Image and Datacube after background & fringe subtraction"""
         print("Saving background & fringe subtracted datacube and stacked field...")
         
-        hdu_cube = fits.PrimaryHDU(data = self.datacube_bkg_fg_sub, header=self.hdu_header_new)
+        datacube_sub = self.datacube_bkg_fg_sub if self.subtract_fringe else self.datacube_bkg_sub
+        
+        check_save_path(save_path)
+        hdu_cube = fits.PrimaryHDU(data = datacube_sub, header=self.hdu_header_new)
         hdu_cube.writeto(save_path + '%s_cube%s.fits'%(self.name, suffix),overwrite=True)
         
         for keyname in ["CTYPE3","CRVAL3","CUNIT3","CRPIX3","CDELT3","CROTA3"]:
@@ -118,13 +325,53 @@ class Read_Raw_Datacube:
         hdu_stack = fits.PrimaryHDU(data = self.stack_field, header=self.hdu_header_new)
         hdu_stack.writeto(save_path + '%s_stack%s.fits'%(self.name, suffix),overwrite=True)
         
+        
 class Read_Datacube:
-    def __init__(self, cube_path, name, SE_catalog, deep_frame=None, z0=None):
+    
+    """ 
+    Read SITELLE datacube.
+    
+    Parameters
+    ----------
+    cube_path: datacube path.
+    name: name of object for saving.
+    mode: spectra extraction method 'ISO' or 'APER' (requring SExtractor output)
+    
+    table: Photutils / SExtractor table (None if reading raw).
+    seg_map: SExtractor segmentation map (None if mode is 'ISO').
+    mask_edge: edge mask (None if reading raw).
+
+    """
+    
+    def __init__(self, cube_path, name, mode="M2ISO",
+                 table=None, seg_map=None, mask_edge=None,
+                 deep_frame=None, z0=None):
+        
         self.hdu = fits.open(cube_path)
         self.header = self.hdu[0].header
-        self.datacube = self.hdu[0].data
+        self.cube = self.hdu[0].data
+        self.stack_field = self.cube.sum(axis=0)
+        
         self.name = name
         self.z0 = z0
+        self.mode = mode
+        
+        if mode=="M2ISO":            
+            self.mask_edge = None
+            if table is not None:
+                self.table = Table.read(table, format='ascii')
+        elif mode=="APER":
+            # Read SE measurement. 
+            self.table = Table.read(table, format="ascii.sextractor")
+            self.mask_edge = fits.open(mask_edge)[0].data.astype('bool')             
+        else:
+            raise ValueError("Choose an extraction mode: 'M2ISO' or 'APER' ('APER' requires SExtractor output)")
+        
+        try:
+            self.seg_map = fits.open(seg_map)[0].data
+        except ValueError:
+            self.seg_map = None
+        
         if deep_frame is not None:
             self.deep_frame = fits.open(deep_frame)[0].data
         else:
@@ -139,12 +386,8 @@ class Read_Datacube:
         self.wavn = np.linspace(self.wavn_start, self.wavn_start+(self.nstep-1)*self.d_wavn, self.nstep)  #cm^-1
         
         # Effective data range from 12100 cm^-1 to 12550 cm^-1 
-        wavn_eff_range = (self.wavn>12100) & (self.wavn<12550)
-        self.wavl = 1./self.wavn[wavn_eff_range][::-1]*1e8
+        self.wavl = 1./self.wavn[::-1]*1e8
         self.d_wavl = np.diff(self.wavl).mean()
-        
-        # If run SE twice, read the second run SE catalog. Format should be ascii.sextractor
-        self.Tab_SE = Table.read(SE_catalog, format="ascii.sextractor")
         
         # For generating different templates 
         self.Temp_Lib = {}
@@ -159,88 +402,102 @@ class Read_Datacube:
         self.CC_SNR_ps_Temps = {}
         self.CC_flag_edge_Temps = {}
         self.CCs_Temps  = {}
+       
+    
+    def m2iso_source_detection(self, sn_thre=2, npixels=8,
+                               nlevels=64, contrast=0.01, closing=True,
+                               columns=['id', 'xcentroid', 'ycentroid', 'ellipticity', 'equivalent_radius', 'area'],
+                               save=True, save_path = './', suffix=""):
+        """ Source Extraction using the second maximum map """
+        from skimage import morphology
+        from photutils import source_properties
         
+        # Second maximum manipulation in wavelength
+        print("Use the map of second maximum along wavelength to detect source.")
+        image_m2 = np.partition(self.cube, kth=-2, axis=0)[-2]
+        back, back_rms = background_sub_SE(image_m2, b_size=128)
+        threshold = back + (sn_thre * back_rms)
         
-    def read_mask(self, file_path):
-        # Open edge mask
-        hdu_mask = fits.open(file_path)
-        self.mask_edge = (hdu_mask[0].data == 0)
+        # Detect + deblend source
+        print("Detecting and deblending source...")
+        segm0 = detect_sources(image_m2, threshold, npixels=npixels)
+        segm = deblend_sources(image_m2, segm0, npixels=npixels, nlevels=nlevels, contrast=contrast)
+        if closing is True:
+            seg_map = morphology.closing(segm.data)
+        else:
+            seg_map = segm.data
         
-    def read_seg(self, file_path):
-        # Open SE segmentation mask
-        hdu_seg = fits.open(file_path)
-        self.img_seg = hdu_seg[0].data
+        # Save 2nd max map and segmentation map
+        if save:
+            check_save_path(save_path)
+            hdu_m2 = fits.PrimaryHDU(data=image_m2, header=self.header)
+            hdu_m2.writeto(save_path + '%s_max2%s.fits'%(self.name, suffix), overwrite=True)
+            hdu_seg = fits.PrimaryHDU(data=seg_map, header=None)
+            hdu_seg.writeto(save_path + '%s_segm_m2%s.fits'%(self.name, suffix), overwrite=True)
         
-    def calculate_seeing(self, R_pix = 10, mag_cut=[0.2,0.8], sigma_guess=1., plot=False):
-        """ Use the brigh star-like objects (class_star>0.7) to calculate 
-            median seeing fwhm by fitting gaussian profiles.
+        # Meausure properties of detections
+        cat = source_properties(image_m2, segm)
+        tab = cat.to_table(columns=columns)   
+        for name in tab.colnames:
+            try:
+                tab[name].info.format = '.2f'
+            except ValueError:
+                pass
+            
+        # Save as table
+        if save:
+            check_save_path(save_path)
+            tab.rename_column('id', 'NUMBER')
+            tab.write(save_path + '%s_m2iso%s.dat'%(self.name, suffix), format='ascii', overwrite=True)
+            
+        self.table = tab
+ 
+        return image_m2, segm, seg_map
+    
+    def m2iso_spec_extraction_all(self, seg_map):
+        labels = np.unique(seg_map)[1:]
+        
+        for k, lab in enumerate(labels):
+            if np.mod(k+1, 400)==0: print("Extract spectra... %d/%d"%(k+1, len(labels)))
+            spec_opt = self.cube[:, seg_map==lab].sum(axis=1)
+            self.obj_specs_opt = np.vstack([self.obj_specs_opt, spec_opt]) if k>0 else [spec_opt]   
+        
+        self.obj_nums = labels
+        
+    def calculate_seeing(self, R_pix = 15, cut=[95,99.5], sigma_guess=1., plot=False):
+        """ 
+        Use the brigh star-like objects (class_star>0.7) to calculate 
+        median seeing fwhm by fitting gaussian profiles.
             
         Parameters
         ----------
         R_pix : max range of profiles to be fitted (in pixel)
-        magcut : percentage of cut in isophotal magnitude
+        cut : percentage of cut in isophotal magnitude
         sigma_guess : initial guess of sigma of gaussian profile (in pixel) 
         plot : plot radial profile for each object in use
+        
         """
         
-        from scipy.optimize import curve_fit
-        def gaussian_func(x, a, sigma):
-            # Define a gaussian function with offset
-            return a * np.exp(-x**2/(2*sigma**2))
-
         # Cut in CLASS_STAR, measurable, roundness and mag threshold
-        mag_all = -2.5*np.log10(self.Tab_SE["FLUX_ISO"])
-        mag0 = [np.percentile(mag_all, mag_cut[0]*100), np.percentile(mag_all, mag_cut[1]*100)]
-        star_cond = (self.Tab_SE["CLASS_STAR"]>0.7) & (self.Tab_SE["PETRO_RADIUS"]>0) \
-                    & (self.Tab_SE["B_IMAGE"]/self.Tab_SE["A_IMAGE"]>0.7) \
-                    & (mag_all>mag0[0]) &(mag_all<mag0[1]) \
-                    & (np.sqrt(self.Tab_SE["A_IMAGE"]**2+self.Tab_SE["B_IMAGE"]**2)<self.Tab_SE["KRON_RADIUS"])
+        star_cond = (self.table["CLASS_STAR"]>0.7) & (self.table["PETRO_RADIUS"]>0) \
+                    & (self.table["B_IMAGE"]/self.table["A_IMAGE"]>0.7) & (table["FLAGS"] <4)
+        tab_star = self.table[star_cond]
+        F_limit = np.percentile(tab_star["FLUX_AUTO"], cut)
+        tab_star = tab_star[(tab_star["FLUX_AUTO"]>F_limit[0])&(tab_star["FLUX_AUTO"]<F_limit[1])]
         
-        self.Tab_star = self.Tab_SE[star_cond]
-        if len(self.Tab_star)<5:
-            print("Mag cut too low. No enough target stars.")
-        else:
-            FWHMs = np.array([])
-            for star in self.Tab_star:
-
-                x_c, y_c = coord_ImtoArray(star["X_IMAGE"], star["Y_IMAGE"])
-                x_min, x_max = (x_c-R_pix).astype("int"), (x_c+R_pix).astype("int")
-                y_min, y_max = (y_c-R_pix).astype("int"), (y_c+R_pix).astype("int")
-                if (np.min([x_min, y_min])<=0) | (np.max([x_max, y_max])>=np.min(self.datacube.shape[1:])): # ignore edge
-                    continue
-
-                cube_thumb = self.datacube[:,x_min:x_max, y_min:y_max]
-                img_thumb = cube_thumb.sum(axis=0)
-
-                x, y = np.indices((img_thumb.shape))
-                rr = np.sqrt((x - (x_c-x_min))**2 + (y - (y_c-y_min))**2)
-                x, y = rr.ravel()/rr.max(), img_thumb.ravel()/img_thumb.ravel().max()
-
-                # Fit the profile with gaussian and return seeing FWHM in arcsec
-                initial_guess = [1,sigma_guess/rr.max()]
-                popt, pcov = curve_fit(gaussian_func, x, y, p0=initial_guess)
-                sig_pix = abs(popt[1])*rr.max()  # sigma of seeing in pixel
-                FWHM = 2.355*sig_pix*0.322
-                FWHMs = np.append(FWHMs, FWHM)
-                self.seeing_fwhm = np.median(FWHMs)    
-
-                if plot:
-                    xplot = np.linspace(0,1,1000)
-                    plt.scatter(x, y)
-                    plt.plot(xplot, gaussian_func(xplot,*popt),"k")
-                    plt.show() 
-                    plt.close()
-                    print(FWHM)  # seeing FWHM in arcsec
-
-            print("Median seeing FWHM in arcsec: %.3f"%self.seeing_fwhm)
+        FWHM = calculate_seeing(tab_star, self.stack_field, self.seg_map, 
+                                R_pix=R_pix, sigma_guess=sigma_guess, min_num=5, plot=True)
+        self.seeing_fwhm = np.median(FWHM)
+        print("Median seeing FWHM in arcsec: %.3f"%self.seeing_fwhm)
         
     def spec_extraction(self, num, ext_type='opt', 
                         ks = np.arange(1.,4.5,0.2), k1=5., k2=8.,
                         print_out=False, plot=False, display=False):
-        """Extract spectal using an optimal aperture, local background evaluated from (k1, k2) annulus
+        """
+        Extract spectal using an optimal aperture, local background evaluated from (k1, k2) annulus
         
         Parameters
-        
+        ----------
         num : SE object number
         ks : a set of aperture ring (in SE petrosian radius) to determined the optimized aperture
         k1, k2 : inner/outer radius (in SE petrosian radius) of annulus for evaluate background RMS
@@ -250,9 +507,9 @@ class Read_Datacube:
         
         """
         
-        tab = self.Tab_SE[self.Tab_SE["NUMBER"]==num]
-        obj_SE = Object_SE(tab, cube=self.datacube, deep_frame=self.deep_frame,
-                           img_seg=self.img_seg, mask_field=self.mask_edge)
+        tab = self.table[self.table["NUMBER"]==num]
+        obj_SE = Object_SE(tab, cube=self.cube, deep_frame=self.deep_frame,
+                           img_seg=self.seg_map, mask_field=self.mask_edge)
         
         if obj_SE.R_petro==0:
             if print_out: print("Error in measuring R_petro, dubious source")
@@ -270,7 +527,7 @@ class Read_Datacube:
         self.obj_nums = np.array([])
         self.obj_aper_cen = np.array([])
         self.obj_aper_opt = np.array([])
-        for num in self.Tab_SE["NUMBER"]:
+        for num in self.table["NUMBER"]:
             spec_cen, k_cen, snr_cen, apers = self.spec_extraction(num=num, ext_type='sky', 
                                                        ks=ks, k1=k1, k2=k2,
                                                        print_out=False, plot=False, display=False)
@@ -295,104 +552,98 @@ class Read_Datacube:
     
     def save_spec_plot(self, save_path=None):
         """Save normalized extracted spectra by the two apertures"""
-        for num, spec, spec_opt in zip(self.obj_nums, self.obj_specs_cen, self.obj_specs_opt):
-            plt.plot(self.wavl, spec/spec.max(), color='gray', label="Aperture cen", alpha=0.7)
-            plt.plot(self.wavl, spec_opt/spec_opt.max(), color='k', label="Aperture opt", alpha=0.9)
+        check_save_path(save_path)
+        for (n, spec_opt) in zip(self.obj_nums, self.obj_specs_opt):
+            plt.plot(self.wavl, spec_opt/spec_opt.max(), color='k', label="opt", alpha=0.9)
             plt.xlabel("wavelength",fontsize=12)
             plt.ylabel("normed flux",fontsize=12)
             plt.legend(fontsize=12)
-            plt.savefig(save_path+"SE#%d.png"%num,dpi=150)
+            plt.savefig(save_path+"#%d.png"%n,dpi=100)
             plt.close()
             
-            
-    def fit_continuum(self, spec, model='GP', edge_ratio=0.15, kernel_scale=100, kenel_noise=1e-3, plot=True):
-        """Fit continuum for the extracted spectrum
-        
-        Parameters
-        ----------
-        spec : extracted spectrum
-        model : continuum model used to subtract from spectrum
-            "GP": flexible non-parametric continuum fitting
-                edge_ratio : filter band edge threshold (above which the edge is replaced with a median to avoid egde issue). 
-                             If None, use the meadian edge ratio determined from spectra of all detections.
-                kernel_scale : kernel scale of the RBF kernel
-                kenel_noise : noise level of the white kernel
-            "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted by a constant slope
-            
-        Returns
-        ----------
-        res : residual spectra
-        wavl_rebin : rebinned wavl in log linear
+    def fit_continuum_all(self, model='GP', save_path=None, plot=False, 
+                          GP_kwds={'edge_ratio':None, 'kernel_scale':100, 'kenel_noise':1e-3}):   
         """
-        
-        res, wavl_rebin, cont_fit = fit_cont(spec, self.wavl, 
-                                               model=model, edge_ratio=edge_ratio,
-                                               kernel_scale=kernel_scale,  kenel_noise=kenel_noise, 
-                                               print_out=False, plot=plot)
-            
-        return res, wavl_rebin, cont_fit   
-            
-    def fit_continuum_all(self, model='GP', edge_ratio=None,
-                          kernel_scale=100, kenel_noise=1e-3, 
-                          plot=False, save_path=None):   
-        """Fit continuum for all the detections
-        
+        Fit continuum of all the extracted spectrum
+
         Parameters
         ----------
         model : continuum model used to subtract from spectrum
-            "GP": flexible non-parametric continuum fitting
-                edge_ratio : filter band edge threshold (above which the edge is replaced with a median to avoid egde issue). 
-                             If None, use the meadian edge ratio determined from spectra of all detections.
-                kernel_scale : kernel scale of the RBF kernel
-                kenel_noise : noise level of the white kernel
-            "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted by a constant slope
-        """
+                "GP": flexible non-parametric continuum fitting
+                      edge_ratio : edge threshold of the filter band (above which the
+                                   edge is replaced with a median to avoid egde issue).
+                                   
+                                   If None, use the meadian edge ratio estimated from
+                                   the stack of all the spectra.
+                                   
+                      kernel_scale : kernel scale of the RBF kernel
+                      kenel_noise : noise level of the white kernel
+                
+                "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted by a constant slope
         
-        if edge_ratio is None:
+        """
+        if plot:
+            check_save_path(save_path)
+        if (model=='GP') & (GP_kwds['edge_ratio'] is None):
             # Stacked spectra to estimate edge ratio
             self.spec_stack = (self.obj_specs_opt/self.obj_specs_opt.max(axis=1).reshape(-1,1)).sum(axis=0)
-            self.edge_ratio_stack = np.sum((self.spec_stack - np.median(self.spec_stack) \
-                                                    <= -2.5*mad_std(self.spec_stack))) / len(self.wavl)
-            edge_ratio = 0.5*self.edge_ratio_stack
+            GP_kwds['edge_ratio'] = 0.5*np.sum((self.spec_stack - np.median(self.spec_stack) \
+                                            <= -2.5*mad_std(self.spec_stack))) / len(self.wavl)
+            print('Fit continuum with GP. No edge_ratio is given. Use estimate = %.2f'%GP_kwds['edge_ratio'])
+        
+        
+        for n in self.table["NUMBER"]:
             
-        for num in self.Tab_SE["NUMBER"]:
-            r_petro = self.Tab_SE[self.Tab_SE["NUMBER"]==num]["PETRO_RADIUS"]
-            if r_petro==0:
-                blank_array = np.zeros(len(self.wavl)+1)
-                res, wavl_rebin, cont_fit = (blank_array,blank_array,blank_array)
+            # Skip supurious detections (edges, spikes, etc.)
+            iloc = (self.table["NUMBER"]==n)
+            if self.mode=="M2ISO":
+                spurious_detection = self.table[iloc]['ellipticity']>= 0.9
+            else:
+                spurious_detection = (self.table[iloc]["PETRO_RADIUS"] <=0) | (self.table[iloc]["FLUX_AUTO"] <=0)
+            
+            blank_array = np.zeros(len(self.wavl)+1)
+                
+            if spurious_detection:
+                print("Spurious detection #%d ... Skip"%n)
+                res, cont_fit = (blank_array, blank_array)
             else:    
-                spec = self.obj_specs_opt[self.obj_nums==num][0]
-                res, wavl_rebin, cont_fit = self.fit_continuum(spec, 
-                                                     model=model, edge_ratio=edge_ratio,
-                                                     kernel_scale=kernel_scale,  kenel_noise=kenel_noise, 
-                                                     plot=plot)
-            self.obj_res_opt = np.vstack((self.obj_res_opt, res)) if num>1 else [res]
-            self.obj_cont_fit_opt = np.vstack((self.obj_res_opt, cont_fit)) if num>1 else [cont_fit]
-            if plot:
-                plt.savefig(save_path+"SE#%d.png"%(num),dpi=100)
-                plt.close()
-            print ("#%d spectra continuum fitted"%(num))
-            
+                if np.mod(n, 200)==0: print("Fit spectra continuum ... %d/%d"%(n, len(self.table["NUMBER"])))
+                try:   
+                    # Fit continuum
+                    spec = self.obj_specs_opt[self.obj_nums==n][0]
+                    res, wavl_rebin, cont_fit = fit_continuum(spec, self.wavl, model=model, 
+                                                              edge_ratio=GP_kwds['edge_ratio'],
+                                                              kernel_scale=GP_kwds['kernel_scale'], 
+                                                              kenel_noise=GP_kwds['kenel_noise'],
+                                                              verbose=False, plot=plot)
+                    if plot:
+                        plt.savefig(save_path+"#%d.png"%(n),dpi=100)
+                        plt.close()
+
+                except Exception as e:
+                    res, cont_fit = (blank_array, blank_array)
+                    print("Spectrum #%d continuum fit failed ... Skip"%n)
+
+            self.obj_res_opt = np.vstack((self.obj_res_opt, res)) if n>1 else [res]
+            self.obj_cont_fit = np.vstack((self.obj_cont_fit, cont_fit)) if n>1 else [cont_fit]
+
         self.wavl_rebin = wavl_rebin
        
             
-    def save_spec_fits(self, save_path='./', suffix=""):  
+    def save_spec_fits(self, save_path='./', suffix="_all"):  
         """Save extracted spectra and aperture (in the unit of SE pertrosian radius) as fits"""
+        check_save_path(save_path)
         hdu_num = fits.PrimaryHDU(data=self.obj_nums)
         
-        hdu_spec_cen = fits.ImageHDU(data=self.obj_specs_cen)
-        hdu_aper_cen = fits.BinTableHDU.from_columns([fits.Column(name="k_aper_cen",array=self.obj_aper_cen,format="E")])
-        
         hdu_spec_opt = fits.ImageHDU(data=self.obj_specs_opt)
-        hdu_aper_opt = fits.BinTableHDU.from_columns([fits.Column(name="k_aper_opt",array=self.obj_aper_opt,format="E")])
+        size = self.table['equivalent_radius'].value if self.mode=="M2ISO" else self.obj_aper_opt
+        hdu_size = fits.ImageHDU(data=size)
+#         hdu_size = fits.BinTableHDU.from_columns([fits.Column(name="size",array=self.obj_aper_opt,format="E")])
         
         hdu_res_opt = fits.ImageHDU(data=self.obj_res_opt)
         hdu_wavl_rebin = fits.ImageHDU(data=self.wavl_rebin)
         
-        hdu_cont_fit_opt = fits.ImageHDU(data=self.obj_cont_fit_opt)
-        
-        hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_cen, hdu_aper_cen, hdu_spec_opt, hdu_aper_opt, 
-                                  hdu_res_opt, hdu_wavl_rebin, hdu_cont_fit_opt])
+        hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_opt, hdu_size, hdu_res_opt, hdu_wavl_rebin])
         hdul.writeto(save_path+'%s-spec%s.fits'%(self.name, suffix), overwrite=True)
         
         
@@ -402,15 +653,14 @@ class Read_Datacube:
         
         self.obj_nums = hdu_spec[0].data
         
-        self.obj_specs_cen = hdu_spec[1].data
-        self.k_apers_cen = hdu_spec[2].data['k_aper_cen']
+#         self.obj_specs_cen = hdu_spec[1].data
+#         self.k_apers_cen = hdu_spec[2].data['k_aper_cen']
         
-        self.obj_specs_opt = hdu_spec[3].data
-        self.k_apers_opt = hdu_spec[4].data['k_aper_opt']
+        self.obj_specs_opt = hdu_spec[1].data
+        self.size_opt = hdu_spec[2].data
         
-        self.obj_res_opt = hdu_spec[5].data
-        self.wavl_rebin = hdu_spec[6].data
-#         self.obj_cont_fit_opt = hdu_spec[7].data
+        self.obj_res_opt = hdu_spec[3].data
+        self.wavl_rebin = hdu_spec[4].data
         
         
     def generate_template(self, n_ratio=50, n_stddev=10, n_intp=2,
@@ -738,10 +988,10 @@ class Read_Datacube:
         """Assign BCG position (x, y) in pixel from id_BCG, ((x1,y1),(x2,y2)) for double cluster"""
         if id_BCG is not None:
             if np.ndim(id_BCG)==0:
-                self.pos_BCG = (self.Tab_SE[id_BCG]["X_IMAGE"], self.Tab_SE[id_BCG]["Y_IMAGE"])
+                self.pos_BCG = (self.table[id_BCG]["X_IMAGE"], self.table[id_BCG]["Y_IMAGE"])
             elif np.ndim(id_BCG)==1:
-                pos_BCG1 = (self.Tab_SE[id_BCG[0]]["X_IMAGE"], self.Tab_SE[id_BCG[0]]["Y_IMAGE"])
-                pos_BCG2 = (self.Tab_SE[id_BCG[1]]["X_IMAGE"], self.Tab_SE[id_BCG[1]]["Y_IMAGE"])
+                pos_BCG1 = (self.table[id_BCG[0]]["X_IMAGE"], self.table[id_BCG[0]]["Y_IMAGE"])
+                pos_BCG2 = (self.table[id_BCG[1]]["X_IMAGE"], self.table[id_BCG[1]]["Y_IMAGE"])
                 self.pos_BCG = (pos_BCG1,pos_BCG2)
             return self.pos_BCG
         else:
@@ -767,7 +1017,7 @@ class Read_Datacube:
                           emission_type="subtract", aperture_type="separate",
                           fix_window=False, multi_aper=True, 
                           n_rand=199, aper_size=[0.7,0.8,0.9,1.1,1.2,1.],
-                          plot=True, print_out=True):
+                          plot=True, print_out=True, return_for_plot=False):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -794,7 +1044,7 @@ class Read_Datacube:
         
         ind = (self.obj_nums==num)
         
-        obj_SE = Object_SE(self.Tab_SE[ind], k_wid=k_wid, cube=self.datacube,
+        obj_SE = Object_SE(self.table[ind], k_wid=k_wid, cube=self.datacube,
                            img_seg=self.img_seg, deep_frame=self.deep_frame, mask_field=self.mask_edge)
         self.obj_SE=obj_SE
 
@@ -825,29 +1075,30 @@ class Read_Datacube:
             else:
                 deep_img = None
             d_angle, offset, dist_clus, \
-            pa, clus_cen_angle, max_dev = compute_centroid_offset(obj_SE, spec=spec, wavl=self.wavl, 
-                                                                         k_aper=k_aper, z_cc=z,
-                                                                         pos_BCG = self.pos_BCG,
-                                                                         coord_BCG = self.coord_BCG, 
-                                                                         wcs = self.wcs, 
-                                                                         centroid_type=centroid_type, 
-                                                                         coord_type=coord_type, 
-                                                                         line_stddev=lstd,
-                                                                         line_ratio=lr,
-                                                                         affil_map=boundary_map, 
-                                                                         deep_img=deep_img, 
-                                                                         sum_type=sum_type,
-                                                                         emission_type=emission_type,
-                                                                         aperture_type=aperture_type,
-                                                                         multi_aper=multi_aper,
-                                                                         n_rand=n_rand, aper_size=aper_size,
-                                                                         plot=plot, print_out=print_out)
-            return (d_angle, offset, dist_clus, pa, clus_cen_angle, max_dev)
+            pa, clus_cen_angle = compute_centroid_offset(obj_SE, spec=spec, wavl=self.wavl, 
+                                                         k_aper=k_aper, z_cc=z,
+                                                         pos_BCG = self.pos_BCG,
+                                                         coord_BCG = self.coord_BCG, 
+                                                         wcs = self.wcs, 
+                                                         centroid_type=centroid_type, 
+                                                         coord_type=coord_type, 
+                                                         line_stddev=lstd,
+                                                         line_ratio=lr,
+                                                         affil_map=boundary_map, 
+                                                         deep_img=deep_img, 
+                                                         sum_type=sum_type,
+                                                         emission_type=emission_type,
+                                                         aperture_type=aperture_type,
+                                                         multi_aper=multi_aper,
+                                                         n_rand=n_rand, aper_size=aper_size,
+                                                         plot=plot, print_out=print_out,
+                                                         return_for_plot=return_for_plot)
+            return (d_angle, offset, dist_clus, pa, clus_cen_angle)
         
         except (ValueError, TypeError) as error:
             if print_out:
                 print("Unable to compute centroid! Error raised.")
-            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
+            return (np.nan, np.nan, np.nan, np.nan, np.nan)
     
     def centroid_analysis_all(self, Num_v, k_wid=6, 
                               centroid_type="APER", coord_type="angular", aperture_type="separate", 
@@ -899,16 +1150,16 @@ class Read_Datacube:
                 multi_aper = False
                 
             d_angle, offset, dist_clus, \
-            pa, clus_cen_angle, max_dev = self.centroid_analysis(num, z=z, k_wid=k_wid, 
-                                                                        centroid_type=centroid_type, 
-                                                                        coord_type=coord_type,
-                                                                        fix_window=fix_w, 
-                                                                        emission_type=emission_type,
-                                                                        aperture_type=aperture_type,
-                                                                        sum_type=sum_type,
-                                                                        multi_aper=multi_aper,
-                                                                        n_rand=n_rand, aper_size=aper_size,
-                                                                        plot=False, print_out=print_out)
+            pa, clus_cen_angle = self.centroid_analysis(num, z=z, k_wid=k_wid, 
+                                                        centroid_type=centroid_type, 
+                                                        coord_type=coord_type,
+                                                        fix_window=fix_w, 
+                                                        emission_type=emission_type,
+                                                        aperture_type=aperture_type,
+                                                        sum_type=sum_type,
+                                                        multi_aper=multi_aper,
+                                                        n_rand=n_rand, aper_size=aper_size,
+                                                        plot=False, print_out=print_out)
             if num in Num_v:
                 if print_out:
                     print("Angle: %.3f  Offset: %.3f"%(d_angle, offset))    
@@ -917,7 +1168,6 @@ class Read_Datacube:
             self.dist_clus_cens = np.append(self.dist_clus_cens, dist_clus)
             self.PAs = np.append(self.PAs, pa)
             self.clus_cen_angles = np.append(self.clus_cen_angles, clus_cen_angle)
-            self.max_devs = np.append(self.max_devs, max_dev)
         
     def construct_control(self, Num_v, mag_cut=None, mag0=25.2, dist_cut=25, bootstraped=False, n_boot=100):
         """Construct control sample for comparison
@@ -930,51 +1180,51 @@ class Read_Datacube:
         
         """
         # remove nan values that fail in centroid analysis
-        Num_not_v = np.setdiff1d(self.Tab_SE["NUMBER"], Num_v)
+        Num_not_v = np.setdiff1d(self.table["NUMBER"], Num_v)
         ind_not_v = Num_not_v - 1
-        Num_c_all = np.setdiff1d(self.Tab_SE["NUMBER"][ind_not_v], 
+        Num_c_all = np.setdiff1d(self.table["NUMBER"][ind_not_v], 
                                  1 + np.where(np.isnan(self.diff_centroids))[0])
         
         # magnitude cut
-        mag = -2.5*np.log10(self.Tab_SE["FLUX_AUTO"])+mag0
+        mag = -2.5*np.log10(self.table["FLUX_AUTO"])+mag0
         mag_no_nan = mag[~np.isnan(mag)]
         
         if mag_cut is None:
             mag_cut = (mag.min(),mag.max())
             
-        Num_mag_ctrl = self.Tab_SE["NUMBER"][(mag>mag_cut[0])&(mag<mag_cut[1])]
+        Num_mag_ctrl = self.table["NUMBER"][(mag>mag_cut[0])&(mag<mag_cut[1])]
         Num_c = np.intersect1d(Num_c_all, Num_mag_ctrl)
         
         # area cut
         thre_iso_area = 10.
         print("Isophotal area threshold: ", thre_iso_area)
-        Num_area_ctrl = self.Tab_SE["NUMBER"][self.Tab_SE["ISOAREA_IMAGE"]>thre_iso_area]
+        Num_area_ctrl = self.table["NUMBER"][self.table["ISOAREA_IMAGE"]>thre_iso_area]
         
         Num_c = np.intersect1d(Num_c, Num_area_ctrl)
         
 #         # SNR cut
 #         thre_snr = np.percentile(self.SNRp_best,90)
 #         print("peak S/N threshold: ", thre_iso_area)
-#         Num_snr_ctrl = self.Tab_SE["NUMBER"][(self.SNRp_best<thre_snr)]
+#         Num_snr_ctrl = self.table["NUMBER"][(self.SNRp_best<thre_snr)]
 #         Num_c = np.intersect1d(Num_c, Num_snr_ctrl)
         
         # radius cut
-        Num_rp_ctrl = self.Tab_SE["NUMBER"][(self.Tab_SE["PETRO_RADIUS"]>0)&(self.Tab_SE["PETRO_RADIUS"]<10)]        
+        Num_rp_ctrl = self.table["NUMBER"][(self.table["PETRO_RADIUS"]>0)&(self.table["PETRO_RADIUS"]<10)]        
         Num_c = np.intersect1d(Num_c, Num_rp_ctrl)      
         
         # elongation cut < 2 sigma
-        thre_elong = np.percentile(self.Tab_SE["ELONGATION"],97.5)
-        Num_elong_ctrl = self.Tab_SE["NUMBER"][self.Tab_SE["ELONGATION"]<thre_elong]
+        thre_elong = np.percentile(self.table["ELONGATION"],97.5)
+        Num_elong_ctrl = self.table["NUMBER"][self.table["ELONGATION"]<thre_elong]
         Num_c = np.intersect1d(Num_c, Num_elong_ctrl)
         
         # edge cut
         Y_pix, X_pix = np.indices(self.mask_edge.shape)
         dist_edge = np.array([np.sqrt((X_pix[~self.mask_edge]-gal["X_IMAGE"])**2 + \
                               (Y_pix[~self.mask_edge]-gal["Y_IMAGE"])**2).min() \
-                              for gal in self.Tab_SE])
+                              for gal in self.table])
         self.dist_edge = dist_edge
         print("Distance to field edge threshold: ", dist_cut)
-        Num_edge_ctrl = self.Tab_SE["NUMBER"][dist_edge>dist_cut]
+        Num_edge_ctrl = self.table["NUMBER"][dist_edge>dist_cut]
         Num_c = np.intersect1d(Num_c, Num_edge_ctrl)
         
         print('Control Sample : n=%d'%len(Num_c))
