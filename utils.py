@@ -40,7 +40,7 @@ def sigmoid(x,x0=0):
 def gaussian_func(x, a, sigma):
             # Define a gaussian function with offset
             return a * np.exp(-x**2/(2*sigma**2))
-        
+
 def colorbar(mappable, pad=0.2, size="5%", loc="right", **args):
     from mpl_toolkits.axes_grid1 import make_axes_locatable
     ax = mappable.axes
@@ -87,7 +87,7 @@ def coord_Array2Im(x_arr, y_arr):
     X_IMAGE, Y_IMAGE = y_arr+1, x_arr+1
     return X_IMAGE, Y_IMAGE
 
-def check_save_path(dir_name)
+def check_save_path(dir_name):
     if not os.path.exists(dir_name):
         print("%s does not exist. Make a new directory."%dir_name)
         os.makedirs(dir_name)
@@ -212,7 +212,14 @@ def calculate_seeing(tab_star, image, seg_map, R_pix=15, sigma_guess=1, min_num=
                 
         return FWHMs
     
-    
+def moving_average(x, w=3):
+    return np.convolve(x, np.ones(w), 'valid') / w
+
+def moving_average_cube(icol, cube, w=3):
+    rows = cube[:,:,icol].T
+    y = np.array([moving_average(row, w=w) for row in rows])
+    return y 
+
 def background_sub_SE(field, mask=None, b_size=128, f_size=3, n_iter=10):
     """ Subtract background using SE estimator with mask """ 
     from photutils import Background2D, SExtractorBackground
@@ -523,14 +530,19 @@ def fit_continuum(spec, wavl, model='GP',
     return res, wavl_rebin, cont_fit
 
 
-def generate_template(wavl, z=0, n_intp=2, 
-                      line_ratio=[1,1,1], box_wid=4, sigma=3,
-                      temp_type="Ha-NII", temp_model="gauss", plot=True):
-    """Generate a template for with line ratio [NII6548, Ha, NII6584]/[Hb, OIII4959, OIII5007] and width [box_wid]
-    # For Gaussian models sigma(stddev)=sigma
-    # For delta function width=box_wid"""
-    wav_wid = wavl[-1] - wavl[0]
+def generate_template(wavl, z=0, n_intp=2,
+                      temp_type="Ha-NII", temp_model="gauss",
+                      temp_params={'box_width':4, 'line_ratio':[1,1,1],
+                                   'sigma':3, 'a_sinc':5},
+                      plot=True, alpha=0.7):
+    """
+    Generate a template for with line ratio [NII6548, Ha, NII6584]/[OIII4959, OIII5007]
+    # For Gaussian models sigma (i.e. stddev) = sigma
+    # For delta function width = box_wid
+    """
+    wavl_range = wavl[-1] - wavl[0]
     n_temp = int(len(wavl)) * n_intp +1  # +1 from rebinning wavelength during continuum fitting
+    
     if temp_type=="Ha-NII":
         lam_0 = 6563.
         line_pos = [6548.*(1+z), 6563.*(1+z), 6584.*(1+z)]
@@ -541,45 +553,59 @@ def generate_template(wavl, z=0, n_intp=2,
         lam_0 = 3727.
         line_pos = [3727.*(1+z)]
         
-    wavl_temp = np.e**np.linspace(np.log(lam_0*(1+z)-wav_wid/2.),np.log(lam_0*(1+z)+wav_wid/2.), n_temp)
-        
+    wavl_temp = np.e**np.linspace(np.log(lam_0*(1+z)-wavl_range/2.),
+                                  np.log(lam_0*(1+z)+wavl_range/2.), n_temp)
+    
+    line_ratio = temp_params["line_ratio"]
+
     if temp_model == "box":
+        box_wid = temp_params["box_width"]
         s = np.sum([models.Box1D(amplitude=lr, x_0=lp, width=box_wid) for (lr, lp) in zip(line_ratio, line_pos)])
         temp = s(wavl_temp)
+        
     elif (temp_model == "gauss")|(temp_model == "sincgauss"):
+        sigma = temp_params["sigma"]
         s = np.sum([models.Gaussian1D(amplitude=lr, mean=lp, stddev=sigma) for (lr, lp) in zip(line_ratio, line_pos)])
         temp = s(wavl_temp)
+        
         if temp_model == "sincgauss":
-            ILS = np.sinc((wavl_temp-lam_0*(1+z))/5.)
-            temp = np.convolve(temp,ILS, mode="same")
-            temp[(wavl_temp<lam_0*(1+z)-50)|(wavl_temp>lam_0*(1+z)+50)]=0
-    else: 
-        print('Model type: "box" or "gauss"?')
+            a_sinc = temp_params["a_sinc"]
+            ILS = np.sinc((wavl_temp-lam_0*(1+z))/a_sinc)
+            temp = np.convolve(temp, ILS, mode="same")
+            temp[(wavl_temp<lam_0*(1+z)-25)|(wavl_temp>lam_0*(1+z)+25)]=0
+            
+    else: print('Model type: "box" or "gauss" or "sincgauss"')
         
     temp /= np.max([1, temp.max()])
     
     if plot:
-        plt.step(wavl_temp, temp,"g",where="mid", alpha=0.5)
+        plt.plot(wavl_temp, temp,"g", alpha=alpha)
         for lp in line_pos:
-            plt.axvline(lp, color="k", ls="-.", alpha=0.7) 
+            plt.axvline(lp, color="k", ls="-.", alpha=alpha) 
         
     return temp, wavl_temp  
 
 
-def xcor_SNR(res, wavl_rebin, temps, wavl_temp, 
-             d_wavl, n_intp=1, kind_intp="linear",
-             z_sys=0.228, rv=None, edge=20,
+def xcor_SNR(res, wavl_rebin, 
+             temps, wavl_temp, 
+             d_wavl, z_sys=0.228, rv=None, 
+             edge=20, h_contrast=0.1,
+             n_intp=1, kind_intp="linear",
              temp_type="Ha-NII", temp_model="gauss",
-             temps_stddev=3, temps_ratio=None,
-             plot=False, fig=None, axes=None, h_contrast=0.1):
-    """Cross-correlate with template and return rative velocity to z0 and corr function
+             temps_params={'stddev':3, 'line_ratio':[1,1,1]},
+             const_window=True, plot=False, fig=None, axes=None):
+    """
+    Cross-correlate with template and return rative velocity to z0 and correlation function
     
-    res : normalized residual spectra
+    res : normalized input spectra
     wavl_rebin : rebinned wavelength
     rv : relative redshift and velocity to z=z0, None if not known (the first object in batch)
     """ 
     
-    # interpolation data before cross-correlation to match template
+    temps_stddev = temps_params['stddev']
+    temps_ratio = temps_params['line_ratio']
+    
+    # Interpolate data before cross-correlation to match template with the same sampling
     Interp_spec = interpolate.interp1d(wavl_rebin, res, kind=kind_intp)
     log_x = np.linspace(np.log(wavl_rebin)[0],np.log(wavl_rebin)[-1], int(len(wavl_rebin)-1) * n_intp +1)
     x = np.e**log_x
@@ -599,6 +625,9 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
         line_pos = np.array([3727.])
         line_name = [" "]
         lam_0 = 3727.
+    else:
+        print('Available template types are: "Ha-NII", "Hb-OIII" and "OII"')
+        return None
       
     z0 = 6563.*(1+z_sys)/lam_0 - 1  # reference redshift, the matched line by default is Ha
     
@@ -607,8 +636,7 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
         cc = signal.correlate(y, temps[0], mode="full", method="direct")    
         
         rz = np.linspace((x[0] - d_wavl/n_intp * temps.shape[1]/2.) / lam_0 - 1, 
-                         (x[-1] + d_wavl/n_intp * temps.shape[1]/2.) / lam_0 - 1, 
-                         len(cc)) - z0    
+                         (x[-1] + d_wavl/n_intp * temps.shape[1]/2.) / lam_0 - 1, len(cc)) - z0    
 
         rv = rz * 3e5
     else:
@@ -624,37 +652,42 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
     SNRs = np.zeros(temps.shape[0])
     Contrasts = np.zeros(temps.shape[0])
     
-    rv_edge = ((np.max([x[x!=0][0], x[0]+edge])/lam_0-1-z0) * 3e5,   # x=0 is mock edge during the continuum fitting
+    # min/max rv based on the wavelength range
+    rv_edge = ((np.max([x[x!=0][0], x[0]+edge])/lam_0-1-z0) * 3e5,   # x=0 is artificially set during the continuum fitting
                (np.min([x[x!=0][-1], x[-1]-edge])/lam_0-1-z0) * 3e5) 
     
-    z_range = (rv>(zmin-z0)*3e5) & (rv<(zmax-z0)*3e5)
-    find_range = z_range & (rv > rv_edge[0]) & (rv < rv_edge[1])
+    # possible range of rv given possible range of redshift 
+    rv_zrange = (rv>(zmin-z0)*3e5) & (rv<(zmax-z0)*3e5)
+    find_range = rv_zrange & (rv > rv_edge[0]) & (rv < rv_edge[1])
     
     for i, (temp, sigma, ratio) in enumerate(zip(temps, temps_stddev, temps_ratio)):
         # vicinity around lines to be excluded when measuring noise RMS
-        if temp_model=="sincgauss":
-            sigma *= 3 
-        w_l = sigma * 3.
-        w_l2 = sigma * 8.
+#         if temp_model=="sincgauss":
+#             sigma *= 3
+        if const_window:
+            w_l, w_l2 = 20, 40
+        else:
+            w_l, w_l2 = sigma * 5, sigma * 8
         
-        if temp_type=="Ha-NII":   #For strong AGN/composite use a broader window, the transform is to make it continous
-            if ratio.max()/3. < 3.:  #<2:1=>1.5w_l, >3:1=>w_l
-                if sigma > 4:  
-                    if SNRs.max()>=50:  
-                        w_l2 *= 1.5
-        
+        if temp_type=="Ha-NII":   #For strong AGN/composite use a broader window, the transform is set as continous
+            if ratio.max()/3. < 3.:
+                if (sigma > 5) & (SNRs.max()>=50):  
+                    w_l *= 1.5
+                    w_l2 *= 1.5
+    
         cc = signal.correlate(y, temp, mode="full", method="direct")
         cc = cc/cc.max()
         ccs[i] = cc
         
-        # Peak redshift (via quadratic interpolation around the peak)
-        # note: difference with a gaussian fitting to the peak is <0.0001 in z
+        # Peak redshift (use cubic interpolation around the peak)
+        # note: difference in z with a gaussian fitting to the peak is very small
         
-        rv_p = rv[find_range][np.argmax(cc[find_range])]
-        Interp_Peak = interpolate.interp1d(rv, cc, kind='linear')
+        rv_p = rv[find_range][np.argmax(cc[find_range])]  # rv peak
+        Interp_Peak = interpolate.interp1d(rv, cc, kind='cubic')
        
         # rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 3*w_l/lam_0*3e5]), np.min([rv_edge[1],rv_p + 3*w_l/lam_0*3e5]), 300)
-        rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 1500]), np.min([rv_edge[1],rv_p + 1500]), 150)
+        rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 1600]), 
+                              np.min([rv_edge[1],rv_p + 1600]), 200)
         cc_intp = Interp_Peak(rv_intp)
         rv_match = rv_intp[np.argmax(cc_intp)]
         rz_match = rv_intp[np.argmax(cc_intp)] / 3e5
@@ -662,135 +695,166 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
         z_cc = z0 + rz_match
         z_ccs[i] = z_cc
         
-        S_p = cc_intp.max()
+        S_p = cc_intp.max()  # peak of cross-correlation function 
         
-        # peak_range = (abs(rv-rv_match)/3e5 < 1.5*w_l/lam_0)
         peak_range = (abs(rv-rv_match)/3e5 < w_l/lam_0)
-        if temp_type=="Ha-NII":
-            noise_peak_range = (~peak_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])  # not use edge
-           
-            signal_range = ((rv > (rv_match - (w_l2+lam_0-6548.)/6548.*3e5)) &\
-                            (rv < (rv_match + (w_l2+6584.-lam_0)/6584.*3e5)))
-            noise_range =  ~signal_range & (rv > rv_edge[0]) & (rv < rv_edge[1])  # not use edge
-            
-        elif temp_type=="Hb-OIII":
-            noise_peak_range = (~peak_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])  # not use edge
-            
-            signal_range = (abs(rz-rz_match) < w_l/lam_0) | (abs(rz-4959.*(1+z_cc)/5007.-z0-1)<w_l/lam_0)
-            noise_range = ~signal_range& (rv > rv_edge[0]) & (rv < rv_edge[1]) 
         
+        # note: when compute noise of CC function, edge not in use 
+        if (temp_type=="Ha-NII") | (temp_type=="Hb-OIII"):
+            
+            noise_peak_range = (~peak_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])
+            
+            if temp_type=="Ha-NII":
+                signal_range = ((rv > (rv_match - (w_l2+lam_0-6548.)/6548.*3e5)) &\
+                                (rv < (rv_match + (w_l2+6584.-lam_0)/6584.*3e5)))
+                
+            elif temp_type=="Hb-OIII":
+                signal_range = (abs(rz-rz_match) < w_l/lam_0) | (abs(rz-4959.*(1+z_cc)/5007.-z0-1)<w_l/lam_0)
+                
+            noise_range = (~signal_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])
+                
         elif temp_type=="OII":
             signal_range = peak_range
-            noise_range = (~signal_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])  # not use edge
+            noise_range = (~signal_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])
             noise_peak_range = noise_range
 
-#         N = np.std(sigma_clip(cc[z_range & noise_range], sigma=3, maxiters=10))
-#         N = mad_std(cc[z_range & noise_range])
-        N = np.std(cc[z_range & noise_range])
-        SNRs[i] = S_p/N  # detection S/N
+        # compute noise and S/N for the lines and the peak
+        N = np.std(sigma_clip(cc[rv_zrange & noise_range], sigma=5, maxiters=10))
+#         N = mad_std(cc[rv_zrange & noise_range])
+#         N = np.std(cc[rv_zrange & noise_range])           # simply use std?
         
-#         N_p = np.std(sigma_clip(cc[z_range & noise_peak_range], sigma=3, maxiters=10))
-#         N_p = mad_std(cc[z_range & noise_peak_range])
-        N_p = np.std(cc[z_range & noise_peak_range])
+        # detection S/N
+        SNRs[i] = S_p/N  
+        
+        N_p = np.std(sigma_clip(cc[rv_zrange & noise_peak_range], sigma=5, maxiters=10))
+#         N_p = mad_std(cc[rv_zrange & noise_peak_range])
+#         N_p = np.std(cc[rv_zrange & noise_peak_range])    # simply use std?
         SNR_ps[i] = S_p/N_p
         
     
-    ###-------##
-        if (temp_type=="Ha-NII"):
+        ###-----------------------------------##
+        # Find peaks and compute peak significance
+        if temp_type=="Ha-NII":
             try:
-                ind_peak, _ = signal.find_peaks(cc_intp, height=h_contrast, distance = 50)
+                # find peak higher than h_contrast
+                ind_peak, _ = signal.find_peaks(cc_intp, height=h_contrast, distance=50)
+                
+                # peak value from higher to lower
                 peaks = np.sort(cc_intp[ind_peak])[::-1]
 
                 if len(peaks)>=2:
                     Contrasts[i] = peaks[0]/peaks[1]
-                else: Contrasts[i] = 1.0 #peaks[0]*(ratio.max()/3.)
+                
+                else:     #single peak
+                    Contrasts[i] = 1.0 #peaks[0]*(ratio.max()/3.)  # upper bond
+                    
             except ValueError:
                 Contrasts[i] = -0.1
         
-        elif (temp_type=="Hb-OIII"):
-            rv_intp_b = np.linspace(np.max([rv_edge[0],(4959.*(1+z_cc)/5007.-z0-1)*3e5 - w_l/lam_0*3e5]), 
-                                    np.min([rv_edge[1],(4959.*(1+z_cc)/5007.-z0-1)*3e5 + w_l/lam_0*3e5]), 100)
-            rv_intp_all = np.concatenate([rv_intp_b,rv_intp])
+        elif temp_type=="Hb-OIII":
+            # For double line template, the second peak is in another rv range
+            rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 1000]),
+                                  np.min([rv_edge[1],rv_p + 1000]), 100)
             
+            rv_intp_2 = np.linspace(np.max([rv_edge[0],(4959.*(1+z_cc)/5007.-z0-1)*3e5 - 1000]), 
+                                    np.min([rv_edge[1],(4959.*(1+z_cc)/5007.-z0-1)*3e5 + 1000]), 100)
+            rv_intp_all = np.concatenate([rv_intp_2,rv_intp])
             
             cc_intp_all = Interp_Peak(rv_intp_all)
-            ind_peak, _ = signal.find_peaks(cc_intp_all, height=h_contrast, distance = 100)
+            ind_peak, _ = signal.find_peaks(cc_intp_all, height=h_contrast, distance=25)
             peaks = np.sort(cc_intp_all[ind_peak])[::-1]
+            
             if len(peaks)>=2:
                 Contrasts[i] = peaks[0]/peaks[1]
-            else: Contrasts[i] = 1.0
+            else:
+                Contrasts[i] = 1.0
             
         elif temp_type=="OII":
             Contrasts[i] = 1.0
             
-    Rs = Contrasts*SNRs/np.max(SNRs)     #Significance
+    Rs = Contrasts*SNRs/np.max(SNRs)     #Significance defined as S/N weight peak ratio
 #     z_loc = (z_ccs>np.percentile(z_ccs,2.5)) & (z_ccs<np.percentile(z_ccs,97.5))
-    r_max = np.argmax(Rs)
-#     r_max = np.argmax(Contrasts)
+
+    # The best matched template
+    if temp_model == "box":
+        best = np.argmax(Contrasts)
+    else:
+        best = np.argmax(Rs)
     
-    ###-------##
-    z_best = z_ccs[r_max]
-    line_at_edge = ((1+z_best)*lam_0<(x[0]+edge)) | ((1+z_best)*lam_0>(x[-1]-edge))   
+    ###-----------------------------------##
+    z_best = z_ccs[best]
+    
+    #  if the line is within 25A to the edge, raise a flag caution
+    line_at_edge = ((1+z_best)*lam_0<(x[0]+25)) | ((1+z_best)*lam_0>(x[-1]-25))   
     if line_at_edge: 
-        flag_edge = 1  # near the filter edge, raise caution
+        flag_edge = 1
     else: 
         flag_edge = 0
 
     if plot:
-        if fig==None:
-            fig = plt.figure(figsize=(8,6))
-            ax1 = plt.subplot(211)
-            ax2 = plt.subplot(212)
+        
+        if fig is None:
+            fig, (ax1,ax2) = plt.subplots(2,1,figsize=(8,6))
         else:
             ax1, ax2 = axes
+            
         ax1.step(wavl_rebin, res, c="royalblue", lw=2, where="mid", label="Residual", alpha=0.9, zorder=4)
 #         ax1.plot(x, y, c="steelblue", linestyle='--', alpha=0.9, zorder=4)
+
         if (temps_ratio is None):
-            ax1.step(wavl_temp*(1+z_ccs[r_max]),temps[r_max], color="seagreen", where="mid",
-                     alpha=0.7, label="Template: z=%.3g"%z_ccs[r_max], zorder=3)
+            ax1.step(wavl_temp*(1+z_ccs[best]),temps[best], color="seagreen", where="mid",
+                     alpha=0.7, label="Template: z=%.3g"%z_ccs[best], zorder=3)
         else:
-            if (temp_model == "gauss")|(temp_model == "sincgauss"):
-                
-                #Plot ideal model template
-                sig_best, ratio_best = temps_stddev[r_max], temps_ratio[r_max]
-                                
-                print("Best z:",z_best, "Best sigma:",sig_best)
-                line_pos = line_pos*(1+z_best)
-                
-                s = np.sum([models.Gaussian1D(amplitude=lr, mean=lp, stddev=sig_best) for (lr, lp) in zip(ratio_best, line_pos)])
-                wavl_new = np.linspace(wavl_temp[0], wavl_temp[-1], 400)/(1+z0)*(1+z_best)
-                temp_best = s(wavl_new)
-                if (temp_model == "sincgauss"):
-                    ILS = np.sinc((wavl_new-lam_0*(1+z_best))/5.)
-                    temp_best = np.convolve(temp_best, ILS, mode="same")
-                    temp_best[(wavl_new<lam_0*(1+z_best)-50)|(wavl_new>lam_0*(1+z_best)+50)]=0  # let higher-order lobe to be 0
-                    
-#                 ax1.step(wavl_temp/(1+z0)*(1+z_best), temps[r_max], color="g", where="mid",
-#                          alpha=0.5, label="Template: z=%.3g"%z_best, zorder=3)  
-                ax1.plot(wavl_new, temp_best/temp_best.max(), color="mediumseagreen", 
-                     alpha=0.7, lw=2, linestyle='--',  zorder=5)    
-                
-                if temp_model=="sincgauss":
-                    sig_best *= 3
+            #Plot ideal model template
+            sig_best, ratio_best = temps_stddev[best], temps_ratio[best]
+
+            print("Best z:",z_best, "Best sigma:",sig_best)
+            line_pos = line_pos*(1+z_best)
+
+            if temp_model == "box":
+                # if use box template, sigma are the same (box_wid/2.355)
+                s = np.sum([models.Box1D(amplitude=lr, x_0=lp, width=sig_best*2.355)
+                            for (lr, lp) in zip(ratio_best, line_pos)])
+            else:
+                s = np.sum([models.Gaussian1D(amplitude=lr, mean=lp, stddev=sig_best)
+                            for (lr, lp) in zip(ratio_best, line_pos)])
+
+            wavl_new = np.linspace(wavl_temp[0], wavl_temp[-1], 400)/(1+z0)*(1+z_best)
+            temp_best = s(wavl_new)
+            
+            if (temp_model == "sincgauss"):
+                ILS = np.sinc((wavl_new-lam_0*(1+z_best))/5.)
+                temp_best = np.convolve(temp_best, ILS, mode="same")
+                temp_best[(wavl_new<lam_0*(1+z_best)-50)|(wavl_new>lam_0*(1+z_best)+50)]=0  # let higher-order lobe to be 0
+
+#             ax1.step(wavl_temp/(1+z0)*(1+z_best), temps[best], color="g", where="mid",
+#                      alpha=0.5, label="Template: z=%.3g"%z_best, zorder=3)  
+            ax1.step(wavl_new, temp_best/temp_best.max(), color="mediumseagreen",
+                     where='mid', lw=2, linestyle='--', alpha=0.7, zorder=5)    
+
+            if const_window:
+                w_l, w_l2 = 20, 40
+            else:
                 w_l, w_l2 = sig_best * 3., sig_best * 8.
-                
-                if temp_type=="Ha-NII":   #For strong AGN/composite use a broader window, the transform is to make it continous
-                    if ratio_best.max()/3. < 3.:  #<2:1=>1.5w_l, >3:1=>w_l
-                        if sig_best > 4:  
-                            if SNRs[r_max]>=50:  
-                                w_l2 *= 1.5                
+
+            if temp_type=="Ha-NII":   #For strong AGN/composite use a broader window, the transform is to make it continous
+                if ratio_best.max()/3. < 3.:  #<2:1=>1.5w_l, >3:1=>w_l
+                    if sig_best > 4:  
+                        if SNRs[best]>=50:  
+                            w_l2 *= 1.5                
                 
                            
         for k, (lp, ln) in enumerate(zip(line_pos, line_name)):
             if ln!=" ":
                 if (lp<x[0]+edge-5) | (lp>x[-1]-edge+5):
                     continue
-                y_lab = res.max() if (k==1) else 0.85 * res.max()
+                y_lab = res.max() if (k==1) else 0.875 * res.max()
                 ax1.vlines(x=lp, ymin=y_lab+0.1, ymax=y_lab+0.18, color='k', lw=1.5)
-                ax1.text(x=lp, y=y_lab+0.28, s=ln, color='k', ha="center", va="center", fontsize=10)
+                ax1.text(x=lp, y=y_lab+0.3, s=ln, color='k', ha="center", va="center", fontsize=11)
                 ax1.set_ylim(res.min()-0.05, res.max()+0.375)
             else:
                 ax1.set_ylim(res.min()-0.05, res.max()+0.25)
+                
         ax1.set_xlim(x[0]-10, x[-1]+10)
         
         x_text = 0.75 if z_best < 0.24 else 0.12
@@ -801,19 +865,19 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
         
         for i, temp in enumerate(temps):    
             ax2.plot(rv, ccs[i], "firebrick", alpha=np.min([0.9, 0.9/len(temps)*3]))
-        ax2.plot(rv, ccs[r_max], "red", lw=1, alpha=0.7, zorder=4)
+        ax2.plot(rv, ccs[best], "red", lw=1, alpha=0.7, zorder=4)
         
-        rv_left, rv_right = ((z_ccs[r_max]-z0 - w_l/lam_0)*3e5, 
-                             (z_ccs[r_max]-z0 + w_l/lam_0)*3e5)  
+        rv_left, rv_right = ((z_ccs[best]-z0 - w_l/lam_0)*3e5, 
+                             (z_ccs[best]-z0 + w_l/lam_0)*3e5)  
         
         if temp_type=="Ha-NII":
-            rv_left2, rv_right2 = (np.max([rv_edge[0],(z_ccs[r_max]-z0 - (w_l2+lam_0-6548.)/6548.) * 3e5]), 
-                                   np.min([rv_edge[1],(z_ccs[r_max]-z0 + (w_l2+6584.-lam_0)/6584.) * 3e5]) )
+            rv_left2, rv_right2 = (np.max([rv_edge[0],(z_ccs[best]-z0 - (w_l2+lam_0-6548.)/6548.) * 3e5]), 
+                                   np.min([rv_edge[1],(z_ccs[best]-z0 + (w_l2+6584.-lam_0)/6584.) * 3e5]))
             
         elif temp_type=="Hb-OIII":
             rv_left2, rv_right2 = rv_left, rv_right
-            rv_left2b, rv_right2b = (np.max([rv_edge[0],((4959.*(1+z_ccs[r_max])/5007.-z0-1) - w_l/lam_0) * 3e5]),
-                                     np.min([rv_edge[1],((4959.*(1+z_ccs[r_max])/5007.-z0-1) + w_l/lam_0) * 3e5]) )
+            rv_left2b, rv_right2b = (np.max([rv_edge[0],((4959.*(1+z_ccs[best])/5007.-z0-1) - w_l/lam_0) * 3e5]),
+                                     np.min([rv_edge[1],((4959.*(1+z_ccs[best])/5007.-z0-1) + w_l/lam_0) * 3e5]))
             ax2.axvline((4959.*(1+z_best)/5007.-z0-1)*3e5, color="orangered", lw=1.5, ls="--", alpha=0.8)
             ax2.axvspan(rv_left2b, rv_right2b, alpha=0.15, color='indianred', zorder=2)
             
@@ -838,16 +902,17 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
         ##--Label the CC peak--##
         try:
             if temp_type=="Ha-NII":
-                rv_intp = np.linspace(rv_left2, rv_right2, 300)
-                d_min = 30
+                rv_intp = np.linspace(rv_left2, rv_right2, 200)
+                d_min = 25
             elif temp_type=="Hb-OIII":
-                rv_intp = np.concatenate([np.linspace(rv_left2b, rv_right2b, 150),
-                                          np.linspace(rv_left2, rv_right2, 150)]) 
-                d_min = 100
+                rv_intp = np.concatenate([np.linspace(rv_left2b, rv_right2b, 100),
+                                          np.linspace(rv_left2, rv_right2, 200)]) 
+                d_min = 25
             elif temp_type=="OII":
-                rv_intp = np.linspace(rv_left2, rv_right2, 150)
-                d_min = 30
-            Interp_Peak = interpolate.interp1d(rv, ccs[r_max], kind='quadratic')
+                rv_intp = np.linspace(rv_left2, rv_right2, 100)
+                d_min = 50
+                
+            Interp_Peak = interpolate.interp1d(rv, ccs[best], kind='quadratic')
             cc_intp = Interp_Peak(rv_intp)
 
             ind_peak, _ = signal.find_peaks(cc_intp, height=h_contrast, distance = d_min)
@@ -855,16 +920,17 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
             
         except ValueError:
             pass
+        
         ##----##
         
         ax2.axhline(0, color="k", lw=1.5, ls="--", alpha=0.7)
-        ax2.axvline((z_ccs[r_max]-z0)*3e5, color="orangered", lw=1.5, ls="--", alpha=0.8)
+        ax2.axvline((z_ccs[best]-z0)*3e5, color="orangered", lw=1.5, ls="--", alpha=0.8)
         print("Peak wavl",x[np.argmax(y)])
                            
-        ax2.text(x_text, 0.85, r"$\rm S/N: %.1f$"%(SNRs[r_max]),
+        ax2.text(x_text, 0.85, r"$\rm S/N: %.1f$"%(SNRs[best]),
                  color='k',fontsize=14, transform=ax2.transAxes,alpha=0.95, zorder=4)
         if temp_type!="OII":
-            ax2.text(x_text, 0.7, r"$\rm R: %.1f$"%(Rs[r_max]),
+            ax2.text(x_text, 0.7, r"$\rm R: %.1f$"%(Rs[best]),
                      color='k',fontsize=14, transform=ax2.transAxes,alpha=0.95, zorder=4)
         ax2.set_xlim((zmin-z0)*3e5, (zmax-z0)*3e5)
         ax2.set_xlabel('Relative Velocity (km/s) to z=%.3g'%z0,fontsize=16)
@@ -874,7 +940,7 @@ def xcor_SNR(res, wavl_rebin, temps, wavl_temp,
         axb.cla()
         axb.set_xlim(zmin,zmax)
         axb.set_xlabel("Redshift",fontsize=16)      
-        
+    
     return ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
 
     

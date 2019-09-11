@@ -80,6 +80,10 @@ def group_ranks_by_socket(verbose=False):
 
     return master_ranks
 
+# Arrays read from fits might cause Pickling Error, returning the
+# following message: 'numpy.ndarray' object has no attribute 'offset'.
+# The issue is due to a use of python pure mmap. 
+# Solution: to make a numpy copy of the input arrays.
 
 def parallel_compute(data, func, cores=None, lengthy_computation=False, func_args=None, func_kwargs=None, verbose=False):
     """

@@ -1,11 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
+
 from astropy.io import fits
 from astropy.table import Table
 from astropy.stats import mad_std
-import scipy.stats as stats
 from astroquery.vizier import Vizier
+
 import re
+import glob
+import pprint as pp
 
 from utils import *
 
@@ -66,7 +69,7 @@ class DeepFrame:
         """ Mask edges """
         check_save_path(save_path)
         hdu_edge = fits.PrimaryHDU(data=self.mask_edge.astype("float"))
-        hdu_edge.writeto(save_path + '%s_edge.fits'%self.name,overwrite=True)
+        hdu_edge.writeto(save_path + '%s_DF_edge.fits'%self.name,overwrite=True)
     
     def make_mask_streak(self, file_path, threshold=5, shape_cut=0.15, area_cut=500,
                          display=True, save_plot=True):
@@ -337,13 +340,13 @@ class Read_Datacube:
     name: name of object for saving.
     mode: spectra extraction method 'ISO' or 'APER' (requring SExtractor output)
     
-    table: Photutils / SExtractor table (None if reading raw).
-    seg_map: SExtractor segmentation map (None if mode is 'ISO').
+    table: table of source properties from Photutils / SExtractor (None before source extraction).
+    seg_map: SExtractor segmentation map (None before source extraction).
     mask_edge: edge mask (None if reading raw).
 
     """
     
-    def __init__(self, cube_path, name, mode="M2ISO",
+    def __init__(self, cube_path, name, mode="MMA",
                  table=None, seg_map=None, mask_edge=None,
                  deep_frame=None, z0=None):
         
@@ -351,12 +354,13 @@ class Read_Datacube:
         self.header = self.hdu[0].header
         self.cube = self.hdu[0].data
         self.stack_field = self.cube.sum(axis=0)
+        self.shape = self.cube.shape
         
         self.name = name
         self.z0 = z0
         self.mode = mode
         
-        if mode=="M2ISO":            
+        if (mode=="MMA")|(mode=="m2"):            
             self.mask_edge = None
             if table is not None:
                 self.table = Table.read(table, format='ascii')
@@ -365,7 +369,7 @@ class Read_Datacube:
             self.table = Table.read(table, format="ascii.sextractor")
             self.mask_edge = fits.open(mask_edge)[0].data.astype('bool')             
         else:
-            raise ValueError("Choose an extraction mode: 'M2ISO' or 'APER' ('APER' requires SExtractor output)")
+            raise ValueError("Choose an extraction mode: 'MMA' or 'm2' or 'APER' ('APER' requires SExtractor output)")
         
         try:
             self.seg_map = fits.open(seg_map)[0].data
@@ -404,24 +408,45 @@ class Read_Datacube:
         self.CCs_Temps  = {}
        
     
-    def m2iso_source_detection(self, sn_thre=2, npixels=8,
-                               nlevels=64, contrast=0.01, closing=True,
-                               columns=['id', 'xcentroid', 'ycentroid', 'ellipticity', 'equivalent_radius', 'area'],
-                               save=True, save_path = './', suffix=""):
-        """ Source Extraction using the second maximum map """
+    def ISO_source_detection(self, sn_thre=2, npixels=8,
+                             nlevels=64, contrast=0.01, closing=True,
+                             columns=['id', 'xcentroid', 'ycentroid', 'ellipticity', 'equivalent_radius', 'area'],
+                             n_win=3, parallel=False, save=True, save_path = './', suffix=""):
+        """ Source Extraction based on Isophotal of S/N """
         from skimage import morphology
         from photutils import source_properties
         
-        # Second maximum manipulation in wavelength
-        print("Use the map of second maximum along wavelength to detect source.")
-        image_m2 = np.partition(self.cube, kth=-2, axis=0)[-2]
-        back, back_rms = background_sub_SE(image_m2, b_size=128)
-        threshold = back + (sn_thre * back_rms)
+        # Pixel-wise manipulation in wavelength
+        
+        if self.mode == "MMA":
+            print("Use the map of maximum of moving average (MMA) along wavelength to detect source.")
+            
+            if parallel:
+                print("Run moving average in parallel. This could be slower using few cores.")
+                
+                from usid_processing import parallel_compute
+                from functools import partial
+                p_moving_average_cube = partial(moving_average_cube, cube=self.cube.copy())
+                results = parallel_compute(np.arange(self.shape[2]), p_moving_average_cube,
+                                           lengthy_computation=False, verbose=True)
+                src_map = np.max(results,axis=2).T
+                
+            else:
+                src_map = np.empty_like(self.stack_field)
+                for i in range(self.shape[1]):
+                    for j in range(self.shape[2]):
+                        src_map[i,j] = max(moving_average(self.cube[:,i,j], n_win))
+                    
+        elif self.mode == "m2":
+            print("Use the map of second maximum (m2) along wavelength to detect source.")
+            src_map = np.partition(self.cube, kth=-2, axis=0)[-2]
         
         # Detect + deblend source
         print("Detecting and deblending source...")
-        segm0 = detect_sources(image_m2, threshold, npixels=npixels)
-        segm = deblend_sources(image_m2, segm0, npixels=npixels, nlevels=nlevels, contrast=contrast)
+        back, back_rms = background_sub_SE(src_map, b_size=128)
+        threshold = back + (sn_thre * back_rms)
+        segm0 = detect_sources(src_map, threshold, npixels=npixels)
+        segm = deblend_sources(src_map, segm0, npixels=npixels, nlevels=nlevels, contrast=contrast)
         if closing is True:
             seg_map = morphology.closing(segm.data)
         else:
@@ -430,31 +455,33 @@ class Read_Datacube:
         # Save 2nd max map and segmentation map
         if save:
             check_save_path(save_path)
-            hdu_m2 = fits.PrimaryHDU(data=image_m2, header=self.header)
-            hdu_m2.writeto(save_path + '%s_max2%s.fits'%(self.name, suffix), overwrite=True)
+            hdu_m2 = fits.PrimaryHDU(data=src_map, header=self.header)
+            hdu_m2.writeto(save_path + '%s_%s%s.fits'%(self.name, self.mode, suffix), overwrite=True)
             hdu_seg = fits.PrimaryHDU(data=seg_map, header=None)
-            hdu_seg.writeto(save_path + '%s_segm_m2%s.fits'%(self.name, suffix), overwrite=True)
+            hdu_seg.writeto(save_path + '%s_segm_%s%s.fits'%(self.name, self.mode, suffix), overwrite=True)
         
         # Meausure properties of detections
-        cat = source_properties(image_m2, segm)
+        cat = source_properties(src_map, segm)
         tab = cat.to_table(columns=columns)   
         for name in tab.colnames:
-            try:
-                tab[name].info.format = '.2f'
-            except ValueError:
-                pass
+            if name!="id":
+                try:
+                    tab[name].info.format = '.2f'
+                except ValueError:
+                    pass
             
         # Save as table
         if save:
             check_save_path(save_path)
             tab.rename_column('id', 'NUMBER')
-            tab.write(save_path + '%s_m2iso%s.dat'%(self.name, suffix), format='ascii', overwrite=True)
+            tab.write(save_path + '%s_%s%s.dat'%(self.name, self.mode, suffix), format='ascii', overwrite=True)
             
         self.table = tab
+        self.src_map = src_map
  
-        return image_m2, segm, seg_map
+        return src_map, segm, seg_map
     
-    def m2iso_spec_extraction_all(self, seg_map):
+    def ISO_spec_extraction_all(self, seg_map):
         labels = np.unique(seg_map)[1:]
         
         for k, lab in enumerate(labels):
@@ -561,7 +588,7 @@ class Read_Datacube:
             plt.savefig(save_path+"#%d.png"%n,dpi=100)
             plt.close()
             
-    def fit_continuum_all(self, model='GP', save_path=None, plot=False, 
+    def fit_continuum_all(self, model='GP', save_path=None, plot=False, verbose=True,
                           GP_kwds={'edge_ratio':None, 'kernel_scale':100, 'kenel_noise':1e-3}):   
         """
         Fit continuum of all the extracted spectrum
@@ -582,21 +609,24 @@ class Read_Datacube:
                 "Trapz1d": 1D Trapezoid model with constant continuum and edge fitted by a constant slope
         
         """
+        
         if plot:
             check_save_path(save_path)
+            
         if (model=='GP') & (GP_kwds['edge_ratio'] is None):
             # Stacked spectra to estimate edge ratio
             self.spec_stack = (self.obj_specs_opt/self.obj_specs_opt.max(axis=1).reshape(-1,1)).sum(axis=0)
             GP_kwds['edge_ratio'] = 0.5*np.sum((self.spec_stack - np.median(self.spec_stack) \
                                             <= -2.5*mad_std(self.spec_stack))) / len(self.wavl)
-            print('Fit continuum with GP. No edge_ratio is given. Use estimate = %.2f'%GP_kwds['edge_ratio'])
+            if verbose:
+                print('Fit continuum with GP. No edge_ratio is given. Use estimate = %.2f'%GP_kwds['edge_ratio'])
         
         
         for n in self.table["NUMBER"]:
             
             # Skip supurious detections (edges, spikes, etc.)
             iloc = (self.table["NUMBER"]==n)
-            if self.mode=="M2ISO":
+            if self.mode!="APER":
                 spurious_detection = self.table[iloc]['ellipticity']>= 0.9
             else:
                 spurious_detection = (self.table[iloc]["PETRO_RADIUS"] <=0) | (self.table[iloc]["FLUX_AUTO"] <=0)
@@ -604,10 +634,13 @@ class Read_Datacube:
             blank_array = np.zeros(len(self.wavl)+1)
                 
             if spurious_detection:
-                print("Spurious detection #%d ... Skip"%n)
+                if verbose:
+                    print("Spurious detection #%d ... Skip"%n)
                 res, cont_fit = (blank_array, blank_array)
             else:    
-                if np.mod(n, 200)==0: print("Fit spectra continuum ... %d/%d"%(n, len(self.table["NUMBER"])))
+                if verbose:
+                    if np.mod(n, 200)==0: 
+                        print("Fit spectra continuum ... %d/%d"%(n, len(self.table["NUMBER"])))
                 try:   
                     # Fit continuum
                     spec = self.obj_specs_opt[self.obj_nums==n][0]
@@ -622,11 +655,13 @@ class Read_Datacube:
 
                 except Exception as e:
                     res, cont_fit = (blank_array, blank_array)
-                    print("Spectrum #%d continuum fit failed ... Skip"%n)
+                    if verbose:
+                        print("Spectrum #%d continuum fit failed ... Skip"%n)
 
             self.obj_res_opt = np.vstack((self.obj_res_opt, res)) if n>1 else [res]
             self.obj_cont_fit = np.vstack((self.obj_cont_fit, cont_fit)) if n>1 else [cont_fit]
-
+        
+        print("Continuum Fitting Finished!")
         self.wavl_rebin = wavl_rebin
        
             
@@ -636,7 +671,7 @@ class Read_Datacube:
         hdu_num = fits.PrimaryHDU(data=self.obj_nums)
         
         hdu_spec_opt = fits.ImageHDU(data=self.obj_specs_opt)
-        size = self.table['equivalent_radius'].value if self.mode=="M2ISO" else self.obj_aper_opt
+        size = self.table['equivalent_radius'].value if self.mode!="APER" else self.obj_aper_opt
         hdu_size = fits.ImageHDU(data=size)
 #         hdu_size = fits.BinTableHDU.from_columns([fits.Column(name="size",array=self.obj_aper_opt,format="E")])
         
@@ -644,7 +679,7 @@ class Read_Datacube:
         hdu_wavl_rebin = fits.ImageHDU(data=self.wavl_rebin)
         
         hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_opt, hdu_size, hdu_res_opt, hdu_wavl_rebin])
-        hdul.writeto(save_path+'%s-spec%s.fits'%(self.name, suffix), overwrite=True)
+        hdul.writeto(save_path+'%s-spec-%s%s.fits'%(self.name, self.mode, suffix), overwrite=True)
         
         
     def read_spec(self, file_path):
@@ -666,93 +701,118 @@ class Read_Datacube:
     def generate_template(self, n_ratio=50, n_stddev=10, n_intp=2,
                           temp_type="Ha-NII", 
                           temp_model="gauss", 
-                          ratio_prior="uniform", 
+                          ratio_prior="log-uniform", 
                           z_type="cluster",
-                          ratio_range = (1., 8), sigma_max = 300,
-                          box_width=4, plot=False):
+                          ratio_range=[1., 8], 
+                          temp_params={'box_width':4,
+                                       'sigma_max':200,
+                                       'a_sinc':5},
+                          plot=False):
         
-        """Generate template(s) for cross-correlation.
+        """
+        Generate template(s) for cross-correlation.
         
         Parameters
         ----------
         temp_type : template type ("Ha-NII" or "Hb-OIII" or "OII")
         temp_model : template line profile model ("gauss", "sincgauss" or "delta")
         n_stddev/n_ratio : number of template=n_stddev*n_ratio, if >1 generate a template library 
-        n_intp : time of interpolation (controling the smoothness of CC function), 1 means no interpolation
+        n_intp : time of interpolation (controling the smoothness of CC function), =1 is no interpolation
         
-        ratio_prior : template line ratios prior type ("sdss": sdss line ratio from MPA-JHU catalog, "uniform": uniform grid in log)  
-        ratio_range : range of line ratio (lower, upper) (only for the template library with "uniform" prior)
-        sigma_max : upper range of broadening in km/s
+        ratio_prior : template line ratios prior type 
+                    "sdss": sdss line ratio from MPA-JHU catalog
+                    "log-uniform": uniform grid in log  
+                    
+        ratio_range : range of line ratio (lower, upper)
+                        only used for the template library with "uniform" prior)
+                        
+        temp_params : 
+                    'box_width' : width of box model (should be small to approximate delta,
+                                  but remind to check if sampled by the wavelength axis)
+                                  
+                    'sigma_max' : upper limit of broadening in km/s for Gaussian models
+                                  fwhm (2.355*sigma) between spectral resolution to galaxy broadening v=300km/s.
+                    # sigma_v = v/sqrt(3), sigma_gal = sigma_v/3e5 * 6563*(1+z_cluster) 
+                    
+                    'a_sinc' : parameter a in the sinc function (y=sin(ax)/(ax))
+        """
         
-        # For Gaussian models, fwhm(=2.355*sigma) between spectral resolution to galaxy broadening v=300km/s.
-        # sigma_v = (v)/sqrt(3), sigma_gal = sigma_v/3e5 * 6563*(1+z_cluster) 
         
-        # For delta function width=box_width"""
-
         
-        self.n_intp = n_intp
+        if temp_model == "box":
+            box_wid = np.max([temp_params['box_width'], self.d_wavl])
+            self.Stddevs = np.ones(n_ratio) * box_wid/2.355 # Minimum width for cross-correlation
+            n_stddev = 1
+            
+        elif (temp_model == "gauss")|(temp_model == "sincgauss"):
         
-        box_wid = np.max([box_width, self.d_wavl])
-        
-        if temp_type=="OII":
-            number = n_stddev
-        else:
-            number = n_ratio * n_stddev
-        print("Template: %s_%s  Total Number: %d"%(temp_type, temp_model, number))
-        self.num_temp = number
-        
-        sig_gal_m = sigma_max/np.sqrt(3)/3e5 * 6563*(1+self.z0)
-        if temp_model=="gauss":
+            if temp_type=="OII":
+                n_ratio = 1
+                
+                
+            sigma_max = temp_params['sigma_max']
+            #sig_gal_m = sigma_max/np.sqrt(3)/3e5 * 6563*(1+self.z0)
+            sig_gal_m = sigma_max/3e5 * 6563*(1+self.z0)
             sig_min = self.d_wavl/2.355
-        elif temp_model=="sincgauss":
-            sig_min = 0.1
-        sig_max = np.sqrt(sig_min**2 + sig_gal_m**2)
-
-        if ratio_prior=="sdss":
-            self.Stddevs = stats.uniform.rvs(size=number) * (sig_max-sig_min) + sig_min
-            dist_line_ratio = np.loadtxt("./%s/SDSS-DR7_line_ratio.txt"%self.name)
-            line_ratios = np.random.choice(dist_line_ratio, size=number)   # note: Ha_NII6584 ratios
-#                 line_ratios = stats.lognorm.rvs(0.64, loc=1.81, scale=1.24, size=number)
-
-        elif ratio_prior=="uniform":    
+            sig_max = np.sqrt(sig_min**2 + sig_gal_m**2)
+            
             stddevs = np.linspace(sig_min, sig_max, n_stddev)
-            if temp_type=="OII":    # Single peaks
-                self.Stddevs = stddevs
-            else:    # Multiple peaks
-                self.Stddevs = np.repeat(stddevs, n_ratio).reshape(n_ratio, n_stddev).T.ravel()
-#                     line_ratio = np.linspace(ratio_range[0], ratio_range[1])[::-1]  # line ratio from high to low
-                line_ratio = np.logspace(np.log10(ratio_range[0]), np.log10(ratio_range[1]))[::-1]  # line ratio from high to low
-                line_ratios = np.repeat(line_ratio, n_stddev).ravel()
+            self.Stddevs = np.repeat(stddevs, n_ratio).reshape(n_ratio, n_stddev).T.ravel() 
+                
+        else: print('Model type: "box" or "gauss" or "sincgauss"')
+        
+        num_temp = n_ratio * n_stddev
+        print("Template: %s_%s  Total Number: %d"%(temp_type, temp_model, num_temp))
+        
+        if ratio_prior=="log-uniform":    
+            # ratio of 1st peak vs 2nd peak
+            peak_ratio = np.logspace(np.log10(ratio_range[0]), 
+                                     np.log10(ratio_range[1]), n_ratio)[::-1]  # line ratio from high to low
+            peak_ratios = np.repeat(peak_ratio, n_stddev).ravel()
+
+        elif ratio_prior=="sdss":
+            dist_line_ratio = np.loadtxt("./%s/SDSS-DR7_line_ratio.txt"%self.name)
+            peak_ratios = np.random.choice(dist_line_ratio, size=num_temp)   # note: Ha_NII6584 ratios
 
         if z_type=="mid":
-            z_ref = (self.wavl[0]+self.wavl[-1])/2./6563.-1  # line located at the middle of the filter
+            # line located at the middle of the filter
+            z_ref = (self.wavl[0]+self.wavl[-1])/2./6563.-1  
+        
         elif z_type=="cluster":
             z_ref = self.z0
 
         if temp_type=="Ha-NII":
-            self.Line_ratios = np.vstack([[1, 3*ratio, 3] for ratio in line_ratios])
+            self.Line_ratios = np.vstack([[1, 3*ratio, 3] for ratio in peak_ratios])
             z_temp = 6563*(1+z_ref)/6563.-1
 
         elif temp_type=="Hb-OIII":        
-            self.Line_ratios = np.vstack([[3, 3*ratio] for ratio in line_ratios])
+            self.Line_ratios = np.vstack([[1, ratio] for ratio in peak_ratios])
             z_temp = 6563*(1+z_ref)/5007.-1
 
         elif temp_type=="OII":
-
-            self.Line_ratios = np.vstack([[1] for k in range(number)])
+            self.Line_ratios = np.vstack([[1] for k in range(num_temp)])
             z_temp = 6563*(1+z_ref)/3727.-1
 
-        n_temp = int(len(self.wavl)) * n_intp +1
-        temps = np.empty((number, n_temp))
+        self.n_intp = n_intp
+        temp_step = int(len(self.wavl)) * n_intp +1
+        temps = np.empty((num_temp, temp_step))
 
-        for i, (lr, stddev) in enumerate(zip(self.Line_ratios, self.Stddevs)):
+        for i, (lr, std) in enumerate(zip(self.Line_ratios, self.Stddevs)):
+            temp_par={'line_ratio':lr, 'sigma':std}
+            
+            if temp_model == "box":
+                temp_par['box_width'] = box_wid
+            if temp_model == "sincgauss":
+                temp_par['a_sinc'] = temp_params['a_sinc']
+                
             temps[i], self.wavl_temp = generate_template(self.wavl, z=z_temp, 
-                                                         temp_model=temp_model, temp_type=temp_type,
-                                                         line_ratio=lr, sigma=stddev, box_wid=box_wid, 
-                                                         n_intp=n_intp,  plot=plot)
+                                                         temp_model=temp_model, 
+                                                         temp_type=temp_type,
+                                                         temp_params=temp_par,                                                      
+                                                         n_intp=n_intp,
+                                                         alpha=0.1, plot=plot)
         self.temps = temps
           
-            
         typ_mod = temp_type + "_" + temp_model
         
         self.Temp_Lib[typ_mod] = self.temps
@@ -774,36 +834,36 @@ class Read_Datacube:
 
         hdul = fits.HDUList(hdus=[hdu_temps, hdu_wavl_temp, hdu_stddev_temp, hdu_line_ratio_temp])
         print("Save %s templates for %s"%(self.name, typ_mod))
-        hdul.writeto(save_path+'Template-%s_%s_%s.fits'%(self.name, typ_mod, suffix), overwrite=True) 
+        hdul.writeto(save_path+'Template-%s_%s%s.fits'%(self.name, typ_mod, suffix), overwrite=True) 
 
-    def Read_Template(self, filename, n_intp=2):
+    def Read_Template(self, dir_name, n_intp=2):
         
-        """Read Emission Line Template""" 
-                      
-        _, temp_type, temp_model, _ = re.split(r'\s|_', filename)
-                      
-        typ_mod = temp_type + "_" + temp_model
-        self.typ_mod = typ_mod
+        """Read Emission Line Template from directory"""
+        temp_list = glob.glob(dir_name+'/Template-%s_*.fits'%self.name)
+        
         self.n_intp = n_intp
-                      
-        print("Read Emission Line Template: %s"%(typ_mod))              
+        print("Read Emission Line Template:"), pp.pprint(temp_list)
         
-        hdul = fits.open(filename)
-        self.temps = hdul[0].data
-        self.wavl_temp = hdul[1].data
-        self.Stddevs = hdul[2].data
-        self.Line_ratios = hdul[3].data
-        
-        self.Temp_Lib[typ_mod] = self.temps
-        self.wavl_temps[typ_mod] = self.wavl_temp
-        self.Stddev_Temps[typ_mod] = self.Stddevs
-        self.Line_Ratios_Temps[typ_mod] = self.Line_ratios
+        for filename in temp_list:
+            temp_type, temp_model, _ = re.split(r'\s|_|\.', filename)[-3:]
+            typ_mod = temp_type + "_" + temp_model
+            
+            hdul = fits.open(filename)
+            self.temps = hdul[0].data
+            self.wavl_temp = hdul[1].data
+            self.Stddevs = hdul[2].data
+            self.Line_ratios = hdul[3].data
+
+            self.Temp_Lib[typ_mod] = self.temps
+            self.wavl_temps[typ_mod] = self.wavl_temp
+            self.Stddev_Temps[typ_mod] = self.Stddevs
+            self.Line_Ratios_Temps[typ_mod] = self.Line_ratios
             
     def cross_correlation(self, num, 
                           temp_type="Ha-NII", 
                           temp_model="gauss", 
                           h_contrast=0.1, 
-                          edge=30,
+                          edge=15,
                           kind_intp="linear", 
                           rv=None, plot=True):
         
@@ -827,12 +887,13 @@ class Read_Datacube:
         Contrasts : peak contrast (peak_1/peak_2) for each template
         SNRs : detection S/N (masking signal) for each template
         SNR_ps : peak S/N (masking peak) for each template
+        
         """ 
             
         if plot:    
-            fig, (ax1,ax2) = plt.subplots(nrows=2, ncols=1,figsize=(9,7))
+            fig, axes = plt.subplots(nrows=2, ncols=1,figsize=(9,7))
         else:
-            fig, (ax1,ax2) = None, (None, None)
+            fig, axes = None, (None, None)
         
         res = self.obj_res_opt[self.obj_nums==num][0]  # Read residual spectra
         
@@ -842,23 +903,34 @@ class Read_Datacube:
         stddevs = self.Stddev_Temps[temp_type + "_" + temp_model]
         line_ratios = self.Line_Ratios_Temps[temp_type + "_" + temp_model]
         
-        ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = xcor_SNR(res=res, wavl_rebin=self.wavl_rebin, 
-                                                                           temps=temps, wavl_temp=wavl_temp, 
-                                                                           d_wavl=self.d_wavl, z_sys=self.z0, 
-                                                                           n_intp=self.n_intp, kind_intp=kind_intp,                                                                 
-                                                                           temp_type=temp_type, temp_model=temp_model,
-                                                                           temps_stddev=stddevs, temps_ratio=line_ratios, 
-                                                                           h_contrast=h_contrast, rv=rv, edge=edge,
-                                                                           plot=plot, fig=fig, axes=(ax1,ax2))
+        # result_cc: ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
+        result_cc = xcor_SNR(res=res, 
+                             wavl_rebin=self.wavl_rebin, 
+                             temps=temps, 
+                             wavl_temp=wavl_temp, 
+                             d_wavl=self.d_wavl, 
+                             z_sys=self.z0, 
+                             n_intp=self.n_intp, 
+                             kind_intp=kind_intp,                                                                 
+                             temp_type=temp_type, 
+                             temp_model=temp_model,
+                             temps_params={'stddev':stddevs, 
+                                           'line_ratio':line_ratios}
+                             h_contrast=h_contrast, 
+                             rv=rv, edge=edge,
+                             plot=plot, fig=fig, axes=axes)
+        
+        ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = result_cc
+        
         if plot: plt.tight_layout()
             
         r_max = np.argmax(Rs)    
         z_best = z_ccs[r_max]
-        print ("SE Object #%d  z: %.3f  Peak R: %.3f  Detction S/N: %.3f Peak S/N: %.3f"\
+        print ("Detection #%d  z: %.3f  Peak R: %.3f  Detction S/N: %.3f Peak S/N: %.3f"\
                                %(num, z_best, Rs[r_max], SNRs[r_max], SNR_ps[r_max]))
         
             
-        return ccs, rv, z_ccs, Rs, SNRs, SNR_ps, flag_edge
+        return ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
 
     def cross_correlation_all(self, 
                               temp_type="Ha-NII", 
@@ -874,6 +946,7 @@ class Read_Datacube:
         temp_model : template line profile model ("gauss", "sincgauss" or "delta")
         kind_intp : scipy interp1d kind, default is "linear"
         h_contrast : threshold of CC peak finding, relative to the highest peak
+        
         """ 
         
         self.temp_type = temp_type
@@ -893,12 +966,12 @@ class Read_Datacube:
       
         for j, num in enumerate(self.obj_nums):
             if j==0:
-                ccs, rv0, z_ccs, Rs, SNRs, SNR_ps, flag_edge = self.cross_correlation(num, h_contrast=h_contrast, 
+                ccs, rv0, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = self.cross_correlation(num, h_contrast=h_contrast, 
                                                                               temp_type=temp_type, temp_model=temp_model, 
                                                                               kind_intp=kind_intp, edge=edge, rv=None, plot=False)
                 self.rv = rv0
             else:
-                ccs, rv, z_ccs, Rs, SNRs, SNR_ps, flag_edge = self.cross_correlation(num, h_contrast=h_contrast, 
+                ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = self.cross_correlation(num, h_contrast=h_contrast, 
                                                                              temp_type=temp_type, temp_model=temp_model, 
                                                                              kind_intp=kind_intp, edge=edge, rv=self.rv, plot=False)
                
@@ -910,8 +983,6 @@ class Read_Datacube:
             self.CCs = np.concatenate([self.CCs, [ccs]]) if len(self.cc_nums)>0 else [ccs]
             
             self.cc_nums = np.append(self.cc_nums, num)
-        
-        
         
         self.CC_zccs_Temps[typ_mod] = self.CC_zccs
         self.CC_Rs_Temps[typ_mod] = self.CC_Rs
