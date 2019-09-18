@@ -1,14 +1,16 @@
+import re
+import os
+import glob
+import time
+import pprint as pp
+
 import numpy as np
 import matplotlib.pyplot as plt
 
 from astropy.io import fits
-from astropy.table import Table
+from astropy.table import Table, Column, join
 from astropy.stats import mad_std
 from astroquery.vizier import Vizier
-
-import re
-import glob
-import pprint as pp
 
 from utils import *
 
@@ -69,7 +71,7 @@ class DeepFrame:
         """ Mask edges """
         check_save_path(save_path)
         hdu_edge = fits.PrimaryHDU(data=self.mask_edge.astype("float"))
-        hdu_edge.writeto(save_path + '%s_DF_edge.fits'%self.name,overwrite=True)
+        hdu_edge.writeto(os.path.join(save_path, '%s_DF_edge.fits'%self.name), overwrite=True)
     
     def make_mask_streak(self, file_path, threshold=5, shape_cut=0.15, area_cut=500,
                          display=True, save_plot=True):
@@ -117,7 +119,7 @@ class DeepFrame:
             
         check_save_path(save_path)
         hdu_weight_map = fits.PrimaryHDU(data=weight)
-        hdu_weight_map.writeto(save_path + 'weight_map_%s.fits'%self.name, overwrite=True)
+        hdu_weight_map.writeto(os.path.join(save_path, 'weight_map_%s.fits'%self.name), overwrite=True)
     
     def subtract_background(self, b_size=128,
                             display=True, plot=False, save_path = './', suffix=""):
@@ -144,7 +146,7 @@ class DeepFrame:
         if plot:
             check_save_path(save_path)
             hdu_new = fits.PrimaryHDU(data=field_sub, header=self.header)
-            hdu_new.writeto(save_path + '/' + '%s_DF%s.fits'%(self.name, suffix), overwrite=True)
+            hdu_new.writeto(os.path.join(save_path, '%s_DF%s.fits'%(self.name, suffix)), overwrite=True)
             print("Saved background subtracted image as %s_DF%s.fits"%(self.name, suffix))
         
         self.field_sub = field_sub    
@@ -198,7 +200,7 @@ def read_raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550]):
     raw_datacube: raw SITTLE datacube class.
     
     """
-    raw_datacube = Raw_Datacube(file_path, name, wavn_range=[12100, 12550])
+    raw_datacube = Raw_Datacube(file_path, name, wavn_range=wavn_range)
     return raw_datacube
 
 class Raw_Datacube: 
@@ -245,7 +247,7 @@ class Raw_Datacube:
         # Save the edge mask to be read later
         check_save_path(save_path)
         hdu_edge = fits.PrimaryHDU(data=self.mask_edge.astype("float")*10)
-        hdu_edge.writeto(save_path + 'Raw_stack_%s_mask.fits'%self.name,overwrite=True)
+        hdu_edge.writeto(os.path.join(save_path, 'Raw_stack_%s_mask.fits'%self.name),overwrite=True)
         
     def save_weight_map(self, region_path, weight=0.001, save_path = './'):
         # Mask regions (eg. star spikes) by making a weight map for SE input
@@ -257,9 +259,9 @@ class Raw_Datacube:
         
         check_save_path(save_path)
         hdu_weight_map = fits.PrimaryHDU(data=weight_map)
-        hdu_weight_map.writeto(save_path + 'weight_map_stack_%s.fits'%self.name, overwrite=True)
+        hdu_weight_map.writeto(os.path.join(save_path, 'weight_map_stack_%s.fits'%self.name), overwrite=True)
     
-    def remove_background(self, box_size=128, filter_size=3, n_iter=10, save_path=None, plot=False):
+    def remove_background(self, box_size=128, filter_size=3, n_iter=10, save_path='./bkg/', plot=False):
         """ Remove background (low-frequency component) using SEXtractor estimator (filtering + mode) """
         if plot:
             check_save_path(save_path)
@@ -277,13 +279,13 @@ class Raw_Datacube:
             # Save background subtraction
             if plot:
                 fig = display_background_sub(field, back, vmax=1)
-                plt.savefig(save_path + "bkg_sub_channel%d.png"%(i+1),dpi=100)
+                plt.savefig(os.path.join(save_path, "bkg_sub_channel%d.png"%(i+1)),dpi=100)
                 plt.close(fig)  
                 
         self.stack_field = self.datacube_bkg_sub.sum(axis=0)
         
     def remove_fringe(self, channels=None, sn_source=2,
-                      box_size=8, filter_size=1, n_iter=20, save_path=None, plot=False):
+                      box_size=8, filter_size=1, n_iter=20, save_path='./bkg/', plot=False):
         """ Remove fringe and artifacts for specified channels """
         if channels is None: return None
         
@@ -304,7 +306,7 @@ class Raw_Datacube:
             # Save fringe subtraction
             if plot:
                 fig = display_background_sub(field, back, vmax=1)
-                plt.savefig(save_path + "fg_sub_channel%d.png"%k,dpi=100)
+                plt.savefig(os.path.join(save_path, "fg_sub_channel%d.png"%k),dpi=100)
                 plt.close(fig)  
                     
         self.stack_field = self.datacube_bkg_fg_sub.sum(axis=0)
@@ -318,7 +320,7 @@ class Raw_Datacube:
         
         check_save_path(save_path)
         hdu_cube = fits.PrimaryHDU(data = datacube_sub, header=self.hdu_header_new)
-        hdu_cube.writeto(save_path + '%s_cube%s.fits'%(self.name, suffix),overwrite=True)
+        hdu_cube.writeto(os.path.join(save_path, '%s_cube%s.fits'%(self.name, suffix)),overwrite=True)
         
         for keyname in ["CTYPE3","CRVAL3","CUNIT3","CRPIX3","CDELT3","CROTA3"]:
             try:
@@ -326,7 +328,7 @@ class Raw_Datacube:
             except KeyError:
                 pass
         hdu_stack = fits.PrimaryHDU(data = self.stack_field, header=self.hdu_header_new)
-        hdu_stack.writeto(save_path + '%s_stack%s.fits'%(self.name, suffix),overwrite=True)
+        hdu_stack.writeto(os.path.join(save_path, '%s_stack%s.fits'%(self.name, suffix)),overwrite=True)
         
         
 class Read_Datacube:
@@ -350,24 +352,25 @@ class Read_Datacube:
                  table=None, seg_map=None, mask_edge=None,
                  deep_frame=None, z0=None):
         
+        self.name = name
+        self.z0 = z0
         self.hdu = fits.open(cube_path)
         self.header = self.hdu[0].header
+        self.RA = self.header["TARGETR"]
+        self.DEC = self.header["TARGETD"]
+        
         self.cube = self.hdu[0].data
         self.stack_field = self.cube.sum(axis=0)
         self.shape = self.cube.shape
-        
-        self.name = name
-        self.z0 = z0
         self.mode = mode
         
         if (mode=="MMA")|(mode=="m2"):            
-            self.mask_edge = None
             if table is not None:
                 self.table = Table.read(table, format='ascii')
         elif mode=="APER":
             # Read SE measurement. 
             self.table = Table.read(table, format="ascii.sextractor")
-            self.mask_edge = fits.open(mask_edge)[0].data.astype('bool')             
+                         
         else:
             raise ValueError("Choose an extraction mode: 'MMA' or 'm2' or 'APER' ('APER' requires SExtractor output)")
         
@@ -376,6 +379,9 @@ class Read_Datacube:
         except ValueError:
             self.seg_map = None
         
+        if mask_edge is not None:
+            self.mask_edge = fits.open(mask_edge)[0].data.astype('bool')
+            
         if deep_frame is not None:
             self.deep_frame = fits.open(deep_frame)[0].data
         else:
@@ -400,18 +406,42 @@ class Read_Datacube:
         self.Line_Ratios_Temps = {}
         
         # Fot CC using different templates
-        self.CC_zccs_Temps = {}
-        self.CC_Rs_Temps = {}
-        self.CC_SNRs_Temps = {}
-        self.CC_SNR_ps_Temps = {}
-        self.CC_flag_edge_Temps = {}
-        self.CCs_Temps  = {}
-       
+#         self.CC_zccs_Temps = {}
+#         self.CC_Rs_Temps = {}
+#         self.CC_SNRs_Temps = {}
+#         self.CC_SNR_ps_Temps = {}
+#         self.CC_flag_edge_Temps = {}
+        
+        self.CC_result_Temps  = {}
     
-    def ISO_source_detection(self, sn_thre=2, npixels=8,
+    def get_wcs(self):
+        """ Read WCS info from the datacube header """
+        self.wcs = WCS(self.header,naxis=2)
+        return self.wcs
+
+    def get_centroid(self, num, Xname="xcentroid", Yname="ycentroid"):
+        """ Get centorids of the cutout for a detection """
+        return get_centroid(num, self.table, Xname=Xname, Yname=Yname)
+    
+    def get_bounds(self, num, cen_pos=None,
+                   Rname='equivalent_radius',
+                   origin=0, **kwargs):
+        """ Get bounds of the cutout for a detection """
+        return get_bounds(num, self.table, self.stack_field.shape, **kwargs)
+    
+    def get_cutout(self, num, image=None,
+                   bounds=None, cen_pos=None,
+                   origin=0, **kwargs):
+        """ Get cutout of the input image for a detection """
+        if image is None:
+            image = self.stack_field
+        return get_cutout(num, image, self.table, **kwargs) 
+    
+    def ISO_source_detection(self, sn_thre=2.5, npixels=8,
                              nlevels=64, contrast=0.01, closing=True,
-                             columns=['id', 'xcentroid', 'ycentroid', 'ellipticity', 'equivalent_radius', 'area'],
-                             n_win=3, parallel=False, save=True, save_path = './', suffix=""):
+                             add_columns=['equivalent_radius'],
+                             box=(3,3,3), parallel=False, 
+                             save=True, save_path = './', suffix=""):
         """ Source Extraction based on Isophotal of S/N """
         from skimage import morphology
         from photutils import source_properties
@@ -419,23 +449,24 @@ class Read_Datacube:
         # Pixel-wise manipulation in wavelength
         
         if self.mode == "MMA":
-            print("Use the map of maximum of moving average (MMA) along wavelength to detect source.")
+            print("Use the map of maximum of moving average (MMA) to detect source.")
+            print("Box shape: ",box)
+            
+            mask_edge_cube = np.repeat(self.mask_edge[np.newaxis, :, :], self.shape[0], axis=0)
             
             if parallel:
                 print("Run moving average in parallel. This could be slower using few cores.")
                 
                 from usid_processing import parallel_compute
                 from functools import partial
-                p_moving_average_cube = partial(moving_average_cube, cube=self.cube.copy())
+                p_moving_average_cube = partial(moving_average_by_col, cube=self.cube.copy())
                 results = parallel_compute(np.arange(self.shape[2]), p_moving_average_cube,
                                            lengthy_computation=False, verbose=True)
                 src_map = np.max(results,axis=2).T
                 
             else:
-                src_map = np.empty_like(self.stack_field)
-                for i in range(self.shape[1]):
-                    for j in range(self.shape[2]):
-                        src_map[i,j] = max(moving_average(self.cube[:,i,j], n_win))
+                cube_MMA = moving_average_cube(self.cube, box=box, mask=mask_edge_cube)
+                src_map = np.max(cube_MMA, axis=0)
                     
         elif self.mode == "m2":
             print("Use the map of second maximum (m2) along wavelength to detect source.")
@@ -455,13 +486,17 @@ class Read_Datacube:
         # Save 2nd max map and segmentation map
         if save:
             check_save_path(save_path)
+            src_map_name = '%s_%s%s.fits'%(self.name, self.mode, suffix)
+            seg_map_name = '%s_segm_%s%s.fits'%(self.name, self.mode, suffix)
+
             hdu_m2 = fits.PrimaryHDU(data=src_map, header=self.header)
-            hdu_m2.writeto(save_path + '%s_%s%s.fits'%(self.name, self.mode, suffix), overwrite=True)
+            hdu_m2.writeto(os.path.join(save_path, src_map_name), overwrite=True)
             hdu_seg = fits.PrimaryHDU(data=seg_map, header=None)
-            hdu_seg.writeto(save_path + '%s_segm_%s%s.fits'%(self.name, self.mode, suffix), overwrite=True)
+            hdu_seg.writeto(os.path.join(save_path, seg_map_name), overwrite=True)
         
         # Meausure properties of detections
         cat = source_properties(src_map, segm)
+        columns = ['id', 'xcentroid', 'ycentroid', 'ellipticity', 'area', 'orientation'] + add_columns
         tab = cat.to_table(columns=columns)   
         for name in tab.colnames:
             if name!="id":
@@ -474,7 +509,8 @@ class Read_Datacube:
         if save:
             check_save_path(save_path)
             tab.rename_column('id', 'NUMBER')
-            tab.write(save_path + '%s_%s%s.dat'%(self.name, self.mode, suffix), format='ascii', overwrite=True)
+            tab_name = '%s_%s%s.dat'%(self.name, self.mode, suffix)
+            tab.write(os.path.join(save_path, tab_name), format='ascii', overwrite=True)
             
         self.table = tab
         self.src_map = src_map
@@ -519,7 +555,7 @@ class Read_Datacube:
         
     def spec_extraction(self, num, ext_type='opt', 
                         ks = np.arange(1.,4.5,0.2), k1=5., k2=8.,
-                        print_out=False, plot=False, display=False):
+                        verbose=False, plot=False, display=False):
         """
         Extract spectal using an optimal aperture, local background evaluated from (k1, k2) annulus
         
@@ -528,22 +564,22 @@ class Read_Datacube:
         num : SE object number
         ks : a set of aperture ring (in SE petrosian radius) to determined the optimized aperture
         k1, k2 : inner/outer radius (in SE petrosian radius) of annulus for evaluate background RMS
-        print_out : print out the optimized k and S/N
+        verbose : print out the optimized k and S/N
         plot : whether to plot the S/N vs k curve
         display: whether to display the image thumbnail with apertures
         
         """
         
-        tab = self.table[self.table["NUMBER"]==num]
-        obj_SE = Object_SE(tab, cube=self.cube, deep_frame=self.deep_frame,
-                           img_seg=self.seg_map, mask_field=self.mask_edge)
+        id = np.where(self.table["NUMBER"]==num)[0][0]
+        obj_SE = Obj_detection(self.table[id], cube=self.cube, deep_frame=self.deep_frame,
+                               seg_map=self.seg_map, mask_edge=self.mask_edge)
         
         if obj_SE.R_petro==0:
-            if print_out: print("Error in measuring R_petro, dubious source")
+            if verbose: print("Error in measuring R_petro, dubious source")
             return (np.zeros_like(self.wavl), 1., 0, None)
         
         k, snr = obj_SE.compute_aper_opt(ks=ks, k1=k1, k2=k2,
-                                                 ext_type=ext_type, print_out=print_out, plot=plot)
+                                                 ext_type=ext_type, verbose=verbose, plot=plot)
         spec = obj_SE.extract_spec(k, ext_type=ext_type, k1=k1, k2=k2, wavl=self.wavl, plot=plot)
         if display&(snr>0):
             obj_SE.img_display()
@@ -557,20 +593,20 @@ class Read_Datacube:
         for num in self.table["NUMBER"]:
             spec_cen, k_cen, snr_cen, apers = self.spec_extraction(num=num, ext_type='sky', 
                                                        ks=ks, k1=k1, k2=k2,
-                                                       print_out=False, plot=False, display=False)
+                                                       verbose=False, plot=False, display=False)
             self.obj_specs_cen = np.vstack((self.obj_specs_cen, spec_cen)) if len(self.obj_nums)>0 else [spec_cen]
             self.obj_aper_cen = np.append(self.obj_aper_cen, k_cen)
             
             spec_opt, k_opt, snr_opt, apers_opt = self.spec_extraction(num=num, ext_type='opt', 
                                                                        ks=ks, k1=k1, k2=k2,
-                                                                       print_out=False, plot=False, display=display)
+                                                                       verbose=False, plot=False, display=display)
             self.obj_specs_opt = np.vstack((self.obj_specs_opt, spec_opt)) if len(self.obj_nums)>0 else [spec_opt]
             self.obj_aper_opt = np.append(self.obj_aper_opt, k_opt)
                 
             # Display the image marking the two apertures and annulus
             if display&(snr_opt>0):
                 apers[0].plot(color='limegreen', lw=1.5, ls='--')
-                plt.savefig(save_path+"SE#%d.png"%(num),dpi=150)
+                plt.savefig(os.path.join(save_path, "SE#%d.png"%num),dpi=150)
                 plt.close()
             
             self.obj_nums = np.append(self.obj_nums, num)
@@ -585,10 +621,10 @@ class Read_Datacube:
             plt.xlabel("wavelength",fontsize=12)
             plt.ylabel("normed flux",fontsize=12)
             plt.legend(fontsize=12)
-            plt.savefig(save_path+"#%d.png"%n,dpi=100)
+            plt.savefig(os.path.join(save_path, "#%d.png"%n),dpi=100)
             plt.close()
             
-    def fit_continuum_all(self, model='GP', save_path=None, plot=False, verbose=True,
+    def fit_continuum_all(self, model='GP', save_path='./fit_cont/', plot=False, verbose=True,
                           GP_kwds={'edge_ratio':None, 'kernel_scale':100, 'kenel_noise':1e-3}):   
         """
         Fit continuum of all the extracted spectrum
@@ -621,22 +657,23 @@ class Read_Datacube:
             if verbose:
                 print('Fit continuum with GP. No edge_ratio is given. Use estimate = %.2f'%GP_kwds['edge_ratio'])
         
-        
+        spurious_nums = np.array([], dtype=int)
         for n in self.table["NUMBER"]:
             
             # Skip supurious detections (edges, spikes, etc.)
             iloc = (self.table["NUMBER"]==n)
             if self.mode!="APER":
-                spurious_detection = self.table[iloc]['ellipticity']>= 0.9
+                spurious_detection = (self.table[iloc]['ellipticity']>= 0.9)
             else:
                 spurious_detection = (self.table[iloc]["PETRO_RADIUS"] <=0) | (self.table[iloc]["FLUX_AUTO"] <=0)
             
             blank_array = np.zeros(len(self.wavl)+1)
+            random_array = np.random.rand(len(self.wavl)+1)
                 
             if spurious_detection:
                 if verbose:
-                    print("Spurious detection #%d ... Skip"%n)
-                res, cont_fit = (blank_array, blank_array)
+                    spurious_nums = np.append(spurious_nums, n)
+                res, cont_fit = (random_array, blank_array)
             else:    
                 if verbose:
                     if np.mod(n, 200)==0: 
@@ -650,19 +687,23 @@ class Read_Datacube:
                                                               kenel_noise=GP_kwds['kenel_noise'],
                                                               verbose=False, plot=plot)
                     if plot:
-                        plt.savefig(save_path+"#%d.png"%(n),dpi=100)
+                        plt.savefig(os.path.join(save_path, "#%d.png"%n),dpi=100)
                         plt.close()
 
                 except Exception as e:
-                    res, cont_fit = (blank_array, blank_array)
+                    res, cont_fit = (random_array, blank_array)
                     if verbose:
                         print("Spectrum #%d continuum fit failed ... Skip"%n)
-
+            
             self.obj_res_opt = np.vstack((self.obj_res_opt, res)) if n>1 else [res]
             self.obj_cont_fit = np.vstack((self.obj_cont_fit, cont_fit)) if n>1 else [cont_fit]
-        
+        if verbose:
+            print("Skip spurious detection: ",
+                  "#"+" #".join(spurious_nums.astype(str)),
+                  " ... Replaced with random noise.")
         print("Continuum Fitting Finished!")
         self.wavl_rebin = wavl_rebin
+        self.num_spurious = spurious_nums
        
             
     def save_spec_fits(self, save_path='./', suffix="_all"):  
@@ -671,31 +712,34 @@ class Read_Datacube:
         hdu_num = fits.PrimaryHDU(data=self.obj_nums)
         
         hdu_spec_opt = fits.ImageHDU(data=self.obj_specs_opt)
-        size = self.table['equivalent_radius'].value if self.mode!="APER" else self.obj_aper_opt
-        hdu_size = fits.ImageHDU(data=size)
+        hdu_cont_fit = fits.ImageHDU(data=self.obj_cont_fit)
 #         hdu_size = fits.BinTableHDU.from_columns([fits.Column(name="size",array=self.obj_aper_opt,format="E")])
         
         hdu_res_opt = fits.ImageHDU(data=self.obj_res_opt)
         hdu_wavl_rebin = fits.ImageHDU(data=self.wavl_rebin)
+        hdu_num_spurious = fits.ImageHDU(data=self.num_spurious)
         
-        hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_opt, hdu_size, hdu_res_opt, hdu_wavl_rebin])
-        hdul.writeto(save_path+'%s-spec-%s%s.fits'%(self.name, self.mode, suffix), overwrite=True)
+        hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_opt, hdu_cont_fit,
+                                  hdu_res_opt, hdu_wavl_rebin, hdu_num_spurious])
+        filename = '%s-spec-%s%s.fits'%(self.name, self.mode, suffix)
+        hdul.writeto(os.path.join(save_path, filename), overwrite=True)
         
         
     def read_spec(self, file_path):
         """Read generated extracted spectra and aperture fits"""
         hdu_spec = fits.open(file_path)
         
-        self.obj_nums = hdu_spec[0].data
+        self.obj_nums = hdu_spec[0].data.copy()
         
 #         self.obj_specs_cen = hdu_spec[1].data
 #         self.k_apers_cen = hdu_spec[2].data['k_aper_cen']
         
-        self.obj_specs_opt = hdu_spec[1].data
-        self.size_opt = hdu_spec[2].data
+        self.obj_specs_opt = hdu_spec[1].data.copy()
+        self.obj_cont_fit = hdu_spec[2].data.copy()
         
-        self.obj_res_opt = hdu_spec[3].data
-        self.wavl_rebin = hdu_spec[4].data
+        self.obj_res_opt = hdu_spec[3].data.copy()
+        self.wavl_rebin = hdu_spec[4].data.copy()
+        self.num_spurious = hdu_spec[5].data.copy()
         
         
     def generate_template(self, n_ratio=50, n_stddev=10, n_intp=2,
@@ -821,9 +865,10 @@ class Read_Datacube:
         self.Line_Ratios_Temps[typ_mod] = self.Line_ratios
         
     def Save_Template(self, temp_type="Ha-NII", temp_model="gauss", 
-                      save_path='./', suffix=""): 
+                      save_path='./temp/', suffix=""): 
         
         """Save Emission Line Template as Fits"""
+        check_save_path(save_path)
         
         typ_mod = temp_type + "_" + temp_model
         
@@ -833,39 +878,48 @@ class Read_Datacube:
         hdu_line_ratio_temp = fits.ImageHDU(self.Line_Ratios_Temps[typ_mod])
 
         hdul = fits.HDUList(hdus=[hdu_temps, hdu_wavl_temp, hdu_stddev_temp, hdu_line_ratio_temp])
-        print("Save %s templates for %s"%(self.name, typ_mod))
-        hdul.writeto(save_path+'Template-%s_%s%s.fits'%(self.name, typ_mod, suffix), overwrite=True) 
+        
+        filename = 'Template-%s_%s%s.fits'%(self.name, typ_mod, suffix)
+        print("Save %s templates for %s as %s"%(self.name, typ_mod, filename))
+        
+        hdul.writeto(os.path.join(save_path, filename), overwrite=True) 
 
     def Read_Template(self, dir_name, n_intp=2):
-        
         """Read Emission Line Template from directory"""
+        
         temp_list = glob.glob(dir_name+'/Template-%s_*.fits'%self.name)
         
-        self.n_intp = n_intp
-        print("Read Emission Line Template:"), pp.pprint(temp_list)
-        
-        for filename in temp_list:
-            temp_type, temp_model, _ = re.split(r'\s|_|\.', filename)[-3:]
-            typ_mod = temp_type + "_" + temp_model
-            
-            hdul = fits.open(filename)
-            self.temps = hdul[0].data
-            self.wavl_temp = hdul[1].data
-            self.Stddevs = hdul[2].data
-            self.Line_ratios = hdul[3].data
+        if len(temp_list)>0:
+            self.n_intp = n_intp
+            print("Read Emission Line Template:"), pp.pprint(temp_list)
 
-            self.Temp_Lib[typ_mod] = self.temps
-            self.wavl_temps[typ_mod] = self.wavl_temp
-            self.Stddev_Temps[typ_mod] = self.Stddevs
-            self.Line_Ratios_Temps[typ_mod] = self.Line_ratios
+            for path_name in temp_list:
+                path, filename_w_ext = os.path.split(path_name)
+                filename, _ = filename_w_ext.rsplit(".", 1)
+                _, temp_type, temp_model = re.split(r'\_', filename)[:3]
+                typ_mod = temp_type + "_" + temp_model
+
+                hdul = fits.open(path_name)
+                self.temps = hdul[0].data.copy()
+                self.wavl_temp = hdul[1].data.copy()
+                self.Stddevs = hdul[2].data.copy()
+                self.Line_ratios = hdul[3].data.copy()
+
+                self.Temp_Lib[typ_mod] = self.temps
+                self.wavl_temps[typ_mod] = self.wavl_temp
+                self.Stddev_Temps[typ_mod] = self.Stddevs
+                self.Line_Ratios_Temps[typ_mod] = self.Line_ratios
+        else:
+            print('%s does not exist or does not have templates ("Template-*").'%dir_name)
             
-    def cross_correlation(self, num, 
+    def cross_correlation(self, num, rv=None,
                           temp_type="Ha-NII", 
-                          temp_model="gauss", 
-                          h_contrast=0.1, 
-                          edge=15,
-                          kind_intp="linear", 
-                          rv=None, plot=True):
+                          temp_model="gauss",
+                          kind_intp="linear",
+                          h_contrast=0.1, edge=20,
+                          const_window=False, 
+                          verbose=True, plot=True,
+                          fig=None, axes=None):
         
         """Cross-correlation for one SE detection.
         
@@ -890,18 +944,19 @@ class Read_Datacube:
         
         """ 
             
-        if plot:    
-            fig, axes = plt.subplots(nrows=2, ncols=1,figsize=(9,7))
-        else:
-            fig, axes = None, (None, None)
+        if plot:
+            if axes is None:
+                fig, axes = plt.subplots(nrows=2, ncols=1,figsize=(9,7))
         
+        # Note spurious detections are skipped
         res = self.obj_res_opt[self.obj_nums==num][0]  # Read residual spectra
         
         # Read the template information, and pass to cross-correlation
-        temps = self.Temp_Lib[temp_type + "_" + temp_model]
-        wavl_temp = self.wavl_temps[temp_type + "_" + temp_model]
-        stddevs = self.Stddev_Temps[temp_type + "_" + temp_model]
-        line_ratios = self.Line_Ratios_Temps[temp_type + "_" + temp_model]
+        typ_mod = temp_type + "_" + temp_model
+        temps = self.Temp_Lib[typ_mod]
+        wavl_temp = self.wavl_temps[typ_mod]
+        stddevs = self.Stddev_Temps[typ_mod]
+        line_ratios = self.Line_Ratios_Temps[typ_mod]
         
         # result_cc: ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
         result_cc = xcor_SNR(res=res, 
@@ -915,29 +970,90 @@ class Read_Datacube:
                              temp_type=temp_type, 
                              temp_model=temp_model,
                              temps_params={'stddev':stddevs, 
-                                           'line_ratio':line_ratios}
+                                           'line_ratio':line_ratios},
                              h_contrast=h_contrast, 
                              rv=rv, edge=edge,
+                             const_window=const_window, 
                              plot=plot, fig=fig, axes=axes)
-        
-        ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = result_cc
         
         if plot: plt.tight_layout()
             
-        r_max = np.argmax(Rs)    
-        z_best = z_ccs[r_max]
-        print ("Detection #%d  z: %.3f  Peak R: %.3f  Detction S/N: %.3f Peak S/N: %.3f"\
-                               %(num, z_best, Rs[r_max], SNRs[r_max], SNR_ps[r_max]))
-        
+        if verbose:
+            print ("Detection #%d  z: %.3f  sigma: %.3f  Peak R: %.3f  Detction S/N: %.3f Peak S/N: %.3f" \
+                   %(num, result_cc["z_best"], result_cc["sigma_best"],
+                     result_cc["R"], result_cc["SNR"], result_cc["SNR_p"]))
             
-        return ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
+        return result_cc
 
-    def cross_correlation_all(self, 
+    
+    def cross_correlation_pipe(self, 
+                               temp_type="Ha-NII", 
+                               temp_model="gauss",
+                               kind_intp="linear",
+                               edge=20, h_contrast=0.1,
+                               const_window=False, 
+                               cores=None, verbose=True):
+        
+        from usid_processing import parallel_compute
+        from functools import partial
+        
+        CC_result = {}
+        
+        # Read the template information, and pass to cross-correlation
+        typ_mod = temp_type + "_" + temp_model
+        temps = self.Temp_Lib[typ_mod]
+        wavl_temp = self.wavl_temps[typ_mod]
+        stddevs = self.Stddev_Temps[typ_mod]
+        line_ratios = self.Line_Ratios_Temps[typ_mod]
+        
+        result_cc = self.cross_correlation(num=1, rv=None, edge=edge, 
+                                           temp_type=temp_type, temp_model=temp_model,
+                                           const_window=const_window, kind_intp=kind_intp,
+                                           h_contrast=h_contrast, verbose=False, plot=False)
+        self.rv = result_cc['rv']
+        result_cc.pop("rv", None)
+        CC_result["1"] = result_cc
+    
+        p_xcor = partial(xcor_SNR, 
+                         wavl_rebin=self.wavl_rebin, 
+                         temps=temps, 
+                         wavl_temp=wavl_temp, 
+                         d_wavl=self.d_wavl, 
+                         z_sys=self.z0, 
+                         temp_type=temp_type, 
+                         temp_model=temp_model,
+                         temps_params={'stddev':stddevs, 
+                                       'line_ratio':line_ratios},
+                         rv=self.rv, edge=edge,
+                         n_intp=self.n_intp, 
+                         kind_intp=kind_intp,     
+                         h_contrast=h_contrast,
+                         const_window=const_window,
+                         plot=False)
+        
+        start = time.time()
+        results_cc = parallel_compute(self.obj_res_opt[1:], p_xcor, cores=cores,
+                                      lengthy_computation=False, verbose=verbose)
+        end = time.time()
+        if verbose:
+            print("Run in parallel. Total Time %.2fs"%(end-start))
+        
+        # Retrieve cc parallelly computed result
+        for k, num in enumerate(self.obj_nums[1:].astype(str)):
+            result_cc.pop("rv", None)
+            CC_result[num] = results_cc[k]
+        
+        CC_result['rv'] = self.rv
+            
+        return CC_result
+    
+    def cross_correlation_all(self, edge=20, 
                               temp_type="Ha-NII", 
                               temp_model="gauss",
                               kind_intp="linear",
-                              edge=30,
-                              h_contrast=0.1):
+                              h_contrast=0.1,
+                              parallel=True, cores=None, 
+                              const_window=False, verbose=True):
         """Cross-correlation for all SE detections in the catalog.
         
         Parameters
@@ -949,49 +1065,52 @@ class Read_Datacube:
         
         """ 
         
-        self.temp_type = temp_type
-        self.temp_model = temp_model
+        n_obj = len(self.obj_nums)
+        
         typ_mod = temp_type + "_" + temp_model
         self.typ_mod = typ_mod
+        temps = self.Temp_Lib[typ_mod]
         
-        self.temps = self.Temp_Lib[typ_mod]
+        # Initialize CC result as null dictionary
+        self.CC_result = {}
         
-        self.cc_nums = np.array([], dtype="int64")
-        self.CC_zccs = np.zeros((len(self.obj_nums), len(self.temps)))
-        self.CC_Rs = np.zeros((len(self.obj_nums), len(self.temps)))
-        self.CC_SNRs = np.zeros((len(self.obj_nums), len(self.temps)))
-        self.CC_SNR_ps = np.zeros((len(self.obj_nums), len(self.temps)))
-        self.CC_flag_edge = np.zeros(len(self.obj_nums))
+        # Cross-correlation with the templates
+        print("Do cross-correlation using %s model templates..."%typ_mod)
         
-      
-        for j, num in enumerate(self.obj_nums):
-            if j==0:
-                ccs, rv0, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = self.cross_correlation(num, h_contrast=h_contrast, 
-                                                                              temp_type=temp_type, temp_model=temp_model, 
-                                                                              kind_intp=kind_intp, edge=edge, rv=None, plot=False)
-                self.rv = rv0
-            else:
-                ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge = self.cross_correlation(num, h_contrast=h_contrast, 
-                                                                             temp_type=temp_type, temp_model=temp_model, 
-                                                                             kind_intp=kind_intp, edge=edge, rv=self.rv, plot=False)
-               
-            self.CC_zccs[j] = z_ccs
-            self.CC_Rs[j] = Rs
-            self.CC_SNRs[j] = SNRs
-            self.CC_SNR_ps[j] = SNR_ps
-            self.CC_flag_edge[j] = flag_edge
-            self.CCs = np.concatenate([self.CCs, [ccs]]) if len(self.cc_nums)>0 else [ccs]
+        if parallel:
+            self.CC_result = self.cross_correlation_pipe(temp_type=temp_type, temp_model=temp_model,
+                                                         cores=cores, verbose=verbose,
+                                                         edge=edge, const_window=const_window,
+                                                         kind_intp=kind_intp, h_contrast=h_contrast)
+        else:
             
-            self.cc_nums = np.append(self.cc_nums, num)
-        
-        self.CC_zccs_Temps[typ_mod] = self.CC_zccs
-        self.CC_Rs_Temps[typ_mod] = self.CC_Rs
-        self.CC_SNRs_Temps[typ_mod] = self.CC_SNRs
-        self.CC_SNR_ps_Temps[typ_mod] = self.CC_SNR_ps
-        self.CC_flag_edge_Temps[typ_mod] = self.CC_flag_edge
-        self.CCs_Temps[typ_mod] = self.CCs
-        
+            for j, num in enumerate(self.obj_nums):
+                if verbose:
+                    if np.mod(j, 400)==0: 
+                        print("Cross-correlating spectra with templates ... %d/%d"%(j, len(self.obj_nums)))
+                        
+                if j==0:
+                    # Compute relative velocity axis only at the first step 
+                    result_cc = self.cross_correlation(num, rv=None, edge=edge,
+                                                       temp_type=temp_type, temp_model=temp_model,
+                                                       verbose=verbose, plot=False,
+                                                       const_window=const_window,
+                                                       kind_intp=kind_intp, h_contrast=h_contrast)
+                else:
+                    result_cc = self.cross_correlation(num, rv=self.rv, edge=edge,
+                                                       temp_type=temp_type, temp_model=temp_model,
+                                                       verbose=verbose, plot=False,
+                                                       const_window=const_window,
+                                                       kind_intp=kind_intp, h_contrast=h_contrast)
+                result_cc.pop("rv", None)
+                self.CC_result[num] = result_cc
+                
+            self.CC_result['rv'] = self.rv
             
+        # Assign results of the specific template
+        self.CC_result_Temps[typ_mod] = self.CC_result
+        
+
     def save_cc_fits(self, save_path='./', suffix=""): 
         """Save cross-correlation results as fits"""
         
@@ -1005,9 +1124,10 @@ class Read_Datacube:
 
         hdul = fits.HDUList(hdus=[hdu_cc_nums, hdu_CC_Rs, hdu_CC_SNRs, hdu_CC_SNR_ps, hdu_CC_zccs, hdu_CC_flag_edge])
         print("Save cross-correlation results for %s using %s templates"%(self.name, self.typ_mod))
-        hdul.writeto(save_path+'%s-cc_%s_%s.fits'%(self.name, self.typ_mod, suffix), overwrite=True) 
-        
-    def read_cc(self, filename):
+        filename = '%s-cc_%s_%s.fits'%(self.name, self.typ_mod, suffix)
+        hdul.writeto(os.path.join(save_path, filename), overwrite=True) 
+       
+    def read_cc_fits(self, filename):
         """Read cross-correlation results""" 
         
         _, temp_type, temp_model, _ = re.split(r'\s|_', filename)
@@ -1049,20 +1169,206 @@ class Read_Datacube:
             self.CC_flag_edge_Temps[typ_mod] = self.CC_flag_edge
         except IndexError:
             pass       
+    
+    
+    def save_cc_result(self, save_path='./', suffix=""): 
+        """Save cross-correlation results as pkl"""
+        import pickle
+        check_save_path(save_path)
+        filename = os.path.join(save_path, '%s-cc%s'%(self.name, suffix))
         
+        with open(filename + '.pkl', 'wb') as file:
+            pickle.dump(self.CC_result_Temps, file, pickle.HIGHEST_PROTOCOL)
+
+        print("Save cross-correlation results for %s as : %s"%(self.name, filename + '.pkl'))
+        print("Template used: "+str([key for key in self.CC_result_Temps.keys()]))
+        
+    def read_cc_result(self, filename):
+        import pickle
+        print("Read cross-correlation results for %s from : %s"%(self.name, filename))
+        
+        if os.path.isfile(filename): 
+            with open(filename, 'rb') as f:
+                self.CC_result_Temps = pickle.load(f)
+
+            print("Template used: "+str([key for key in self.CC_result_Temps.keys()]))
+            
+        else:
+            print("%s does not exist. Check file path."%filename)
+        
+        
+    def cc_property(func=None): 
+        def get_prop(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except KeyError:
+                print("Template / Property name does not exist.")
+        return get_prop
+
+    @cc_property    
+    def get_CC_result_best(self, prop, typ_mod, nums=None):
+        """
+        Get the best matched value of a property from CC results.
+        
+        prop: 'sigma_best', 'ratio_best', 'z_best', 'SNR' ...
+        """
+        
+        if nums is None:
+            nums = self.obj_nums
+        return np.array([self.CC_result_Temps[typ_mod][num][prop]
+                         for num in nums.astype(str)])
+            
+
+    
+    def estimate_EW(self, num, z=None, sigma=None, 
+                    temp_type="Ha-NII", temp_model="gauss",
+                    MC_err=True, n_MC=250, edge=20,
+                    use_cont_fit=False, ax=None, plot=True):
+        
+        id = num-1
+        typ_mod = temp_type + "_" + temp_model
+        
+        if temp_type=="Ha-NII":
+            lam_0 = 6563.
+        elif temp_type=="Hb-OIII":
+            lam_0 = 5007.
+        elif temp_type=="OII":
+            lam_0 = 3727.
+
+        if use_cont_fit:
+            cont = np.median(np.interp(self.wavl, self.wavl_rebin, self.obj_cont_fit[id]))
+        else:
+            cont = None
+            
+        if sigma is None:
+            if temp_model=="box":
+                sigma = self.d_wavl
+            else:
+                sigma = self.CC_result_Temps[typ_mod][str(num)]['sigma_best']
+        
+        if z is None:
+            z = self.CC_result_Temps[typ_mod][str(num)]['z_best']
+        
+        EW, EW_std = estimate_EW(self.obj_specs_opt[id], self.wavl,
+                                 z=z, lam_0=lam_0, sigma=sigma, 
+                                 MC_err=MC_err, n_MC=n_MC,
+                                 cont=cont, ax=ax, plot=plot)
+        
+        return EW, EW_std
+
+    def estimate_EW_all(self, temp_type="Ha-NII", temp_model="gauss",
+                        MC_err=True, n_MC=250, use_cont_fit=False, edge=20):
+            
+        typ_mod = temp_type + "_" + temp_model
+       
+        z_bests = self.get_CC_result_best('z_best', typ_mod)
+        sigma_bests = self.get_CC_result_best('sigma_best', typ_mod)
+        
+        EWs = np.zeros_like(self.obj_nums)
+        EW_stds = np.zeros_like(self.obj_nums)
+        for k, num in enumerate(self.obj_nums):
+            if np.mod(k+1, 400)==0: print("Measure EW... %d/%d"%(k+1, len(self.obj_nums)))
+            EWs[k], EW_stds[k] = self.estimate_EW(num, z=z_bests[k], sigma=sigma_bests[k],
+                                                  temp_type=temp_type, temp_model=temp_model,
+                                                  MC_err=MC_err, n_MC=n_MC, edge=edge,
+                                                  use_cont_fit=use_cont_fit, plot=False)
+        self.EWs = EWs
+        self.EW_stds = EW_stds
+        
+    def match_sdss_star(self, sep=3*u.arcsec,
+                        search_radius=7*u.arcmin, band='rmag', mag_max=18):
+       
+        # Retrieve SDSS star catalog of the target field
+        tab_sdss = crossmatch_sdss12(self.RA, self.DEC,
+                                     radius=search_radius, band=band, mag_max=mag_max)
+        
+        # Read WCS info from the datacube header
+        wcs = self.get_wcs()
+
+        c_star = SkyCoord(ra=tab_sdss["RA_ICRS"], dec=tab_sdss["DE_ICRS"])
+        
+        # Use wcs.all_world2pix to perform all transformations in series (core WCS, SIP and distortions) 
+        # Note pixel cooordinate of centroids in photutils is 0-based!
+        star_pos = np.array(c_star.to_pixel(wcs, origin=0)).T  
+        
+        obj_pos = np.array([self.table['xcentroid'], self.table['ycentroid']]).T
+        coords_obj = wcs.all_pix2world(obj_pos, 0)  # 0-based position
+        
+        # Convert positions of detections to world coordinates
+        c_obj = SkyCoord(ra=coords_obj[:,0], dec=coords_obj[:,1], frame="icrs", unit="deg")
+    
+        # Match the detection postions with the SDSS star catalog
+        idx, d2d, d3d = c_star.match_to_catalog_sky(c_obj)
+        match = d2d < sep
+        cat_star_match = tab_sdss[match]
+        cat_obj_match = self.table[idx[match]]
+        
+        # Combine the detection table with the SDSS star catalog
+        cat_star_match.add_column(cat_obj_match["NUMBER"], index=0, name="NUMBER")
+        cat_match = join(cat_obj_match, cat_star_match, keys='NUMBER')
+        
+        return cat_match
+    
+    def plot_candidate(self, num, temp_type="Ha-NII", temp_model="gauss", fig=None):
+    
+        from matplotlib.gridspec import GridSpec
+        if fig is None:
+            fig = plt.figure(figsize=(13,10))
+        gs = GridSpec(3, 4, figure=fig)
+        ax1 = fig.add_subplot(gs[0, :3])
+        ax2 = fig.add_subplot(gs[1, :3])
+        ax3 = fig.add_subplot(gs[2, :3])
+        ax4,ax5,ax6 = [fig.add_subplot(gs[i, 3]) for i in range(3)]
+
+        self.rv = self.CC_result_Temps[temp_type+"_"+temp_model]["rv"]
+        
+        EW, EW_std = self.estimate_EW(num, temp_type=temp_type, temp_model=temp_model, ax=ax1)
+
+        result = self.cross_correlation(num, const_window=False, rv=self.rv,
+                                        temp_type=temp_type, temp_model=temp_model,
+                                        verbose=False, axes=(ax2,ax3))
+
+        X_cen, Y_cen = self.get_centroid(num) 
+        bounds = self.get_bounds(num, cen_pos=(X_cen, Y_cen)) 
+        x_min, y_min, _, _ = bounds
+        X_min, Y_min = coord_Array2Im(x_min, y_min, 0)
+
+        if hasattr(self, "src_map"):
+            cutout = self.get_cutout(num, self.src_map, bounds=bounds, cen_pos=(X_cen, Y_cen))
+            ax4.imshow(cutout, norm=norm1, origin="lower", vmin=np.median(self.src_map), vmax=1)
+        
+        cutout_stack = self.get_cutout(num, self.stack_field, bounds=bounds, cen_pos=(X_cen, Y_cen))
+        ax5.imshow(cutout_stack, norm=norm2, origin="lower", vmin=np.median(self.stack_field), vmax=1e2)
+        
+        if self.deep_frame is not None:
+            cutout_deep = self.get_cutout(num, self.deep_frame, bounds=bounds, cen_pos=(X_cen, Y_cen))
+            ax6.imshow(cutout_deep, norm=norm3, origin="lower", vmin=np.median(self.deep_frame), vmax=1e3)
+
+        for ax, title in zip([ax4,ax5,ax6],["MMA", "Stack", "Deep"]):
+            ax.plot(X_cen-X_min, Y_cen-Y_min, 'r+', ms=15)
+            ax.xaxis.set_major_locator(plt.MaxNLocator(6))
+            ax.yaxis.set_major_locator(plt.MaxNLocator(6))
+            ax.set_xticklabels(ax.get_xticks().astype('int64')+X_min)
+            ax.set_yticklabels(ax.get_yticks().astype('int64')+Y_min)
+            ax.set_title(title, fontsize=12)
+            ax.set_xlabel("X (pix)")
+            ax.set_ylabel("Y (pix)")
+            
+        plt.tight_layout()
+
     
     def read_cluster_boundary(self, filepath):
         """Read Cluster boundary map and BCG position, only for double cluster"""
         self.boundary_map = fits.open(filepath)[0].data 
         
-    def assign_BCG_position(self, id_BCG):
+    def assign_BCG_position(self, id_BCG, xname='xcentroid', yname='ycentroid'):
         """Assign BCG position (x, y) in pixel from id_BCG, ((x1,y1),(x2,y2)) for double cluster"""
         if id_BCG is not None:
             if np.ndim(id_BCG)==0:
-                self.pos_BCG = (self.table[id_BCG]["X_IMAGE"], self.table[id_BCG]["Y_IMAGE"])
+                self.pos_BCG = (self.table[id_BCG][xname], self.table[id_BCG][yname])
             elif np.ndim(id_BCG)==1:
-                pos_BCG1 = (self.table[id_BCG[0]]["X_IMAGE"], self.table[id_BCG[0]]["Y_IMAGE"])
-                pos_BCG2 = (self.table[id_BCG[1]]["X_IMAGE"], self.table[id_BCG[1]]["Y_IMAGE"])
+                pos_BCG1 = (self.table[id_BCG[0]][xname], self.table[id_BCG[0]][yname])
+                pos_BCG2 = (self.table[id_BCG[1]][xname], self.table[id_BCG[1]][yname])
                 self.pos_BCG = (pos_BCG1,pos_BCG2)
             return self.pos_BCG
         else:
@@ -1071,7 +1377,6 @@ class Read_Datacube:
     def assign_BCG_coordinate(self, coord_BCG):
         """Assign BCG position (ra, dec) in deg from id_BCG, ((ra1,dec1),(ra2,dec2)) for double cluster""" 
         # WCS
-        self.wcs = WCS(self.hdu[0].header, naxis=2)
         if np.ndim(coord_BCG)==1:
             self.coord_BCG = SkyCoord(coord_BCG[0], coord_BCG[1], frame='icrs', unit="deg")
             print("BCG coordinate: ", self.coord_BCG.to_string('hmsdms'))
@@ -1083,12 +1388,12 @@ class Read_Datacube:
             print("BCG2 coordinate: ", coord_BCG2.to_string('hmsdms'))
         
         
-    def centroid_analysis(self, num, z=None, k_wid=6, 
+    def centroid_analysis(self, num, z=None,
                           centroid_type="APER", coord_type="angular", sum_type="weight",
                           emission_type="subtract", aperture_type="separate",
                           fix_window=False, multi_aper=True, 
                           n_rand=199, aper_size=[0.7,0.8,0.9,1.1,1.2,1.],
-                          plot=True, print_out=True, return_for_plot=False):
+                          plot=True, verbose=True, return_for_plot=False):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -1113,11 +1418,10 @@ class Read_Datacube:
         dist_clus : distance to cluster center (in pixel)
         """ 
         
-        ind = (self.obj_nums==num)
+        ind = np.where(self.obj_nums==num)[0][0]
         
-        obj_SE = Object_SE(self.table[ind], k_wid=k_wid, cube=self.datacube,
-                           img_seg=self.img_seg, deep_frame=self.deep_frame, mask_field=self.mask_edge)
-        self.obj_SE=obj_SE
+        obj_SE = Obj_detection(self.table[ind], cube=self.cube,
+                               seg_map=self.seg_map, deep_frame=self.deep_frame, mask_edge=self.mask_edge)
 
         spec = self.obj_specs_opt[ind][0]
 
@@ -1129,9 +1433,9 @@ class Read_Datacube:
         if z is None:
             z = self.z_best[ind]
         
-        try: 
+        if hasattr(self, 'boundary_map'):
             boundary_map = self.boundary_map
-        except AttributeError:
+        else:
             boundary_map = None
             
         try:
@@ -1146,13 +1450,12 @@ class Read_Datacube:
             else:
                 deep_img = None
             d_angle, offset, dist_clus, \
-            pa, clus_cen_angle = compute_centroid_offset(obj_SE, spec=spec, wavl=self.wavl, 
+            pa, clus_cen_angle = compute_centroid_offset(obj_SE, spec=spec, 
+                                                         wavl=self.wavl, 
                                                          k_aper=k_aper, z_cc=z,
-                                                         pos_BCG = self.pos_BCG,
                                                          coord_BCG = self.coord_BCG, 
                                                          wcs = self.wcs, 
                                                          centroid_type=centroid_type, 
-                                                         coord_type=coord_type, 
                                                          line_stddev=lstd,
                                                          line_ratio=lr,
                                                          affil_map=boundary_map, 
@@ -1162,19 +1465,19 @@ class Read_Datacube:
                                                          aperture_type=aperture_type,
                                                          multi_aper=multi_aper,
                                                          n_rand=n_rand, aper_size=aper_size,
-                                                         plot=plot, print_out=print_out,
+                                                         plot=plot, verbose=verbose,
                                                          return_for_plot=return_for_plot)
             return (d_angle, offset, dist_clus, pa, clus_cen_angle)
         
         except (ValueError, TypeError) as error:
-            if print_out:
+            if verbose:
                 print("Unable to compute centroid! Error raised.")
             return (np.nan, np.nan, np.nan, np.nan, np.nan)
     
-    def centroid_analysis_all(self, Num_v, k_wid=6, 
-                              centroid_type="APER", coord_type="angular", aperture_type="separate", 
+    def centroid_analysis_all(self, Num_v,
+                              centroid_type="APER", aperture_type="separate", 
                               n_rand=199, aper_size = [0.7,0.8,0.9,1.1,1.2,1.],
-                              plot=False, print_out=True):
+                              plot=False, verbose=True):
         """Compute centroid offset and angle for all SE detections
         
         Parameters
@@ -1196,10 +1499,10 @@ class Read_Datacube:
         self.PAs = np.array([])
         self.clus_cen_angles = np.array([])
         self.max_devs = np.array([])
-        if print_out:
+        if verbose:
             print("Current Model: ", self.typ_mod)
         for num in self.obj_nums:
-            if print_out:
+            if verbose:
                 print("#EL-%1d"%num)
             ind = (self.obj_nums==num)
 
@@ -1221,18 +1524,17 @@ class Read_Datacube:
                 multi_aper = False
                 
             d_angle, offset, dist_clus, \
-            pa, clus_cen_angle = self.centroid_analysis(num, z=z, k_wid=k_wid, 
+            pa, clus_cen_angle = self.centroid_analysis(num, z=z,
                                                         centroid_type=centroid_type, 
-                                                        coord_type=coord_type,
                                                         fix_window=fix_w, 
                                                         emission_type=emission_type,
                                                         aperture_type=aperture_type,
                                                         sum_type=sum_type,
                                                         multi_aper=multi_aper,
                                                         n_rand=n_rand, aper_size=aper_size,
-                                                        plot=False, print_out=print_out)
+                                                        plot=False, verbose=verbose)
             if num in Num_v:
-                if print_out:
+                if verbose:
                     print("Angle: %.3f  Offset: %.3f"%(d_angle, offset))    
             self.diff_angles = np.append(self.diff_angles, d_angle)
             self.diff_centroids = np.append(self.diff_centroids, offset)
@@ -1322,17 +1624,3 @@ class Read_Datacube:
                 self.diff_centroids_c_bp[i] = self.diff_centroids[ind_c_bp]
                 self.dist_clus_cens_c_bp[i] = self.dist_clus_cens[ind_c_bp]
                 
-    def measure_EW_Ha_all(self, Num_v):
-        for num in self.obj_nums:
-            ind = (self.obj_nums==num)
-
-            if num in Num_v:  # For emission galaxies, pick a window 70A aorund emission
-                z_best = self.z_best[ind]
-                spec = self.obj_specs_opt[ind][0]
-                lstd = self.line_stddev_best[ind]
-                EW_Ha = measure_EW(spec, self.wavl, z=z_best, line_stddev = lstd)
-            else:  
-                EW_Ha = np.nan
-                
-            self.EW_Ha = np.append(self.EW_Ha, EW_Ha) if num>1 else [EW_Ha]
-        

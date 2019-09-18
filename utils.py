@@ -1,6 +1,7 @@
 import os
 import re
 
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as plticker
@@ -11,24 +12,27 @@ import pandas as pd
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, RationalQuadratic
 
-from astropy.stats import SigmaClip, sigma_clip, mad_std, gaussian_fwhm_to_sigma
-from astropy.convolution import convolve, Gaussian1DKernel, Gaussian2DKernel, MexicanHat2DKernel
-from astropy.modeling import models, fitting
-
 import astropy.units as u
 from astropy.wcs import WCS
 from astropy.io import fits
+from astropy.coordinates import SkyCoord
+from astropy.stats import SigmaClip, sigma_clip, mad_std, gaussian_fwhm_to_sigma
+from astropy.convolution import convolve, Gaussian1DKernel, Gaussian2DKernel
+from astropy.modeling import models, fitting
+from astropy.table import Table
+
 from astropy.visualization import LogStretch, SqrtStretch, AsinhStretch
 from astropy.visualization.mpl_normalize import ImageNormalize
-norm1 = ImageNormalize(stretch=LogStretch())
-norm2 = ImageNormalize(stretch=LogStretch())
-norm = ImageNormalize(stretch=AsinhStretch())
+norm1, norm2, norm3 = [ImageNormalize(stretch=LogStretch()) for i in range(3)]
+norm0 = ImageNormalize(stretch=AsinhStretch())
 
 from photutils import Background2D, SExtractorBackground
 from photutils import EllipticalAnnulus, EllipticalAperture, aperture_photometry
-
 from photutils import centroid_com, centroid_2dg
 from photutils import detect_sources, deblend_sources, source_properties
+from photutils.utils import make_random_cmap
+rand_cmap = make_random_cmap(3000, random_state=12345)
+rand_cmap.set_under(color='black')
 
 ############################################
 # Basic
@@ -77,20 +81,34 @@ def vmin_3sig(img):
 def printsomething():
     print("Print")
 
-def coord_Im2Array(X_IMAGE, Y_IMAGE):
+def coord_Im2Array(X_IMAGE, Y_IMAGE, origin=1):
     """ Convert image coordniate to numpy array coordinate """
-    x_arr, y_arr = int(max(round(Y_IMAGE)-1, 0)), int(max(round(X_IMAGE)-1, 0))
+    x_arr, y_arr = int(max(round(Y_IMAGE)-origin, 0)), int(max(round(X_IMAGE)-origin, 0))
     return x_arr, y_arr
 
-def coord_Array2Im(x_arr, y_arr):
+def coord_Array2Im(x_arr, y_arr, origin=1):
     """ Convert image coordniate to numpy array coordinate """
-    X_IMAGE, Y_IMAGE = y_arr+1, x_arr+1
+    X_IMAGE, Y_IMAGE = y_arr+origin, x_arr+origin
     return X_IMAGE, Y_IMAGE
 
 def check_save_path(dir_name):
     if not os.path.exists(dir_name):
         print("%s does not exist. Make a new directory."%dir_name)
         os.makedirs(dir_name)
+
+        
+
+def timer(func): 
+    def execute_func(*args, **kwargs): 
+  
+        begin = time.time() 
+        func(*args, **kwargs) 
+        end = time.time() 
+        print("Total time taken in : ", func.__name__, end - begin) 
+  
+    return execute_func
+
+
 
 ############################################
 # Crosmatch & Preprocess
@@ -117,7 +135,7 @@ def crossmatch_gaia2(RA, DEC, radius=6*u.arcmin, band='RPmag', mag_max=18):
                           column_filters={band:'{0} .. {1}'.format(5, mag_max)})    
     return result[0]
     
-def crossmatch_sdss12(self, RA, DEC, radius=6*u.arcmin, band='rmag', mag_max=18):
+def crossmatch_sdss12(RA, DEC, radius=6*u.arcmin, band='rmag', mag_max=18):
     result = query_vizier(catalog_name="V/147/sdss12", 
                           RA=RA, DEC=DEC, radius=radius,
                           columns=['SDSS-ID', 'RA_ICRS', 'DE_ICRS', 'class', band],
@@ -212,10 +230,17 @@ def calculate_seeing(tab_star, image, seg_map, R_pix=15, sigma_guess=1, min_num=
                 
         return FWHMs
     
-def moving_average(x, w=3):
+def moving_average(x, w=5):
+    """ 1D moving average"""
     return np.convolve(x, np.ones(w), 'valid') / w
 
-def moving_average_cube(icol, cube, w=3):
+def moving_average_cube(cube, box=(3,3,3), mask=None):
+    """ 3D moving average on cube"""
+    out = convolve(cube, np.ones(box), mask=mask,
+                   nan_treatment='fill', normalize_kernel=True)
+    return out
+
+def moving_average_by_col(icol, cube, w=5):
     rows = cube[:,:,icol].T
     y = np.array([moving_average(row, w=w) for row in rows])
     return y 
@@ -256,71 +281,98 @@ def display_background_sub(field, back, vmax=1e3):
 # Measurement
 ############################################
 
-def measure_pa_offset(pos1, pos2, wcs, obj_SE):
-    (x1, y1) = pos1 
-    (x2, y2) = pos2
-    ra1, dec1 = wcs.all_pix2world(x1 + obj_SE.y_min, obj_SE.img_thumb.shape[1] - obj_SE.x_max + y1, 1)
-    ra2, dec2 = wcs.all_pix2world(x2 + obj_SE.y_min, obj_SE.img_thumb.shape[1] - obj_SE.x_max + y2, 1)
-    c1 = SkyCoord(ra1, dec1, frame='icrs', unit="deg")
-    c2 = SkyCoord(ra2, dec2, frame='icrs', unit="deg")
-
-    pa = np.mod(270 + np.arctan2(y2-y1,x2-x1)*180/np.pi, 360)
-    offset = np.sqrt((x1-x2)**2+(y1-y2)**2)
-
-    return pa, offset
-
-def measure_EW(spec, wavl, z, line_stddev=3, plot=False):
-    w_l = line_stddev * 2
+def get_centroid(num, table, Xname="xcentroid", Yname="ycentroid"):
+    """ Get centorids of the cutout for a detection """
+    id = np.where(table["NUMBER"]==num)[0][0]
+    X_cen, Y_cen = table[Xname][id], table[Yname][id]
+    return (X_cen, Y_cen)
     
-    ln_range = ((6563.-w_l)*(1+z), (6563.+w_l)*(1+z))
-    ln = (wavl>ln_range[0])&(wavl<ln_range[1]) & (wavl>wavl[0]+20) & (wavl<wavl[-1]-20) 
+def get_bounds(num, table, shape, cen_pos=None,
+               Rname='equivalent_radius', origin=0):
+    """ Get bounds of the cutout for a detection """
+    id = np.where(table["NUMBER"]==num)[0][0]
 
-    con = (~ln) & (wavl>wavl[0]+30) & (wavl<wavl[-1]-30) & ((wavl<(6548.-20)*(1+z))|(wavl>(6584.+20)*(1+z)))
-    cont = np.median(spec[con])
-    EW = np.sum((spec[ln]-cont)/cont)
-    if plot:
-        plt.step(wavl,spec, where="mid")
-        plt.step(wavl[ln],spec[ln], where="mid")
-        plt.scatter(wavl[con],spec[con], color="seagreen",alpha=0.9)
-        plt.axhline(cont,color="seagreen",alpha=0.8)
-    return EW
-    
-# SE Object Pipeline start from here
-class Object_SE:
-    def __init__(self, obj, k_wid=6, cube=None, img_seg=None, deep_frame= None, mask_field=None):
-        self.num = obj["NUMBER"][0]
-        self.X_IMAGE, self.Y_IMAGE = obj["X_IMAGE"][0], obj["Y_IMAGE"][0]
-        self.x_c, self.y_c = coord_ImtoArray(self.X_IMAGE, self.Y_IMAGE)
-        self.width = np.max([obj["A_IMAGE"][0],3])
-        self.a_image = obj["A_IMAGE"][0]
-        self.b_image = obj["B_IMAGE"][0]
-        self.theta = obj["THETA_IMAGE"][0]*np.pi/180.
-        
-        self.R_petro = obj["PETRO_RADIUS"][0]
-        self.R_kron = obj["KRON_RADIUS"][0]
-        self.flux_auto = obj["FLUX_AUTO"][0]
-        
-        self.x_min, self.x_max = (np.max([int(self.x_c - k_wid*self.width), 0]), 
-                                 np.min([int(self.x_c + k_wid*self.width), cube.shape[1]]))
-        self.y_min, self.y_max = (np.max([int(self.y_c - k_wid*self.width), 0]), 
-                                 np.min([int(self.y_c + k_wid*self.width), cube.shape[2]]))
-        self.center_pos=(self.y_c-self.y_min, self.x_c-self.x_min)
+    if cen_pos is None:
+        cen_pos = get_centroid(num, table)
+
+    x_cen, y_cen = coord_Im2Array(cen_pos[0], cen_pos[1], origin=origin)
+
+    r = int(max(25, 4*table[Rname][id]))
+
+    x_min, y_min = max(x_cen-r,0), max(y_cen-r,0)
+    x_max, y_max = min(x_cen+r, shape[0]-1), min(y_cen+r, shape[1]-1)
+
+    return (x_min, y_min, x_max, y_max)
+
+def get_cutout(num, table, image,
+               bounds=None, cen_pos=None,
+               Rname='equivalent_radius',
+               origin=0, **kwargs):
+    """ Get cutout of the input image for a detection """
+    if cen_pos is None:
+        cen_pos = get_centroid(num, table)
+
+    if bounds is None:
+         bounds = get_bounds(num, table, image.shape, **kwargs)
+
+    (x_min, y_min, x_max, y_max) = bounds
+
+    cutout = image[x_min:x_max+1, y_min:y_max+1]
+
+    return cutout
+
+class Obj_detection:
+    def __init__(self, tab, from_SE=False, cube=None,
+                 seg_map=None, deep_frame=None, mask_edge=None):
+        num = tab["NUMBER"]
+        if from_SE==True:
+            self.X_c, self.Y_c = tab["X_IMAGE"], tab["Y_IMAGE"]
+            self.x_c, self.y_c = coord_ImtoArray(self.X_c, self.Y_c)
+            self.width = np.max([tab["A_IMAGE"],3])
+            self.a_image, self.b_image = tab["A_IMAGE"], tab["B_IMAGE"]
+            self.theta = tab["THETA_IMAGE"]
+
+            self.R_petro = tab["PETRO_RADIUS"]
+            self.flux_auto = tab["FLUX_AUTO"]
+
+            x_min, x_max = (np.max([int(self.x_c - 6*self.width), 0]),
+                            np.min([int(self.x_c + 6*self.width), cube.shape[1]]))
+            y_min, y_max = (np.max([int(self.y_c - 6*self.width), 0]),
+                            np.min([int(self.y_c + 6*self.width), cube.shape[2]]))
+            self.origin = 1
             
-        self.mask_thumb = mask_field[self.x_min:(self.x_max+1), self.y_min:(self.y_max+1)]
+        else:
+            self.X_c, self.Y_c = tab["xcentroid"], tab["ycentroid"]
+#             self.x_c, self.y_c = coord_ImtoArray(self.X_c, self.Y_c, 0)
+            self.a_image = tab['equivalent_radius']
+            self.b_image = self.a_image * (1-tab['ellipticity'])
+            self.theta = tab['orientation']
+    
+            (x_min, y_min, x_max, y_max) = get_bounds(num, Table(tab), cube.shape[1:],
+                                                      cen_pos=(self.X_c, self.Y_c))
+            self.origin = 0
         
-        self.seg_thumb = img_seg[self.x_min:(self.x_max+1), self.y_min:(self.y_max+1)]
-        self.mask_seg = (self.seg_thumb==obj["NUMBER"]) | (self.seg_thumb==0)
-        self.mask_seg_obj = (self.seg_thumb==obj["NUMBER"])
+        self.bounds = (x_min, y_min, x_max, y_max)
         
-        self.cube_thumb = cube[:,self.x_min:(self.x_max+1), self.y_min:(self.y_max+1)]
+        self.X_min, self.Y_min = coord_Array2Im(x_min, y_min, origin=self.origin)
+        self.center_pos=(self.X_c-self.X_min, self.Y_c-self.Y_min)
+
+        self.mask_thumb = mask_edge[x_min:(x_max+1), y_min:(y_max+1)]
+
+        self.seg_thumb = seg_map[x_min:(x_max+1), y_min:(y_max+1)]
+        self.mask_seg = (self.seg_thumb==num) | (self.seg_thumb==0)
+        self.mask_seg_obj = (self.seg_thumb==num)
+
+        self.cube_thumb = cube[:,x_min:(x_max+1), y_min:(y_max+1)]
         self.img_thumb = self.cube_thumb.sum(axis=0)
         
         if deep_frame is not None:
-            self.deep_thumb = deep_frame[self.x_min:(self.x_max+1), self.y_min:(self.y_max+1)]
+            self.deep_thumb = deep_frame[x_min:(x_max+1), y_min:(y_max+1)]
         else:
             self.deep_thumb = None
-        
-    def img_display(self, vmin=0., vmax=None, norm=norm):
+                
+                
+    def img_display(self, vmin=0., vmax=None, norm=norm0):
         fig,ax=plt.subplots(1,1)
         if self.deep_thumb is None:
             img = self.img_thumb
@@ -342,7 +394,7 @@ class Object_SE:
         except AttributeError:
             return ax
      
-    def aper_photometry(self, k, k1, k2, ext_type="opt", print_out=False):
+    def aper_photometry(self, k, k1, k2, ext_type="opt", verbose=False):
         apertures = EllipticalAperture(positions=self.center_pos, 
                                        a=k*self.a_image, b=k*self.b_image, theta=self.theta)
         
@@ -363,10 +415,10 @@ class Object_SE:
         n_pix = len(signal)
         
         if (len(signal)==0)|(len(bkg)==0):
-            if print_out: print("No signal/background!")
+            if verbose: print("No signal/background!")
             return np.nan, np.nan, None
         if n_pix<=5: 
-            if print_out: print("Too few pixels!")
+            if verbose: print("Too few pixels!")
             return np.nan, np.nan, None
         
 #         S =  np.max([np.sum(signal) - n_pix * np.median(bkg), 0])
@@ -377,13 +429,13 @@ class Object_SE:
         if ext_type == "sky": N = N_sky
         else: N = N_tot
             
-        if print_out: print ("Aperture: %.1f Rp; Signal: %.4f, Noise: %.4f, SNR = %.4f"%(k, S, N, S/N))
+        if verbose: print ("Aperture: %.1f Rp; Signal: %.4f, Noise: %.4f, SNR = %.4f"%(k, S, N, S/N))
         return S, N, apers 
                    
     def compute_aper_opt(self, ks = np.arange(1.0,4.5,0.2), k1 = 5., k2 = 8., ext_type="opt",
-                         print_out=True, plot=False):
+                         verbose=True, plot=False):
         if self.R_petro==0:
-            if print_out: print("Error in measuring R_petro, dubious source")
+            if verbose: print("Error in measuring R_petro, dubious source")
             return (1., 0)
         
         snr_ks = np.empty_like(ks)
@@ -400,7 +452,7 @@ class Object_SE:
         except ValueError:
             return (1., 0)  # No available aperture, all k is None
         
-        if print_out: print ("Optimal Aperture: %.1f Rp, SNR = %.4f"%(k_opt, snr_opt))
+        if verbose: print ("Optimal Aperture: %.1f Rp, SNR = %.4f"%(k_opt, snr_opt))
         if plot:
             plt.figure(figsize=(7,5))
             plt.plot(ks, snr_ks, color="mediumseagreen",lw=2.5,alpha=0.9)
@@ -585,15 +637,30 @@ def generate_template(wavl, z=0, n_intp=2,
         
     return temp, wavl_temp  
 
-
+def use_broad_window(sigma, line_ratio, SNR,
+                     sigma_thre=5, sn_thre=20,
+                     temp_type="Ha-NII",
+                     temp_model="gauss"):
+    
+    strong_NII = (temp_type=="Ha-NII")&(line_ratio.max()/3 < 3)
+    broad_line = (sigma>sigma_thre)|(temp_model=="box")
+    high_SN = (SNR>=sn_thre)
+    
+    if strong_NII & broad_line & high_SN:
+        return True
+    else:
+        return False
+    
 def xcor_SNR(res, wavl_rebin, 
              temps, wavl_temp, 
              d_wavl, z_sys=0.228, rv=None, 
              edge=20, h_contrast=0.1,
              n_intp=1, kind_intp="linear",
              temp_type="Ha-NII", temp_model="gauss",
-             temps_params={'stddev':3, 'line_ratio':[1,1,1]},
-             const_window=True, plot=False, fig=None, axes=None):
+             temps_params={'stddev':3,
+                           'line_ratio':[1,1,1]},
+             const_window=False, plot=False,
+             fig=None, axes=None):
     """
     Cross-correlate with template and return rative velocity to z0 and correlation function
     
@@ -664,16 +731,18 @@ def xcor_SNR(res, wavl_rebin,
         # vicinity around lines to be excluded when measuring noise RMS
 #         if temp_model=="sincgauss":
 #             sigma *= 3
-        if const_window:
-            w_l, w_l2 = 20, 40
+        if (const_window)|(temp_model=="box"):
+            w_l, w_l2 = 15, 25
         else:
-            w_l, w_l2 = sigma * 5, sigma * 8
+            w_l, w_l2 = sigma * 3, sigma * 5
         
-        if temp_type=="Ha-NII":   #For strong AGN/composite use a broader window, the transform is set as continous
-            if ratio.max()/3. < 3.:
-                if (sigma > 5) & (SNRs.max()>=50):  
-                    w_l *= 1.5
-                    w_l2 *= 1.5
+        #For strong AGN/composite use a broader window
+        broad = use_broad_window(sigma, ratio, SNRs.max(),
+                                 sigma_thre=5, sn_thre=25,
+                                 temp_type=temp_type,
+                                 temp_model=temp_model)
+        if broad:
+            w_l, w_l2 = w_l*2, w_l2*2
     
         cc = signal.correlate(y, temp, mode="full", method="direct")
         cc = cc/cc.max()
@@ -719,20 +788,20 @@ def xcor_SNR(res, wavl_rebin,
             noise_peak_range = noise_range
 
         # compute noise and S/N for the lines and the peak
-        N = np.std(sigma_clip(cc[rv_zrange & noise_range], sigma=5, maxiters=10))
+#         N = np.std(sigma_clip(cc[rv_zrange & noise_range], sigma=5, maxiters=10))
 #         N = mad_std(cc[rv_zrange & noise_range])
-#         N = np.std(cc[rv_zrange & noise_range])           # simply use std?
+        N = np.std(cc[rv_zrange & noise_range])           # simply use std?
         
         # detection S/N
         SNRs[i] = S_p/N  
         
-        N_p = np.std(sigma_clip(cc[rv_zrange & noise_peak_range], sigma=5, maxiters=10))
+#         N_p = np.std(sigma_clip(cc[rv_zrange & noise_peak_range], sigma=5, maxiters=10))
 #         N_p = mad_std(cc[rv_zrange & noise_peak_range])
-#         N_p = np.std(cc[rv_zrange & noise_peak_range])    # simply use std?
+        N_p = np.std(cc[rv_zrange & noise_peak_range])    # simply use std?
         SNR_ps[i] = S_p/N_p
         
     
-        ###-----------------------------------##
+        ###-----------------------------------###
         # Find peaks and compute peak significance
         if temp_type=="Ha-NII":
             try:
@@ -773,17 +842,19 @@ def xcor_SNR(res, wavl_rebin,
             Contrasts[i] = 1.0
             
     Rs = Contrasts*SNRs/np.max(SNRs)     #Significance defined as S/N weight peak ratio
-#     z_loc = (z_ccs>np.percentile(z_ccs,2.5)) & (z_ccs<np.percentile(z_ccs,97.5))
 
     # The best matched template
-    if temp_model == "box":
-        best = np.argmax(Contrasts)
-    else:
-        best = np.argmax(Rs)
+#     if temp_model == "box":
+#         best = np.argmax(Contrasts)
+#     else:
+    best = np.argmax(Rs)
     
     ###-----------------------------------##
     z_best = z_ccs[best]
-    
+    snr_best = SNRs[best]
+    sig_best = temps_stddev[best]
+    ratio_best = temps_ratio[best]
+        
     #  if the line is within 25A to the edge, raise a flag caution
     line_at_edge = ((1+z_best)*lam_0<(x[0]+25)) | ((1+z_best)*lam_0>(x[-1]-25))   
     if line_at_edge: 
@@ -792,8 +863,7 @@ def xcor_SNR(res, wavl_rebin,
         flag_edge = 0
 
     if plot:
-        
-        if fig is None:
+        if axes is None:
             fig, (ax1,ax2) = plt.subplots(2,1,figsize=(8,6))
         else:
             ax1, ax2 = axes
@@ -801,48 +871,41 @@ def xcor_SNR(res, wavl_rebin,
         ax1.step(wavl_rebin, res, c="royalblue", lw=2, where="mid", label="Residual", alpha=0.9, zorder=4)
 #         ax1.plot(x, y, c="steelblue", linestyle='--', alpha=0.9, zorder=4)
 
-        if (temps_ratio is None):
-            ax1.step(wavl_temp*(1+z_ccs[best]),temps[best], color="seagreen", where="mid",
-                     alpha=0.7, label="Template: z=%.3g"%z_ccs[best], zorder=3)
+        #Plot ideal model template
+        sig_best, ratio_best = temps_stddev[best], temps_ratio[best]
+        line_pos = line_pos*(1+z_best)
+
+        if temp_model == "box":
+            # if use box template, sigma are the same (box_wid/2.355)
+            s = np.sum([models.Box1D(amplitude=lr, x_0=lp, width=sig_best*2.355)
+                        for (lr, lp) in zip(ratio_best, line_pos)])
         else:
-            #Plot ideal model template
-            sig_best, ratio_best = temps_stddev[best], temps_ratio[best]
+            s = np.sum([models.Gaussian1D(amplitude=lr, mean=lp, stddev=sig_best)
+                        for (lr, lp) in zip(ratio_best, line_pos)])
 
-            print("Best z:",z_best, "Best sigma:",sig_best)
-            line_pos = line_pos*(1+z_best)
+        wavl_new = np.linspace(wavl_temp[0], wavl_temp[-1], 400)/(1+z0)*(1+z_best)
+        temp_best = s(wavl_new)
 
-            if temp_model == "box":
-                # if use box template, sigma are the same (box_wid/2.355)
-                s = np.sum([models.Box1D(amplitude=lr, x_0=lp, width=sig_best*2.355)
-                            for (lr, lp) in zip(ratio_best, line_pos)])
-            else:
-                s = np.sum([models.Gaussian1D(amplitude=lr, mean=lp, stddev=sig_best)
-                            for (lr, lp) in zip(ratio_best, line_pos)])
-
-            wavl_new = np.linspace(wavl_temp[0], wavl_temp[-1], 400)/(1+z0)*(1+z_best)
-            temp_best = s(wavl_new)
-            
-            if (temp_model == "sincgauss"):
-                ILS = np.sinc((wavl_new-lam_0*(1+z_best))/5.)
-                temp_best = np.convolve(temp_best, ILS, mode="same")
-                temp_best[(wavl_new<lam_0*(1+z_best)-50)|(wavl_new>lam_0*(1+z_best)+50)]=0  # let higher-order lobe to be 0
+        if (temp_model == "sincgauss"):
+            ILS = np.sinc((wavl_new-lam_0*(1+z_best))/5.)
+            temp_best = np.convolve(temp_best, ILS, mode="same")
+            temp_best[(wavl_new<lam_0*(1+z_best)-50)|(wavl_new>lam_0*(1+z_best)+50)]=0  # let higher-order lobe to be 0
 
 #             ax1.step(wavl_temp/(1+z0)*(1+z_best), temps[best], color="g", where="mid",
 #                      alpha=0.5, label="Template: z=%.3g"%z_best, zorder=3)  
-            ax1.step(wavl_new, temp_best/temp_best.max(), color="mediumseagreen",
-                     where='mid', lw=2, linestyle='--', alpha=0.7, zorder=5)    
+        ax1.step(wavl_new, temp_best/temp_best.max(), color="mediumseagreen",
+                 where='mid', lw=2, linestyle='--', alpha=0.7, zorder=5)    
 
-            if const_window:
-                w_l, w_l2 = 20, 40
-            else:
-                w_l, w_l2 = sig_best * 3., sig_best * 8.
+        if (const_window)|(temp_model=="box"):
+            w_l, w_l2 = 15, 25
+        else:    
+            w_l, w_l2 = sig_best * 3., sig_best * 5.
 
-            if temp_type=="Ha-NII":   #For strong AGN/composite use a broader window, the transform is to make it continous
-                if ratio_best.max()/3. < 3.:  #<2:1=>1.5w_l, >3:1=>w_l
-                    if sig_best > 4:  
-                        if SNRs[best]>=50:  
-                            w_l2 *= 1.5                
-                
+        broad = use_broad_window(sig_best, ratio_best, snr_best,
+                                 sigma_thre=5, sn_thre=30,
+                                 temp_type=temp_type,temp_model=temp_model)    
+        if broad:
+            w_l, w_l2 = w_l*2, w_l2*2
                            
         for k, (lp, ln) in enumerate(zip(line_pos, line_name)):
             if ln!=" ":
@@ -850,18 +913,18 @@ def xcor_SNR(res, wavl_rebin,
                     continue
                 y_lab = res.max() if (k==1) else 0.875 * res.max()
                 ax1.vlines(x=lp, ymin=y_lab+0.1, ymax=y_lab+0.18, color='k', lw=1.5)
-                ax1.text(x=lp, y=y_lab+0.3, s=ln, color='k', ha="center", va="center", fontsize=11)
-                ax1.set_ylim(res.min()-0.05, res.max()+0.375)
+                ax1.text(x=lp, y=y_lab+0.3, s=ln, color='k', ha="center", va="center", fontsize=14)
+                ax1.set_ylim(res.min()-0.05, res.max()+0.45)
             else:
                 ax1.set_ylim(res.min()-0.05, res.max()+0.25)
                 
         ax1.set_xlim(x[0]-10, x[-1]+10)
         
         x_text = 0.75 if z_best < 0.24 else 0.12
-        ax1.text(x_text, 0.85, "z = %.3g"%(z_best),
+        ax1.text(x_text, 0.8, "z = %.3g"%(z_best),
                  color='k',fontsize=14, transform=ax1.transAxes,alpha=0.95, zorder=4)
-        ax1.set_xlabel('Wavelength ($\AA$)',fontsize=16)
-        ax1.set_ylabel('Normed Flux',fontsize=16)
+        ax1.set_xlabel('Wavelength ($\AA$)',fontsize=14)
+        ax1.set_ylabel('Normed Flux',fontsize=14)
         
         for i, temp in enumerate(temps):    
             ax2.plot(rv, ccs[i], "firebrick", alpha=np.min([0.9, 0.9/len(temps)*3]))
@@ -912,11 +975,11 @@ def xcor_SNR(res, wavl_rebin,
                 rv_intp = np.linspace(rv_left2, rv_right2, 100)
                 d_min = 50
                 
-            Interp_Peak = interpolate.interp1d(rv, ccs[best], kind='quadratic')
+            Interp_Peak = interpolate.interp1d(rv, ccs[best], kind='cubic')
             cc_intp = Interp_Peak(rv_intp)
 
             ind_peak, _ = signal.find_peaks(cc_intp, height=h_contrast, distance = d_min)
-            plt.plot(rv_intp[ind_peak], cc_intp[ind_peak], "x", ms=5, color='orange',zorder=4) 
+            ax2.plot(rv_intp[ind_peak], cc_intp[ind_peak], "x", ms=5, color='orange',zorder=4) 
             
         except ValueError:
             pass
@@ -925,109 +988,151 @@ def xcor_SNR(res, wavl_rebin,
         
         ax2.axhline(0, color="k", lw=1.5, ls="--", alpha=0.7)
         ax2.axvline((z_ccs[best]-z0)*3e5, color="orangered", lw=1.5, ls="--", alpha=0.8)
-        print("Peak wavl",x[np.argmax(y)])
                            
-        ax2.text(x_text, 0.85, r"$\rm S/N: %.1f$"%(SNRs[best]),
-                 color='k',fontsize=14, transform=ax2.transAxes,alpha=0.95, zorder=4)
+        ax2.text(x_text, 0.82, r"$\rm S/N: %.1f$"%(SNRs[best]),
+                 color='k',fontsize=13, transform=ax2.transAxes, alpha=0.95, zorder=4)
         if temp_type!="OII":
             ax2.text(x_text, 0.7, r"$\rm R: %.1f$"%(Rs[best]),
-                     color='k',fontsize=14, transform=ax2.transAxes,alpha=0.95, zorder=4)
+                     color='k',fontsize=13, transform=ax2.transAxes, alpha=0.95, zorder=4)
         ax2.set_xlim((zmin-z0)*3e5, (zmax-z0)*3e5)
-        ax2.set_xlabel('Relative Velocity (km/s) to z=%.3g'%z0,fontsize=16)
-        ax2.set_ylabel('CCF',fontsize=16)
+        ax2.set_xlabel('Relative Velocity (km/s) to z=%.3g'%z0,fontsize=14)
+        ax2.set_ylabel('CCF',fontsize=14)
         axb = ax2.twiny()
         axb.plot(rv/3e5 + z0, np.ones_like(rv)) # Dummy plot
         axb.cla()
         axb.set_xlim(zmin,zmax)
-        axb.set_xlabel("Redshift",fontsize=16)      
+        axb.set_xlabel("Redshift",fontsize=14)      
     
-    return ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
+    result_cc = {}
+    for (prop, vals) in zip(["ccf", "rv", "z_best", "sigma_best", 
+                            "R", "contrast", "SNR", "SNR_p", "flag_e"],
+                           [ccs[best], rv, z_best, sig_best, Rs[best], 
+                            Contrasts[best], SNRs[best], SNR_ps[best], flag_edge]):
+#                            [ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge]):
+        result_cc[prop] = vals
+        
+    return result_cc
 
+
+def measure_dist_to_edge(table, mask_edge, pad=200,
+                         Xname="xcentroid", Yname="ycentroid"):
+    """ Measure distance of each detection to the edges of the field.
+        This is to reduce some spurious detection around edges."""
     
-def compute_centroid_offset(obj_SE, k_aper, spec, wavl, 
-                            z_cc, pos_BCG=None, coord_BCG=None, 
-                            niter_aper=15, ctol_aper=0.01, iso_snr=1.2, 
-                            n_rand=199, aper_size = [0.7,0.8,0.9,1.1,1.2,1.],
-                            centroid_type="APER", coord_type="angular",
-                            wcs=None, affil_map=None, deep_img=None, 
-                            emission_type="subtract", sum_type="weight", 
-                            aperture_type="separate", multi_aper=False,
-                            line_stddev=3, line_ratio=None, mag0=25.2, 
-                            plot=True, print_out=True, return_for_plot=False):    
-    # Compute the centroid of emission and continua, and plot
-    w_l = line_stddev * 3
-#     if line_ratio<3:
-#         em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
-#     else: 
-#         em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
-    em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
-        
-    em = (wavl>em_range[0])&(wavl<em_range[1]) & (wavl>wavl[0]+15) & (wavl<wavl[-1]-15) 
-#     img_em = obj_SE.cube_thumb[em,:,:].sum(axis=0)/np.sum(em)
-
-    w2 = line_stddev * 5
-    con = (~em) & (wavl>wavl[0]+25) & (wavl<wavl[-1]-25) & ((wavl<(6548.-w2)*(1+z_cc))|(wavl>(6584.+w2)*(1+z_cc)))
-
-    if sum_type=="mean":
-        img_em = np.mean(obj_SE.cube_thumb[em,:,:],axis=0)
-        img_con = np.mean(obj_SE.cube_thumb[con,:,:], axis=0)
-        
-    elif sum_type=="median":    
-        img_con = np.median(obj_SE.cube_thumb[con,:,:], axis=0)
-        img_em = np.mean(obj_SE.cube_thumb[em,:,:],axis=0)
-        
-    elif sum_type=="weight":
-        img_con = np.median(obj_SE.cube_thumb[con,:,:], axis=0)
-#         img_con_std = mad_std(obj_SE.cube_thumb[con,:,:], axis=0)
-        img_em0 = obj_SE.cube_thumb[em,:,:]
-        
-        weight_map = abs(img_em0-img_con)#/img_con
-#         weight_map[(img_em0-img_con)<-2.5*img_con_std] = 0
-        weight_sum = np.sum(weight_map, axis=0)
-        
-        img_em = np.sum(img_em0*weight_map/weight_sum, axis=0)
-       
+    shape = mask_edge.shape
+    # Note photutils is 0-based while DS9 and SExtractor is 1-based
+    yy, xx = np.mgrid[0:shape[0],0:shape[1]]
     
-    if emission_type=="subtract":
-        img_em = img_em - img_con
+    dist_edge = np.empty(len(table))
+    for i, obj in enumerate(table):
+        x_obj, y_obj = (obj[Xname], obj[Yname])
+        if (x_obj<pad) | (x_obj>(shape[1]-pad)) | (y_obj<pad) | (y_obj>(shape[0]-pad)):
+            dist_edge[i] = math.sqrt(np.min((xx[mask_edge]-x_obj)**2 + (yy[mask_edge]-y_obj)**2))
+        else:
+            dist_edge[i] = pad
+            
+    return dist_edge
+    
+def estimate_EW(spec, wavl, z, 
+                lam_0=6563., sigma=5, edge=20,
+                MC_err=False, n_MC=250, spec_err=0.15, 
+                cont=None, ax=None, plot=True):
+    """ Estimate Equivalent Width of the line(s) """
+    
+    # window range to estimate EW. Filter edges excluded.
+    not_at_edge = (wavl>wavl.min()+edge) & (wavl<wavl.max()-edge)
+    line_range = (wavl > lam_0*(1+z)-8*sigma) & (wavl < lam_0*(1+z)+8*sigma) & not_at_edge
+    
+    # estimate conitinum if not given
+    if cont is None:
+        cont = np.median(spec[(~line_range) & not_at_edge])
+    
+    # EW = intg{F_l / F_0 - 1} (EW>0: emission)
+    x = wavl[line_range]
+    y = spec[line_range]
+    EW = np.trapz(y=y/cont-1, x=x)
+    
+    if MC_err is True:
+        if np.ndim(spec_err)==0:
+            y_err = spec_err*(abs(y-cont))
+        else:
+            y_err = spec_err[line_range]
+        EW_err = [np.trapz(y=(y+np.random.normal(0, scale=y_err))/cont-1, x=x) for i in range(n_MC)]
+        EW_std = np.std(EW_err)
     else:
-        img_em = img_em
+        EW_std = np.nan
     
-    if print_out:
-        if centroid_type == "APER":
-            print("optimal aperture:%.1f"%k_aper)
+    if plot:
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10,4))
+        ax.step(wavl, spec, where="mid", color="k",alpha=0.9)
+        ax.step(wavl[line_range], spec[line_range], where="mid")
+        ax.axhline(cont,color="seagreen",alpha=0.8)
+        if MC_err is True:
+            ax.errorbar(x, y, y_err, fmt=".", lw=1, color="gray", capsize=2, alpha=0.5)
+        x_text = 0.7 if z < 0.24 else 0.1
+        ax.text(x_text, 0.8, r"$\rm EW=%.2f\pm%.2f\AA$"%(EW, EW_std),
+                     color='k', fontsize=13, transform=ax.transAxes, alpha=0.95)
+        ax.set_xlabel('Wavelength ($\AA$)',fontsize=14)
+        ax.set_ylabel(r'Flux ($\rm 10^{-17}\,erg/cm^2/s/\AA$)',fontsize=13) 
+        
+    return EW, EW_std
 
-    mask_obj = obj_SE.mask_seg
-#     mask_obj = obj_SE.mask_seg_obj
+    
+def save_ds9_region(name, obj_pos, size, color="green", origin=1):
+
+    import pyregion
+    
+    if size is None: size=10
+    
+    ds9_header = "# Region file format: DS9 version 4.1\nglobal color=%s dashlist=8 3 width=1\nimage\n"%color
+    reg = "\n".join(["circle(%.4f,%.4f,%.3f)\n"\
+                            %(pos[0]+origin, pos[1]+origin, size) for pos in obj_pos])
+    region_str = ds9_header + reg
+    ds9_regs = pyregion.parse(region_str)
+    ds9_regs.write(os.path.join(save_path,'%s.reg'%name))    
+    
+def measure_offset_aper(obj, img_em, img_con, mask_obj,
+                        k_aper=5, multi_aper=False,
+                        aperture_type="separate",
+                        aper_size=[0.7,0.8,0.9,1.1,1.2,1.],
+                        n_rand_start=199, niter_aper=15, ctol_aper=0.01,
+                        verbose=True):
+    if verbose:
+            print("optimal aperture:%.1f"%k_aper)
+            
     if aperture_type== "separate":
-        theta = obj_SE.theta
-        if multi_aper==False:
+        theta = obj.theta * np.pi/180
+        
+        if multi_aper is False:
             aper_size = [1]
-            n_rand = 0
-        x1s, y1s = np.zeros((n_rand+1,len(aper_size))),np.zeros((n_rand+1,len(aper_size)))
-        x2s, y2s = np.zeros((n_rand+1,len(aper_size))),np.zeros((n_rand+1,len(aper_size)))
-        aper_ems  = np.array([])
-        aper_cons  = np.array([])
-        if print_out:
+            n_rand_start = 0
+            
+        x1s = np.zeros((n_rand_start+1, len(aper_size)))
+        y1s, x2s, y2s = np.zeros_like(x1s), np.zeros_like(x1s), np.zeros_like(x1s)
+        
+        aper_ems, aper_cons  = np.array([]), np.array([])
+        
+        if verbose:
             print("Aper (min,max): (%.2f,%.2f)"%(k_aper*aper_size[0],k_aper*aper_size[-1]))
-        for k, per_apaer in enumerate(aper_size):
-            a = np.max([obj_SE.a_image*per_apaer,1.])
-#             a = obj_SE.a_image*per_apaer
-            b = a/obj_SE.a_image * obj_SE.b_image
+        
+        for k, percent in enumerate(aper_size):
+            a = np.max([obj.a_image*percent,1.])
+            b = a/obj.a_image * obj.b_image
             da_s = np.append(stats.norm(loc=0, scale=a/3.).rvs(n_rand), 0)
             db_s = np.append(stats.norm(loc=0, scale=b/3.).rvs(n_rand), 0)
-            
+
             for j,(da,db) in enumerate(zip(da_s, db_s)):
                 try:
                     for d,img in enumerate([img_em, img_con]):
                         dx, dy = da*np.cos(theta)-db*np.sin(theta), da*np.sin(theta)+db*np.cos(theta)
-                        x, y = obj_SE.center_pos[0] + dx, obj_SE.center_pos[1] + dy
-                        
+                        x, y = obj.center_pos[0] + dx, obj.center_pos[1] + dy
+
                         for i in range(niter_aper):
                             aper = EllipticalAperture(positions=(x,y), 
-                                                      a=k_aper*a, b=k_aper*b, theta=obj_SE.theta)              
+                                                      a=k_aper*a, b=k_aper*b, theta=obj.theta)              
                             m0 = aper.to_mask(method='exact')[0]
-                            mask_aper = m0.to_image(obj_SE.img_thumb.shape)
+                            mask_aper = m0.to_image(mask_obj.shape)
 
                             data = img * mask_aper * mask_obj
                             if np.sum(data) < 0:
@@ -1036,87 +1141,143 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
                                 aper_em, aper_con = None, None                              
                                 break
                             x_new, y_new = centroid_com(data, mask=np.logical_not(mask_aper * mask_obj))
-                            
+
                             reach_ctol = (np.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_aper)   
-#                             reach_aperture = (np.sqrt((x_new-obj_SE.center_pos[0])**2+(y_new-obj_SE.center_pos[1])**2) > 2*obj_SE.R_petro)
-                            if  reach_ctol: 
-                                # if reach n_iter, or the bound of optimal aperture, stop
+                            if  reach_ctol:  
                                 break
                             else:
                                 x, y = x_new, y_new
+                                
                         if d==0:
                             data_em = img_em * mask_aper * mask_obj
                             x1, y1 = x, y
                             x1s[j,k], y1s[j,k] = x,y
                             aper_em = EllipticalAperture(positions=(x1,y1), 
-                                                      a=k_aper*a, b=k_aper*b, theta=obj_SE.theta)
-
+                                                      a=k_aper*a, b=k_aper*b, theta=obj.theta)
 
                         elif d==1:
                             data_con = img_con * mask_aper * mask_obj
                             x2, y2 = x, y
                             x2s[j,k], y2s[j,k] = x, y
                             aper_con = EllipticalAperture(positions=(x2,y2), 
-                                                      a=k_aper*a, b=k_aper*b, theta=obj_SE.theta)
+                                                      a=k_aper*a, b=k_aper*b, theta=obj.theta)
+                            
                 except (ValueError, TypeError) as error:
                     x1s[j,k], y1s[j,k] = np.nan, np.nan
                     x2s[j,k], y2s[j,k] = np.nan, np.nan
                     aper_em, aper_con = None, None
                     continue
-                        
+
             aper_ems = np.append(aper_ems, aper_em)
             aper_cons = np.append(aper_cons, aper_con)
-            
         
         use_value_1, use_value_2 = np.ones_like(aper_size, dtype=bool), np.ones_like(aper_size, dtype=bool)
         sigma_1s, sigma_2s = np.ones_like(aper_size), np.ones_like(aper_size)
-            
+
         for k in range(len(aper_size)):
             r1_k = np.sqrt((x1s[:,k]-np.nanmean(x1s[:,k]))**2+(y1s[:,k]-np.nanmean(y1s[:,k]))**2)
             r2_k = np.sqrt((x2s[:,k]-np.nanmean(x2s[:,k]))**2+(y2s[:,k]-np.nanmean(y2s[:,k]))**2)
             sigma_1s[k], sigma_2s[k] = np.nanstd(r1_k), np.nanstd(r2_k)
-#             print("\naper:",aper_size[k])
-#             print((np.nanstd(r1_k)))
-#             print((np.nanstd(r2_k)))
+
             # if centroid diverge, set the centroid to be nan
             if (np.nanstd(r1_k)>.1): use_value_1[k] = False
             if (np.nanstd(r2_k)>.1): use_value_2[k] = False
-        
+
         if (np.sum(use_value_1)==0)|(np.sum(use_value_2)==0):
             return (0, 0 , 0)
-        
+
         x1_eff, y1_eff = x1s[-1][use_value_1], y1s[-1][use_value_1]
         x2_eff, y2_eff = x2s[-1][use_value_2], y2s[-1][use_value_2]
         sigma_1_eff, sigma_2_eff = sigma_1s[use_value_1], sigma_2s[use_value_2]
-        
+
         aper_ems_eff, aper_cons_eff = aper_ems[use_value_1], aper_cons[use_value_2]
-#         print(use_value)
-
         
-
+        result_cen = {"x1_eff":x1_eff, "y1_eff":y1_eff, "x2_eff":x2_eff, "y2_eff":y2_eff,
+                      "aper_ems_eff":aper_ems_eff, "aper_cons_eff":aper_cons_eff}
+        
     elif aperture_type== "single": #single aperture
-        img = obj_SE.img_thumb
-        x, y = obj_SE.center_pos
+        img = obj.img_thumb
+        x, y = obj.center_pos
         for i in range(niter_aper):
             aper = EllipticalAperture(positions=(x,y), 
-                                      a=k_aper*obj_SE.a_image, b=k_aper*obj_SE.b_image, theta=obj_SE.theta)
+                                      a=k_aper*obj.a_image, b=k_aper*obj.b_image, theta=obj.theta)
             m0 = aper.to_mask(method='exact')[0]
-            mask_aper = m0.to_image(obj_SE.img_thumb.shape)           
+            mask_aper = m0.to_image(img.shape)           
             data = img * mask_aper * mask_obj
             x_new, y_new = centroid_com(data, mask=np.logical_not(mask_aper * mask_obj))
             reach_ctol = (np.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_aper)
-#             reach_aperture = (np.sqrt((x_new-obj_SE.center_pos[0])**2+(y_new-obj_SE.center_pos[1])**2) > 2*obj_SE.R_petro)
             if  reach_ctol: 
                 # if reach n_iter, or the bound of optimal aperture, stop
                 break
             else:
                 x, y = x_new, y_new
+                
         data_em = img_em * mask_aper * mask_obj
-        x1, y1 = centroid_com(data_em, mask=np.logical_not(mask_aper * mask_obj))
-        aper_em = aper
+        x1_eff, y1_eff = centroid_com(data_em, mask=np.logical_not(mask_aper * mask_obj))
         data_con = img_con * mask_aper * mask_obj
-        x2, y2 = centroid_com(data_con, mask=np.logical_not(mask_aper * mask_obj))
-        aper_con = aper
+        x2_eff, y2_eff = centroid_com(data_con, mask=np.logical_not(mask_aper * mask_obj))
+        
+        aper_em, aper_con = aper, aper
+        result_cen = {"x1":x1, "y1":y1, "x2":x2, "y2":y2, "aper_em":aper_em, "aper_con":aper_con}
+        
+    return result_cen
+    
+def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
+                            coord_BCG=None,
+                            iso_snr=1.2, 
+                            edge=20, n_rand=199,
+                            centroid_type="APER",
+                            subtract=True, sum_type="weighted", 
+                            k_aper=5, multi_aper=False,
+                            aper_size=[0.7,0.8,0.9,1.1,1.2,1.],
+                            aperture_type="separate",
+                            niter_aper=15, ctol_aper=0.01,
+                            line_stddev=3, line_ratio=None, mag0=25.2,
+                            affil_map=None, deep_img=None,
+                            plot=True, verbose=True,
+                            return_for_plot=False, **kwargs):    
+    """ Compute the centroid of emission and continua, and plot """
+    
+    # Window width of lines
+    w_l, w_l2 = line_stddev * 3, line_stddev * 5
+    
+    if line_ratio<3:
+        em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
+    else: 
+        em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
+        
+    # Emission channels
+    em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
+    
+    # Continuum channels
+    con = (~em) & (wavl > max((6584.+w_l2)*(1+z_cc), wavl[0]+edge)) & (wavl < min((6548.-w_l2)*(1+z_cc), wavl[-1]-edge))
+    
+    # Make emission image and continuum image from datacube
+    if sum_type=="mean":
+        img_em = np.mean(obj.cube_thumb[em,:,:],axis=0)
+        img_con = np.mean(obj.cube_thumb[con,:,:], axis=0)
+        
+    elif sum_type=="median":    
+        img_con = np.median(obj.cube_thumb[con,:,:], axis=0)
+        img_em = np.mean(obj.cube_thumb[em,:,:],axis=0)
+        
+    elif sum_type=="weighted":    
+        # Emission image is the sum of emission channels weigthed by flux density.
+        img_con = np.median(obj.cube_thumb[con,:,:], axis=0)
+        img_em0 = obj.cube_thumb[em,:,:]
+        
+        weight_map = abs(img_em0-img_con)
+        weight_sum = np.sum(weight_map, axis=0)
+        
+        img_em = np.sum(img_em0*weight_map/weight_sum, axis=0)
+    
+    if subtract is True:
+        img_em = img_em - img_con
+    
+    mask_obj = obj.mask_seg
+    
+    if centroid_type == "APER":
+        res_cen = measure_offset_aper(obj, img_em, img_con, mask_obj, **kwargs)
         
     elif centroid_type == 'ISO1':
         sigma = 3.0 * gaussian_fwhm_to_sigma    # FWHM = 3.
@@ -1133,8 +1294,8 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
         
         tbl_em = source_properties(img_em, segm_deblend_em).to_table()
         tbl_con = source_properties(img_con, segm_deblend_con).to_table()
-        label_em = np.sqrt((tbl_em["xcentroid"].value-obj_SE.img_thumb.shape[1]/2.)**2+(tbl_em["ycentroid"].value-obj_SE.img_thumb.shape[0]/2.)**2).argmin()
-        label_con = np.sqrt((tbl_con["xcentroid"].value-obj_SE.img_thumb.shape[1]/2.)**2+(tbl_con["ycentroid"].value-obj_SE.img_thumb.shape[0]/2.)**2).argmin()
+        label_em = np.sqrt((tbl_em["xcentroid"].value-obj.img_thumb.shape[1]/2.)**2+(tbl_em["ycentroid"].value-obj.img_thumb.shape[0]/2.)**2).argmin()
+        label_con = np.sqrt((tbl_con["xcentroid"].value-obj.img_thumb.shape[1]/2.)**2+(tbl_con["ycentroid"].value-obj.img_thumb.shape[0]/2.)**2).argmin()
         x1, y1 = tbl_em["xcentroid"][label_em].value, tbl_em["ycentroid"][label_em].value
         x2, y2 = tbl_con["xcentroid"][label_con].value, tbl_con["ycentroid"][label_con].value
         
@@ -1146,149 +1307,84 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
         kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
         kernel.normalize()
         
-        threshold = detect_threshold(obj_SE.img_thumb, snr=iso_snr)
-        segm = detect_sources(obj_SE.img_thumb, threshold, npixels=5, filter_kernel=kernel)
-        segm_deblend = deblend_sources(obj_SE.img_thumb, segm, npixels=5, filter_kernel=kernel, nlevels=32,contrast=0.001)
+        threshold = detect_threshold(obj.img_thumb, snr=iso_snr)
+        segm = detect_sources(obj.img_thumb, threshold, npixels=5, filter_kernel=kernel)
+        segm_deblend = deblend_sources(obj.img_thumb, segm, npixels=5, filter_kernel=kernel, nlevels=32,contrast=0.001)
         
-        tbl = source_properties(obj_SE.img_thumb, segm_deblend).to_table()
-        label = np.sqrt((tbl["xcentroid"].value-obj_SE.img_thumb.shape[1]/2.)**2+(tbl["ycentroid"].value-obj_SE.img_thumb.shape[0]/2.)**2).argmin()
+        tbl = source_properties(obj.img_thumb, segm_deblend).to_table()
+        label = np.sqrt((tbl["xcentroid"].value-obj.img_thumb.shape[1]/2.)**2+(tbl["ycentroid"].value-obj.img_thumb.shape[0]/2.)**2).argmin()
         
         data_em = img_em * (segm_deblend.data==(1+label))
         data_con = img_con * (segm_deblend.data==(1+label))
         x1, y1 = centroid_com(data_em)
         x2, y2 = centroid_com(data_con)
-    
 
-    
-    #------------#        
-    if coord_type=="euclid":
-        centroid_offset = np.sqrt((x1-x2)**2+(y1-y2)**2)
-        if np.ndim(pos_BCG)==1:
-            (x_BCG, y_BCG) = pos_BCG
+    ###-----------------------------------###
+            
+    if np.ndim(coord_BCG)==0:
+#             (ra_BCG, dec_BCG) = coord_BCG.ra, coord_BCG.dec
+        c_BCG = coord_BCG
 
+    else:
+        lab = affil_map[obj.x_c.astype("int64"), obj.y_c.astype("int64")]
+#             (ra_BCG, dec_BCG) = (coord_BCG[0].ra,coord_BCG[0].dec) if lab==1 else (coord_BCG[1].ra,coord_BCG[1].dec) 
+        c_BCG = coord_BCG[0] if lab==1 else coord_BCG[1]
+
+    ra0, dec0 = wcs.all_pix2world(obj.X_c, obj.Y_c, obj.origin)
+    c0 = SkyCoord(ra0, dec0, frame='icrs', unit="deg")
+
+    dist_clus_cen = c0.separation(c_BCG).to(u.arcsec).value / 0.322
+    clus_cen_angle = c0.position_angle(c_BCG).to(u.deg).value
+
+
+    if aperture_type== "separate":
+        
+        x1_eff, y1_eff, x2_eff, y2_eff = [res_cen[key] for key in ["x1_eff", "y1_eff", "x2_eff", "y2_eff"]]
+        aper_ems_eff, aper_cons_eff = res_cen["aper_ems_eff"], res_cen["aper_cons_eff"]
+
+        if (len(x1_eff)>0)&(len(x2_eff)>0):
+#                 x1 = np.sum(x1_eff/(sigma_1_eff)**2)/np.sum(1./(sigma_1_eff)**2)
+            i_1, i_2 = np.argmin(sigma_1_eff), np.argmin(sigma_2_eff)
+            x1, y1 = x1_eff[i_1], y1_eff[i_1]
+            x2, y2 = x2_eff[i_2], y2_eff[i_2]
+
+            aper_em = aper_ems_eff[i_1]
+            aper_con = aper_cons_eff[i_2]
+
+            if multi_aper:
+                Pos_1 = np.vstack([x1_eff,y1_eff]).T
+                Pos_2 = np.vstack([x2_eff,y2_eff]).T
+                max_dev = np.max([np.max(pdist(Pos_1)), np.max(pdist(Pos_2))]) 
+            else:
+                max_dev = 0
         else:
-            lab = affil_map[obj_SE.x_c.astype("int64"), obj_SE.y_c.astype("int64")]
-            (x_BCG, y_BCG) = pos_BCG[0] if lab==1 else pos_BCG[1]     
+            x1, y1 = obj.center_pos
+            x2, y2 = obj.center_pos
+            centroid_offset = 0
 
-        dist_clus_cen = np.sqrt((x_BCG-obj_SE.X_IMAGE-1)**2 + (y_BCG-obj_SE.Y_IMAGE-1)**2)  
-
-        pa = np.arctan2(x2-x1,y2-y1)
-        clus_cen_angle = np.arctan2((x_BCG-obj_SE.X_IMAGE-1),(y_BCG-obj_SE.Y_IMAGE-1))
-        if print_out:
-            print("PA: %.3f,  Cluster-centric angle: %.3f"%(pa*180/np.pi, clus_cen_angle*180/np.pi))
-        diff_angle = np.abs(pa*180/np.pi - clus_cen_angle*180/np.pi)
+        pa, centroid_offset = measure_pa_offset((x1,y1), (x2,y2), wcs, obj)
+        diff_angle = np.abs(pa - clus_cen_angle)
         if diff_angle>180:
             diff_angle = 360 - diff_angle
-            
-            
-    elif coord_type=="angular":
+
+    else:
+        x1, y1, x2, y2 = [res_cen[key] for key in ["x1", "y1", "x2", "y2"]] 
+        aper_em, aper_con = res_cen["aper_em"], res_cen["aper_con"]
         
-        if np.ndim(coord_BCG)==0:
-#             (ra_BCG, dec_BCG) = coord_BCG.ra, coord_BCG.dec
-            c_BCG = coord_BCG
+        ra1, dec1 = wcs.all_pix2world(x1+obj.X_min,obj.img_thumb.shape[1]-obj.Y_max+y1, obj.origin)
+        ra2, dec2 = wcs.all_pix2world(x2+obj.X_min,obj.img_thumb.shape[1]-obj.Y_max+y2, obj.origin)
+        c1 = SkyCoord(ra1, dec1, frame='icrs', unit="deg")
+        c2 = SkyCoord(ra2, dec2, frame='icrs', unit="deg")
 
-        else:
-            lab = affil_map[obj_SE.x_c.astype("int64"), obj_SE.y_c.astype("int64")]
-#             (ra_BCG, dec_BCG) = (coord_BCG[0].ra,coord_BCG[0].dec) if lab==1 else (coord_BCG[1].ra,coord_BCG[1].dec) 
-            c_BCG = coord_BCG[0] if lab==1 else coord_BCG[1]
+        pa = np.mod(270 + np.arctan2(y2-y1,x2-x1)*180/np.pi, 360)
+        centroid_offset = np.sqrt((x1-x2)**2+(y1-y2)**2)
 
-        ra0, dec0 = wcs.all_pix2world(obj_SE.X_IMAGE, obj_SE.Y_IMAGE, 1)
-        c0 = SkyCoord(ra0, dec0, frame='icrs', unit="deg")
-
-        dist_clus_cen = c0.separation(c_BCG).to(u.arcsec).value / 0.322
-        clus_cen_angle = c0.position_angle(c_BCG).to(u.deg).value
-            
-    
-        if aperture_type== "separate":
-            
-            #----#
-#             pa_s = np.array([]) #
-#             centroid_offsets = np.array([]) #
-#             dist_clus_cens = np.array([]) #
-#             for i,(x1,y1,x2,y2) in enumerate(zip(x1_eff, y1_eff, x2_eff, y2_eff)):
-
-#                 ##Correct for distortion 
-#                 pa, centroid_offset = measure_pa_offset((x1,y1), (x2,y2), wcs, obj_SE)
-                
-#                 diff_angle = np.abs(pa - clus_cen_angle)
-#                 if diff_angle>180:
-#                     diff_angle = 360 - diff_angle
-
-#                 pa_s = np.append(pa_s, pa)
-#                 centroid_offsets = np.append(centroid_offsets, centroid_offset)
-                
-#             centroid_offset = np.median(centroid_offsets)
-#             pa = np.median(pa_s)
-#             diff_angle = np.abs(pa - clus_cen_angle)
-#             if diff_angle>180:
-#                     diff_angle = 360 - diff_angle
-
-#             if (len(x1_eff)>len(aper_size)//2)&(len(x2_eff)>len(aper_size)//2): # if half of used aperture is valied
-#                 x1, y1 = np.median(x1_eff), np.median(y1_eff)
-#                 x2, y2 = np.median(x2_eff), np.median(y2_eff)
-#             else:
-#                 x1, y1 = obj_SE.center_pos
-#                 x2, y2 = obj_SE.center_pos
-#                 centroid_offset = 0
-            
-            #----#
-            if (len(x1_eff)>0)&(len(x2_eff)>0):
-#                 x1 = np.sum(x1_eff/(sigma_1_eff)**2)/np.sum(1./(sigma_1_eff)**2)
-                i_1, i_2 = np.argmin(sigma_1_eff), np.argmin(sigma_2_eff)
-                x1, y1 = x1_eff[i_1], y1_eff[i_1]
-                x2, y2 = x2_eff[i_2], y2_eff[i_2]
-            
-                aper_em = aper_ems_eff[i_1]
-                aper_con = aper_cons_eff[i_2]
-            
-                if multi_aper:
-                    Pos_1 = np.vstack([x1_eff,y1_eff]).T
-                    Pos_2 = np.vstack([x2_eff,y2_eff]).T
-                    max_dev = np.max([np.max(pdist(Pos_1)), np.max(pdist(Pos_2))]) 
-                else:
-                    max_dev = 0
-            else:
-                x1, y1 = obj_SE.center_pos
-                x2, y2 = obj_SE.center_pos
-                centroid_offset = 0
-            
-#             print("x1",x1_eff)
-#             print("x2",x2_eff)
-#             print("y1",y1_eff)
-#             print("y2",y2_eff)
-#             print("Pos em:",x1,y1)
-#             print("Pos con:",x2,y2)
-            
-            pa, centroid_offset = measure_pa_offset((x1,y1), (x2,y2), wcs, obj_SE)
-            diff_angle = np.abs(pa - clus_cen_angle)
-            if diff_angle>180:
-                diff_angle = 360 - diff_angle
-            
-#             k_aper1 = np.max([aper_size[np.argmin(sigma_1_eff)],1./a])
-#             k_aper2 = np.max([aper_size[np.argmin(sigma_2_eff)],1./a])
-#             aper_em = EllipticalAperture(positions=(x1,y1), 
-#                               a=k_aper1*a, b=k_aper1*b, theta=obj_SE.theta)
-#             aper_con = EllipticalAperture(positions=(x2,y2), 
-#                               a=k_aper2*a, b=k_aper2*b, theta=obj_SE.theta)
-
-#             print("sigma1/a",np.min(sigma_1_eff)/k_aper1*a)
-#             print("sigma2/a",np.min(sigma_2_eff)/k_aper1*a)
-            
-        else:
-            ra1, dec1 = wcs.all_pix2world(x1+obj_SE.y_min,obj_SE.img_thumb.shape[1]-obj_SE.x_max+y1, 1)
-            ra2, dec2 = wcs.all_pix2world(x2+obj_SE.y_min,obj_SE.img_thumb.shape[1]-obj_SE.x_max+y2, 1)
-            c1 = SkyCoord(ra1, dec1, frame='icrs', unit="deg")
-            c2 = SkyCoord(ra2, dec2, frame='icrs', unit="deg")
-
-            pa = np.mod(270 + np.arctan2(y2-y1,x2-x1)*180/np.pi, 360)
-            centroid_offset = np.sqrt((x1-x2)**2+(y1-y2)**2)
-            
-            diff_angle = np.abs(pa - clus_cen_angle)
-            if diff_angle>180:
-                diff_angle = 360 - diff_angle
+        diff_angle = np.abs(pa - clus_cen_angle)
+        if diff_angle>180:
+            diff_angle = 360 - diff_angle
 
     
-    #------------#
+    ###-----------------------------------###
     
     if plot:
         plt.figure(figsize=(13,12))
@@ -1310,15 +1406,15 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
         loc = plticker.MultipleLocator(base=10) # this locator puts ticks at regular intervals
         ax1.xaxis.set_major_locator(loc)
         ax1.yaxis.set_major_locator(loc)
-        ax1.set_xticklabels(ax1.get_xticks().astype("int")+obj_SE.y_min,fontsize=15)
-        ax1.set_yticklabels(ax1.get_yticks().astype("int")+obj_SE.x_min,fontsize=15)
+        ax1.set_xticklabels(ax1.get_xticks().astype("int")+obj.y_min,fontsize=15)
+        ax1.set_yticklabels(ax1.get_yticks().astype("int")+obj.x_min,fontsize=15)
 #         ax1.set_title("Emisson",color="k",fontsize=18)
 #         plt.colorbar(s)
         if centroid_type != "APER":
             ax1s = plt.subplot2grid((3, 3), (1, 0), colspan=1, rowspan=1)
             ax1s.imshow(data_em, origin="lower",cmap="viridis",vmin=0,vmax=vmax_5sig(data_em))
-            ax1s.set_xticklabels(ax1s.get_xticks().astype("int")+obj_SE.y_min,fontsize=10)
-            ax1s.set_yticklabels(ax1s.get_yticks().astype("int")+obj_SE.x_min,fontsize=10)
+            ax1s.set_xticklabels(ax1s.get_xticks().astype("int")+obj.y_min,fontsize=10)
+            ax1s.set_yticklabels(ax1s.get_yticks().astype("int")+obj.x_min,fontsize=10)
             ax1s.set_title("Em. seg.",color="k",fontsize=15)
             
             
@@ -1327,35 +1423,24 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
         ax2.plot(x2, y2, "lightgreen", marker="+", ms=15, mew=3,alpha=0.95)
         ax2.xaxis.set_major_locator(loc)
         ax2.yaxis.set_major_locator(loc)
-        ax2.set_xticklabels(ax2.get_xticks().astype("int")+obj_SE.y_min,fontsize=15)
-        ax2.set_yticklabels(ax2.get_yticks().astype("int")+obj_SE.x_min,fontsize=15)
+        ax2.set_xticklabels(ax2.get_xticks().astype("int")+obj.y_min,fontsize=15)
+        ax2.set_yticklabels(ax2.get_yticks().astype("int")+obj.x_min,fontsize=15)
 #         ax2.set_title("Continuum",color="k",fontsize=18)
 #         plt.colorbar(s)
         if centroid_type != "APER":
             ax2s = plt.subplot2grid((4, 3), (3, 2), colspan=1, rowspan=1)
             ax2s.imshow(data_con, origin="lower",cmap="hot",vmin=0.,vmax=vmax_5sig(data_con))
-            ax2s.set_xticklabels(ax2s.get_xticks().astype("int")+obj_SE.y_min,fontsize=10)
-            ax2s.set_yticklabels(ax2s.get_yticks().astype("int")+obj_SE.x_min,fontsize=10)
+            ax2s.set_xticklabels(ax2s.get_xticks().astype("int")+obj.y_min,fontsize=10)
+            ax2s.set_yticklabels(ax2s.get_yticks().astype("int")+obj.x_min,fontsize=10)
             ax2s.set_title("Cont. seg.",color="k",fontsize=15)
-            
-            
-        
-#         if centroid_type == "APER":
-            
-#             ax3 = plt.subplot2grid((4, 3), (1, 2), colspan=1, rowspan=1)
-#             ax3.imshow(mask_aper * obj_SE.mask_seg, origin="lower", cmap="gray")
-#             ax3.set_title("segmentation",color="k",fontsize=12)
         
         ax = plt.subplot2grid((3, 3), (1, 0), colspan=2, rowspan=2)
         
-        if deep_img is None:
-#             img_g = (img_con+img_em)/2.
-#             img_rgb = make_lupton_rgb(img_con, img_g, img_em, stretch=0.05, Q=10)
-#             ax.imshow(img_rgb, origin="lower", vmin=0., vmax=vmax_5sig(img_rgb), norm=norm)
+        if hasattr(obj, deep_thumb):
+            ax.imshow(deep_img, origin="lower", cmap="gray", vmin=0., vmax=vmax_5sig(deep_img), norm=norm)
+        else:
             img = img_con*np.sum(con)
             ax.imshow(img, origin="lower", cmap="gray", vmin=0., vmax=vmax_5sig(img))
-        else:
-            ax.imshow(deep_img, origin="lower", cmap="gray", vmin=0., vmax=vmax_5sig(deep_img), norm=norm)
         
         xlim,ylim = ax.get_xlim(),ax.get_ylim()
         if centroid_type == "APER":
@@ -1381,28 +1466,23 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
 #             for j in range(n_rand):
 #                 ax1.plot(x1s[j,k], y1s[j,k], color="plum", marker=".", ms=3,mew=1,alpha=0.8, zorder=3)
 #                 ax2.plot(x2s[j,k], y2s[j,k], "palegreen", marker=".", ms=3,mew=1,alpha=0.8, zorder=3)
-#         ax1.scatter(obj_SE.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj_SE.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=1)
-#         ax2.scatter(obj_SE.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj_SE.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=1)
-#         ax.scatter(obj_SE.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj_SE.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=5)
+#         ax1.scatter(obj.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=1)
+#         ax2.scatter(obj.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=1)
+#         ax.scatter(obj.center_pos[0]+da_s*np.cos(theta)-db_s*np.sin(theta), obj.center_pos[1]+da_s*np.sin(theta)+db_s*np.cos(theta), color="orange", alpha=0.3,s=5)
         
         ax.plot(x1, y1, color="violet", marker="+", ms=25,mew=5,alpha=0.95, zorder=4)
         ax.plot(x2, y2, color="lightgreen", marker="+", ms=25,mew=5,alpha=0.95, zorder=3)
-        ax.set_xticklabels(ax.get_xticks().astype("int")+obj_SE.y_min)
-        ax.set_yticklabels(ax.get_yticks().astype("int")+obj_SE.x_min)
-        if coord_type=="euclid":
-            ax.arrow(0.85,0.15,np.sin(pa)/10,np.cos(pa)/10,color="skyblue",
-                     head_width=0.02, head_length=0.02,transform=ax.transAxes)
-            ax.arrow(0.85,0.15,np.sin(clus_cen_angle)/10,np.cos(clus_cen_angle)/10,color="orange",
-                     head_width=0.02, head_length=0.02,transform=ax.transAxes)
-        elif coord_type=="angular":
-            ax.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="lightblue",
-                     head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
-            ax.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
-                     head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
+        ax.set_xticklabels(ax.get_xticks().astype("int")+obj.y_min)
+        ax.set_yticklabels(ax.get_yticks().astype("int")+obj.x_min)
+        
+        ax.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="lightblue",
+                 head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
+        ax.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
+                 head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
         
         ax.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=25,transform=ax.transAxes)
         ax.text(0.05,0.12,r"$\bf \Delta\,d:{\ }%.1f$"%centroid_offset,color="lavender",fontsize=25,transform=ax.transAxes)
-        #mag_auto = -2.5*np.log10(obj_SE.flux_auto) + mag0
+        #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
         #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
         if np.ndim(coord_BCG)>0:
             text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
@@ -1414,7 +1494,19 @@ def compute_centroid_offset(obj_SE, k_aper, spec, wavl,
     else:
         return diff_angle, centroid_offset, dist_clus_cen, pa, clus_cen_angle
 
+    
+def measure_pa_offset(pos1, pos2, wcs, obj):
+    (x1, y1) = pos1 
+    (x2, y2) = pos2
+    ra1, dec1 = wcs.all_pix2world(x1 + obj.y_min, obj.img_thumb.shape[1] - obj.x_max + y1, 1)
+    ra2, dec2 = wcs.all_pix2world(x2 + obj.y_min, obj.img_thumb.shape[1] - obj.x_max + y2, 1)
+    c1 = SkyCoord(ra1, dec1, frame='icrs', unit="deg")
+    c2 = SkyCoord(ra2, dec2, frame='icrs', unit="deg")
 
+    pa = np.mod(270 + np.arctan2(y2-y1,x2-x1)*180/np.pi, 360)
+    offset = np.sqrt((x1-x2)**2+(y1-y2)**2)
+
+    return pa, offset
 
 
 def draw_centroid_offset(diff_centroids_v, diff_centroids_c, crit=[0.5, 0.8]):
@@ -1503,7 +1595,7 @@ def draw_angle_compare(diff_angles_v, diff_centroids_v, diff_angles_c, diff_cent
     
 def generate_catalog(save_name, Datacube, Num_v, wcs, n_rand=99):
     print("Measuring Centroids for %d candidates..."%len(Num_v))
-    Datacube.centroid_analysis_all(Num_v=Num_v, centroid_type='APER',coord_type="angular", n_rand=n_rand, print_out=False)
+    Datacube.centroid_analysis_all(Num_v=Num_v, centroid_type='APER',coord_type="angular", n_rand=n_rand, verbose=False)
     
     mag0 = 25.2
     mag_all = -2.5*np.log10(Datacube.Tab_SE["FLUX_AUTO"]) + mag0
