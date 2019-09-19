@@ -435,7 +435,7 @@ class Read_Datacube:
         """ Get cutout of the input image for a detection """
         if image is None:
             image = self.stack_field
-        return get_cutout(num, image, self.table, **kwargs) 
+        return get_cutout(num, self.table, image, **kwargs) 
     
     def ISO_source_detection(self, sn_thre=2.5, npixels=8,
                              nlevels=64, contrast=0.01, closing=True,
@@ -1216,7 +1216,7 @@ class Read_Datacube:
         if nums is None:
             nums = self.obj_nums
         return np.array([self.CC_result_Temps[typ_mod][num][prop]
-                         for num in nums.astype(str)])
+                         for num in np.atleast_1d(nums).astype(str)])
             
 
     

@@ -5,6 +5,8 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as plticker
+plt.rcParams['image.origin'] = 'lower'
+
 from scipy import interpolate, signal, integrate, stats
 
 import pandas as pd
@@ -1241,16 +1243,17 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     # Window width of lines
     w_l, w_l2 = line_stddev * 3, line_stddev * 5
     
-    if line_ratio<3:
-        em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
-    else: 
-        em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
+#     if (line_ratio<3) & (line_stddev>5):
+    em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
+#     else: 
+#         em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
         
     # Emission channels
     em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
     
     # Continuum channels
-    con = (~em) & (wavl > max((6584.+w_l2)*(1+z_cc), wavl[0]+edge)) & (wavl < min((6548.-w_l2)*(1+z_cc), wavl[-1]-edge))
+    con = (~em) & (wavl > wavl[0]+edge) & (wavl < wavl[-1]-edge) \
+                & ((wavl > (6584.+w_l2)*(1+z_cc)) | (wavl < (6548.-w_l2)*(1+z_cc)))
     
     # Make emission image and continuum image from datacube
     if sum_type=="mean":
