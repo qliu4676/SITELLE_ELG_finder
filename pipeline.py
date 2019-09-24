@@ -1389,11 +1389,12 @@ class Read_Datacube:
         
         
     def centroid_analysis(self, num, z=None,
-                          centroid_type="APER", coord_type="angular", sum_type="weight",
-                          emission_type="subtract", aperture_type="separate",
+                          centroid_type="APER", sum_type="weight",
+                          emission_type="subtract",
                           fix_window=False, multi_aper=True, 
-                          n_rand=199, aper_size=[0.7,0.8,0.9,1.1,1.2,1.],
-                          plot=True, verbose=True, return_for_plot=False):
+                          n_rand=99, aper_size=[0.7,0.85,1.15,1.3,1.],
+                          plot=True, verbose=True,
+                          return_for_plot=False):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -1433,10 +1434,7 @@ class Read_Datacube:
         if z is None:
             z = self.z_best[ind]
         
-        if hasattr(self, 'boundary_map'):
-            boundary_map = self.boundary_map
-        else:
-            boundary_map = None
+        boundary_map = getattr(self, 'boundary_map', None)
             
         try:
             snr = self.SNR_best[ind]
@@ -1445,38 +1443,34 @@ class Read_Datacube:
             else:
                 lstd, lr = self.line_stddev_best[ind], self.line_ratio_best[ind]
 
-            if plot:
-                deep_img = obj_SE.deep_thumb
-            else:
-                deep_img = None
-            d_angle, offset, dist_clus, \
-            pa, clus_cen_angle = compute_centroid_offset(obj_SE, spec=spec, 
-                                                         wavl=self.wavl, 
-                                                         k_aper=k_aper, z_cc=z,
-                                                         coord_BCG = self.coord_BCG, 
-                                                         wcs = self.wcs, 
-                                                         centroid_type=centroid_type, 
-                                                         line_stddev=lstd,
-                                                         line_ratio=lr,
-                                                         affil_map=boundary_map, 
-                                                         deep_img=deep_img, 
-                                                         sum_type=sum_type,
-                                                         emission_type=emission_type,
-                                                         aperture_type=aperture_type,
-                                                         multi_aper=multi_aper,
-                                                         n_rand=n_rand, aper_size=aper_size,
-                                                         plot=plot, verbose=verbose,
-                                                         return_for_plot=return_for_plot)
-            return (d_angle, offset, dist_clus, pa, clus_cen_angle)
+            res_measure = compute_centroid_offset(obj_SE, spec=spec, 
+                                                 wavl=self.wavl, 
+                                                 k_aper=k_aper, z_cc=z,
+                                                 coord_BCG = self.coord_BCG, 
+                                                 wcs = self.wcs, 
+                                                 centroid_type=centroid_type, 
+                                                 line_stddev=lstd,
+                                                 line_ratio=lr,
+                                                 affil_map=boundary_map, 
+                                                 deep_img=deep_img, 
+                                                 sum_type=sum_type,
+                                                 emission_type=emission_type,
+                                                 aperture_type=aperture_type,
+                                                 multi_aper=multi_aper,
+                                                 n_rand=n_rand, aper_size=aper_size,
+                                                 plot=plot, verbose=verbose,
+                                                 return_for_plot=return_for_plot)
         
-        except (ValueError, TypeError) as error:
+        except (ValueError) as error:
+            res_measure = {}
             if verbose:
                 print("Unable to compute centroid! Error raised.")
-            return (np.nan, np.nan, np.nan, np.nan, np.nan)
+            
+        return res_measure
     
     def centroid_analysis_all(self, Num_v,
-                              centroid_type="APER", aperture_type="separate", 
-                              n_rand=199, aper_size = [0.7,0.8,0.9,1.1,1.2,1.],
+                              centroid_type="APER",
+                              n_rand=99, aper_size=[0.7,0.85,1.15,1.3,1.],
                               plot=False, verbose=True):
         """Compute centroid offset and angle for all SE detections
         
@@ -1498,7 +1492,6 @@ class Read_Datacube:
         self.dist_clus_cens = np.array([])
         self.PAs = np.array([])
         self.clus_cen_angles = np.array([])
-        self.max_devs = np.array([])
         if verbose:
             print("Current Model: ", self.typ_mod)
         for num in self.obj_nums:
