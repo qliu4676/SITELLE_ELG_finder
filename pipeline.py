@@ -413,6 +413,7 @@ class Read_Datacube:
 #         self.CC_flag_edge_Temps = {}
         
         self.CC_result_Temps  = {}
+        self.result_centroid = {}
     
     def get_wcs(self):
         """ Read WCS info from the datacube header """
@@ -1389,12 +1390,10 @@ class Read_Datacube:
         
         
     def centroid_analysis(self, num, z=None,
-                          centroid_type="APER", sum_type="weight",
-                          emission_type="subtract",
-                          fix_window=False, multi_aper=True, 
-                          n_rand=99, aper_size=[0.7,0.85,1.15,1.3,1.],
-                          plot=True, verbose=True,
-                          return_for_plot=False):
+                          centroid_type="APER", sum_type="weighted",
+                          subtract_continuum=True, from_SE=False,
+                          line_width=None, multi_aper=True, 
+                          return_for_plot=False, smooth=False, **kwargs):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -1405,12 +1404,7 @@ class Read_Datacube:
         centroid_type : method of computing centroid position for emission and continua
             "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
             "ISO2" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
-        coord_type : method of computing cluster-centric vector 
-            "angular" : use wcs coordinate (TAN-SIP corrected)
-            "euclid" : use pixel position
-        fix_window : whether to fix the emission window. True for non-candidate.
-        n_rand : number of random start 
-        aper_size : apertures used in measuring centroid (in a_image)
+        line_width : width of emission window. Fixed for non-candidate.
         
         Returns
         ----------
@@ -1421,120 +1415,112 @@ class Read_Datacube:
         
         ind = np.where(self.obj_nums==num)[0][0]
         
-        obj_SE = Obj_detection(self.table[ind], cube=self.cube,
-                               seg_map=self.seg_map, deep_frame=self.deep_frame, mask_edge=self.mask_edge)
+        obj = Obj_detection(self.table[ind], cube=self.cube,
+                            seg_map=self.seg_map, deep_frame=self.deep_frame, mask_edge=self.mask_edge)
 
-        spec = self.obj_specs_opt[ind][0]
+        spec = self.obj_specs_opt[ind]
 
-        if centroid_type == "APER":
+        if from_SE is True:
             k_aper =  self.k_apers_opt[ind][0]
         else:
             k_aper = None
         
         if z is None:
-            z = self.z_best[ind]
+            z = self.get_CC_result_best('z_best', 'Ha-NII_gauss', nums=num)[0]
         
         boundary_map = getattr(self, 'boundary_map', None)
-            
-        try:
-            snr = self.SNR_best[ind]
-            if fix_window:
-                lstd, lr = 3., 10.
-            else:
-                lstd, lr = self.line_stddev_best[ind], self.line_ratio_best[ind]
-
-            res_measure = compute_centroid_offset(obj_SE, spec=spec, 
-                                                 wavl=self.wavl, 
-                                                 k_aper=k_aper, z_cc=z,
-                                                 coord_BCG = self.coord_BCG, 
-                                                 wcs = self.wcs, 
-                                                 centroid_type=centroid_type, 
-                                                 line_stddev=lstd,
-                                                 line_ratio=lr,
-                                                 affil_map=boundary_map, 
-                                                 deep_img=deep_img, 
-                                                 sum_type=sum_type,
-                                                 emission_type=emission_type,
-                                                 aperture_type=aperture_type,
-                                                 multi_aper=multi_aper,
-                                                 n_rand=n_rand, aper_size=aper_size,
-                                                 plot=plot, verbose=verbose,
-                                                 return_for_plot=return_for_plot)
         
-        except (ValueError) as error:
-            res_measure = {}
-            if verbose:
-                print("Unable to compute centroid! Error raised.")
+        if line_width is None:
+            line_width = 3.
+        else:
+            line_width = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss', nums=num)[0]
+#         try:
+        res_measure = compute_centroid_offset(obj, spec=spec, wavl=self.wavl,
+                                              z_cc=z, wcs=self.wcs,
+                                              coord_BCG=self.coord_BCG,
+                                              centroid_type=centroid_type,
+                                              sum_type=sum_type, smooth=smooth, 
+                                              k_aper=k_aper, multi_aper=multi_aper,
+                                              line_stddev=line_width, 
+                                              subtract=subtract_continuum, **kwargs)
+        
+#         except (ValueError) as error:
+#             res_measure = {}
+#             if verbose:
+#                 print("Unable to compute centroid! Error raised.")
             
         return res_measure
+
     
-    def centroid_analysis_all(self, Num_v,
-                              centroid_type="APER",
-                              n_rand=99, aper_size=[0.7,0.85,1.15,1.3,1.],
-                              plot=False, verbose=True):
+    def centroid_analysis_all(self, Num_V, nums=None,
+                              centroid_type="APER", sum_type="weighted",
+                              plot=False, verbose=True, smooth=True, **kwargs):
         """Compute centroid offset and angle for all SE detections
         
         Parameters
         ----------
-        Num_v : number list of target candiate in the SE catalog
-        k_wid : half-width of the thumbnail (note: not to be too small)
+        Num_V : number list of target candiate in the SE catalog
         centroid_type : method of computing centroid position for emission and continua
             "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
-            "ISO2" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
-        coord_type : method of computing cluster-centric vector 
-            "angular" : use wcs coordinate (TAN-SIP corrected)
-            "euclid" : use pixel position
+            "ISO-MMA" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
         """
         
         self.centroid_type = centroid_type
-        self.diff_angles = np.array([]) 
-        self.diff_centroids = np.array([])
-        self.dist_clus_cens = np.array([])
-        self.PAs = np.array([])
-        self.clus_cen_angles = np.array([])
-        if verbose:
-            print("Current Model: ", self.typ_mod)
-        for num in self.obj_nums:
+        
+        self.z_best = self.get_CC_result_best('z_best', 'Ha-NII_gauss')
+        self.sigma_best = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss')
+        
+        self.result_centroid[centroid_type] = {}
+        
+        nums = self.obj_nums if nums is None else np.atleast_1d(nums)
+        
+        for num in nums:
             if verbose:
-                print("#EL-%1d"%num)
-            ind = (self.obj_nums==num)
+                print("\nCandidate: #%d"%num)
+            ind = np.where(self.obj_nums==num)[0][0]
 
-            if num in Num_v:  # For emission galaxies, pick a window 70A aorund emission
+            if num in Num_V:  # Candidate
                 z = self.z_best[ind]
-                fix_w = False
-                emission_type = "subtract"
-#                 sum_type = "mean"
-                sum_type = "weight"
-#                 sum_type = "median"
+                line_width = self.sigma_best[ind]
+                subtract=True
                 multi_aper = True
                 
             else:  # For non-emission galaxies, pick a random window excluding the edge 
                 z = np.random.uniform(low=(self.wavl[0]+25)/6563.-1, 
                                       high=(self.wavl[-1]-25)/6563.-1)
-                fix_w = True
-                emission_type = "narrowband"
-                sum_type = "median"
+                use_good = False
+                line_width = 3
+                subtract = False
                 multi_aper = False
                 
-            d_angle, offset, dist_clus, \
-            pa, clus_cen_angle = self.centroid_analysis(num, z=z,
-                                                        centroid_type=centroid_type, 
-                                                        fix_window=fix_w, 
-                                                        emission_type=emission_type,
-                                                        aperture_type=aperture_type,
-                                                        sum_type=sum_type,
-                                                        multi_aper=multi_aper,
-                                                        n_rand=n_rand, aper_size=aper_size,
-                                                        plot=False, verbose=verbose)
-            if num in Num_v:
+            res_measure = self.centroid_analysis(num, z=z,
+                                                centroid_type=centroid_type, 
+                                                line_width=line_width,
+                                                subtract_continuum=subtract,
+                                                sum_type=sum_type,
+                                                multi_aper=multi_aper,
+                                                plot=False, verbose=verbose,
+                                                 smooth=smooth, **kwargs)
+            if (num in Num_V) & (len(res_measure)>0):
                 if verbose:
-                    print("Angle: %.3f  Offset: %.3f"%(d_angle, offset))    
-            self.diff_angles = np.append(self.diff_angles, d_angle)
-            self.diff_centroids = np.append(self.diff_centroids, offset)
-            self.dist_clus_cens = np.append(self.dist_clus_cens, dist_clus)
-            self.PAs = np.append(self.PAs, pa)
-            self.clus_cen_angles = np.append(self.clus_cen_angles, clus_cen_angle)
+                    print("Angle: %.2f +/- %.2f"%(res_measure["diff_angle"],res_measure["diff_angle_std"]))
+                    print("Offset: %.2f +/- %.2f"%(res_measure["cen_offset"], res_measure["cen_offset_std"]))    
+            
+            self.result_centroid[centroid_type]["%s"%num] = res_measure
+            
+        self.result_centroid[centroid_type+'_sm'] = self.result_centroid.pop(centroid_type)
+    
+    def get_centroid_result(self, prop, centroid_type="APER", fill_value=0):
+        """
+        Get the best matched value of a property from centroid analysis results.
         
+        prop: 'diff_angle', 'cen_offset', 'diff_angle_std', 'cen_offset_std', ...
+        """
+        
+        result = self.result_centroid[centroid_type]
+        return np.array([result[num].get(prop, fill_value) for num in result.keys()])
+    
+            
     def construct_control(self, Num_v, mag_cut=None, mag0=25.2, dist_cut=25, bootstraped=False, n_boot=100):
         """Construct control sample for comparison
         
@@ -1567,12 +1553,6 @@ class Read_Datacube:
         Num_area_ctrl = self.table["NUMBER"][self.table["ISOAREA_IMAGE"]>thre_iso_area]
         
         Num_c = np.intersect1d(Num_c, Num_area_ctrl)
-        
-#         # SNR cut
-#         thre_snr = np.percentile(self.SNRp_best,90)
-#         print("peak S/N threshold: ", thre_iso_area)
-#         Num_snr_ctrl = self.table["NUMBER"][(self.SNRp_best<thre_snr)]
-#         Num_c = np.intersect1d(Num_c, Num_snr_ctrl)
         
         # radius cut
         Num_rp_ctrl = self.table["NUMBER"][(self.table["PETRO_RADIUS"]>0)&(self.table["PETRO_RADIUS"]<10)]        
@@ -1616,4 +1596,4 @@ class Read_Datacube:
                 self.diff_angles_c_bp[i] = self.diff_angles[ind_c_bp]
                 self.diff_centroids_c_bp[i] = self.diff_centroids[ind_c_bp]
                 self.dist_clus_cens_c_bp[i] = self.dist_clus_cens[ind_c_bp]
-                
+
