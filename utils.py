@@ -13,6 +13,7 @@ import pandas as pd
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, RationalQuadratic
+from skimage.morphology import dilation
 
 import astropy.units as u
 from astropy.wcs import WCS
@@ -31,11 +32,16 @@ norm0 = ImageNormalize(stretch=AsinhStretch())
 from photutils import Background2D, SExtractorBackground
 from photutils import EllipticalAnnulus, EllipticalAperture, aperture_photometry
 from photutils import centroid_com, centroid_2dg
-from photutils import detect_sources, deblend_sources, source_properties
-from photutils.utils import make_random_cmap
+from photutils import detect_threshold, detect_sources, deblend_sources, source_properties
+from photutils.utils import make_random_cmap, NoDetectionsWarning
 rand_state = 12345
 rand_cmap = make_random_cmap(3000, random_state=rand_state)
 rand_cmap.set_under(color='black')
+
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    warnings.warn("no detection", NoDetectionsWarning)
 
 
 ############################################
@@ -364,8 +370,8 @@ class Obj_detection:
         self.mask_thumb = mask_edge[x_min:(x_max+1), y_min:(y_max+1)]
 
         self.seg_thumb = seg_map[x_min:(x_max+1), y_min:(y_max+1)]
-        self.mask_seg = (self.seg_thumb==num) | (self.seg_thumb==0)
-        self.mask_seg_obj = (self.seg_thumb==num)
+        self.seg_tot = (self.seg_thumb==num) | (self.seg_thumb==0)
+        self.seg_obj = (self.seg_thumb==num)
 
         self.cube_thumb = cube[:,x_min:(x_max+1), y_min:(y_max+1)]
         self.img_thumb = self.cube_thumb.sum(axis=0)
@@ -406,15 +412,15 @@ class Obj_detection:
                                               b_out=k2*self.b_image, theta=self.theta)
 
         apers = [apertures, annulus_apertures]
-        m0 = apers[0].to_mask(method='exact')[0]
+        m0 = apers[0].to_mask(method='exact')
         area_aper = m0.to_image(self.img_thumb.shape)
         area_aper[self.mask_thumb] = 0
-        m1 = apers[1].to_mask(method='exact')[0]
+        m1 = apers[1].to_mask(method='exact')
         area_annu = m1.to_image(self.img_thumb.shape)
         area_annu[self.mask_thumb] = 0
 
-        bkg = self.img_thumb[np.logical_and(area_annu>=0.5,self.mask_seg)]
-        signal = self.img_thumb[np.logical_and(area_aper>=0.5,self.mask_seg)]
+        bkg = self.img_thumb[np.logical_and(area_annu>=0.5,self.seg_tot)]
+        signal = self.img_thumb[np.logical_and(area_aper>=0.5,self.seg_tot)]
         n_pix = len(signal)
         
         if (len(signal)==0)|(len(bkg)==0):
@@ -1095,15 +1101,17 @@ def save_ds9_region(name, obj_pos, size, color="green", origin=1):
     ds9_regs = pyregion.parse(region_str)
     ds9_regs.write(os.path.join(save_path,'%s.reg'%name))    
     
-def measure_offset_aperture(obj, img_em, img_con, mask_obj,
-                            k_aper=2, multi_aper=True, use_good=True,
+def measure_offset_aperture(obj, img_em, img_con,
+                            k_aper=2, multi_aper=True, 
                             aper_size=[0.7,0.85,1.15,1.3,1.],
-                            n_rand_start=99, niter_aper=15, ctol_aper=0.01,
-                            verbose=True, fwhm=3, smooth=False):
+                            n_rand_start=99, niter_aper=15, ctol_aper=0.1,
+                            std_map_em=None, std_map_con=None,
+                            use_good=True, verbose=True):
     """
     n_rand : number of random start 
     aper_size : apertures used in measuring centroid (in a_image)     
     """
+    seg_obj = obj.seg_tot
     theta = obj.theta * np.pi/180
 
     if multi_aper is False:
@@ -1117,50 +1125,52 @@ def measure_offset_aperture(obj, img_em, img_con, mask_obj,
 
     aper_ems, aper_cons  = np.array([]), np.array([])
     
-    for k, percent in enumerate(aper_size):
-        a = np.max([obj.a_image*percent, 2.])
-        b = a/obj.a_image * obj.b_image
-        da_s = np.append(stats.norm(loc=0, scale=a/4.).rvs(n_rand_start, random_state=rand_state), 0)
-        db_s = np.append(stats.norm(loc=0, scale=b/4.).rvs(n_rand_start, random_state=rand_state), 0)
+    for k, percent in enumerate(aper_size):   # different aperture size
+        a = max([obj.a_image * percent, 2.])
+        b = a * obj.b_image/obj.a_image
+        # delta initial position, the last value is the original position
+        da_s = np.append(stats.norm(loc=0, scale=1).rvs(n_rand_start, random_state=rand_state), 0)
+        db_s = np.append(stats.norm(loc=0, scale=b/a).rvs(n_rand_start, random_state=rand_state), 0)
 
-        for j,(da,db) in enumerate(zip(da_s, db_s)):
+        for j, (da,db) in enumerate(zip(da_s, db_s)):  # different initial position
             try:
-                for d,img in enumerate([img_em, img_con]):
+                for d, img in enumerate([img_em, img_con]):
                     dx, dy = da*np.cos(theta)-db*np.sin(theta), da*np.sin(theta)+db*np.cos(theta)
                     x, y = obj.center_pos[0] + dx, obj.center_pos[1] + dy
-                    for i in range(niter_aper):
-                        aper = EllipticalAperture(positions=(x,y), 
+                    
+                    for n in range(niter_aper):
+                        aper = EllipticalAperture(positions=(x, y), 
                                                   a=k_aper*a, b=k_aper*b, theta=theta)              
                         m0 = aper.to_mask(method='exact')
-                        mask_aper = m0.to_image(mask_obj.shape)
+                        mask_aper = m0.to_image(seg_obj.shape)
                         if mask_aper is None:
                             raise ApertureMeasurementError("Invalid Aperture.")
                             
-                        data = img * mask_aper * mask_obj
+                        data = img * mask_aper * seg_obj
 #                         if np.sum(data) < 0:
 #                             raise ApertureMeasurementError("Sum of data is < 0.")
                             
-                        x_new, y_new = centroid_com(data, mask=np.logical_not(mask_aper * mask_obj))
+                        x_new, y_new = centroid_com(data, mask=np.logical_not(mask_aper * seg_obj))
 
-                        reach_ctol = (np.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_aper)   
+                        reach_ctol = (math.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_aper)   
                         if reach_ctol:  
                             break
                         else:
                             x, y = x_new, y_new
 
                     if d==0:
-                        data_em = img_em * mask_aper * mask_obj
+                        data_em = img_em * mask_aper * seg_obj
                         x1, y1 = x, y
-                        x1s[j,k], y1s[j,k] = x,y
-                        aper_em = EllipticalAperture(positions=(x1,y1), 
-                                                  a=k_aper*a, b=k_aper*b, theta=theta)
+                        x1s[j,k], y1s[j,k] = x, y
+                        aper_em = EllipticalAperture(positions=(x1,y1),
+                                                     a=k_aper*a, b=k_aper*b, theta=theta)
 
                     elif d==1:
-                        data_con = img_con * mask_aper * mask_obj
+                        data_con = img_con * mask_aper * seg_obj
                         x2, y2 = x, y
                         x2s[j,k], y2s[j,k] = x, y
-                        aper_con = EllipticalAperture(positions=(x2,y2), 
-                                                  a=k_aper*a, b=k_aper*b, theta=theta)
+                        aper_con = EllipticalAperture(positions=(x2,y2),
+                                                      a=k_aper*a, b=k_aper*b, theta=theta)
 
             except (ValueError, ApertureMeasurementError) as error:
                 x1s[j,k], y1s[j,k] = np.nan, np.nan
@@ -1171,76 +1181,236 @@ def measure_offset_aperture(obj, img_em, img_con, mask_obj,
         aper_ems = np.append(aper_ems, aper_em)
         aper_cons = np.append(aper_cons, aper_con)
 
-    # Remove terrible measurement
+    # Remove terrible measurement that flows with initial guess
     use_value_1, use_value_2 = np.zeros_like(aper_size, dtype=bool), np.zeros_like(aper_size, dtype=bool)
     sigma_1s, sigma_2s = np.ones_like(aper_size), np.ones_like(aper_size)
     
     for k in range(len(aper_size)):
-        if min(np.isfinite(x1s[:,k]).sum(), np.isfinite(x1s[:,k]).sum()) > 0:
+        if min(np.isfinite(x1s[:,k]).sum(), np.isfinite(x2s[:,k]).sum()) > 0:
             r1_k = np.sqrt((x1s[:,k]-np.nanmean(x1s[:,k]))**2+(y1s[:,k]-np.nanmean(y1s[:,k]))**2)
             r2_k = np.sqrt((x2s[:,k]-np.nanmean(x2s[:,k]))**2+(y2s[:,k]-np.nanmean(y2s[:,k]))**2)
             sigma_1s[k], sigma_2s[k] = np.nanstd(r1_k), np.nanstd(r2_k)
 
-            # if centroid diverge, set the centroid to be nan
-            if (np.nanstd(r1_k)<=.1): use_value_1[k] = True
-            if (np.nanstd(r2_k)<=.1): use_value_2[k] = True
+            # if centroid has large dispersion among inital guess, do not use the measurement
+            if (sigma_1s[k]<=.5): use_value_1[k] = True
+            if (sigma_2s[k]<=.5): use_value_2[k] = True
         else:
             use_value_1[k] = use_value_2[k] = False
     
     if (np.sum(use_value_1)==0)|(np.sum(use_value_2)==0):
         return None
-
+    
+    # use the measurement from the last row of measurement (undisturbed)
     x1_eff, y1_eff = x1s[-1][use_value_1], y1s[-1][use_value_1]
     x2_eff, y2_eff = x2s[-1][use_value_2], y2s[-1][use_value_2]
     sigma_1_eff, sigma_2_eff = sigma_1s[use_value_1], sigma_2s[use_value_2]
     aper_ems_eff, aper_cons_eff = aper_ems[use_value_1], aper_cons[use_value_2]
     
-    # Pick measurement w/ smallest dispersion
-    i_1, i_2 = np.argmin(sigma_1_eff), np.argmin(sigma_2_eff)
-    x1, y1 = x1_eff[i_1], y1_eff[i_1]
-    x2, y2 = x2_eff[i_2], y2_eff[i_2]
+    # Calculate uncertainty in centroid
+    if (std_map_em is not None) & (std_map_con is not None):
+        
+        # Use the local measured sky map
+        n_eff1,n_eff2 = len(aper_ems_eff), len(aper_cons_eff)
+        std_pos1_eff, std_pos2_eff = np.ones((n_eff1,2)), np.ones((n_eff2,2))
+        std_Rpos1_eff, std_Rpos2_eff = np.ones(n_eff1), np.ones(n_eff2)
+        SN_em_eff, SN_con_eff = np.zeros(n_eff1), np.zeros(n_eff2)
+        
+        for k, aper_em in enumerate(aper_ems_eff):
+            ma_em = aper_em.to_mask(method='exact')
+            seg_aper_em = ma_em.to_image(seg_obj.shape)
+            seg_em = (seg_aper_em * seg_obj).astype('bool')
+            
+            # position of measured centroids
+            pos_cen_1 = np.array([x1_eff[k], y1_eff[k]])
+            
+            # Compute uncertainty of centroid in x, y and its magnitude
+            std_pos1_eff[k] = compute_centroid_std(pos_cen_1, img_em, std_map_em, seg_em)
+            std_Rpos1_eff[k] = np.linalg.norm(std_pos1_eff[k])
+            
+            S = (img_em*seg_em).sum()
+            n_pix = seg_em.sum()
+            N_sky = np.sqrt(n_pix*np.median(std_map_em)) 
+            N_tot = np.sqrt(S + N_sky**2)
+            SN_em_eff[k] = S/N_tot
+            
+        for k, aper_con in enumerate(aper_cons_eff):
+            ma_con = aper_con.to_mask(method='exact')
+            seg_aper_con = ma_con.to_image(seg_obj.shape)
+            seg_con = np.logical_and(seg_aper_con, seg_obj)#.astype('bool')
+            
+            # position of measured centroids
+            pos_cen_2 = np.array([x2_eff[k], y2_eff[k]])
+            
+            # Compute uncertainty of centroid in x, y and its magnitude
+            std_pos2_eff[k] = compute_centroid_std(pos_cen_2, img_con, std_map_con, seg_con)
+            std_Rpos2_eff[k] = np.linalg.norm(std_pos2_eff[k])
+            
+            S = (img_con*seg_con).sum()
+            n_pix = seg_con.sum()
+            N_sky = np.sqrt(n_pix*np.median(std_map_con)) 
+            N_tot = np.sqrt(S + N_sky**2)
+            SN_con_eff[k] = S/N_tot
+            
+        i_1, i_2 = np.argmax(SN_em_eff), np.argmax(SN_con_eff)
+#         i_1, i_2 = np.argmin(std_Rpos1_eff), np.argmin(std_Rpos2_eff)
+        std_pos1, std_pos2 = std_pos1_eff[i_1], std_pos2_eff[i_2]
 
+    else:
+        # Pick measurement w/ smallest dispersion
+        i_1, i_2 = np.argmin(sigma_1_eff), np.argmin(sigma_2_eff)
+        std_pos1, std_pos2 = None, None
+        
+    x1, y1 = x1_eff[i_1], y1_eff[i_1]
+    x2, y2 = x2_eff[i_2], y2_eff[i_2]    
     aper_em = aper_ems_eff[i_1]
     aper_con = aper_cons_eff[i_2]
-    m_em = aper_em.to_mask(method='exact')
-    mask_aper_em = m_em.to_image(mask_obj.shape)
-
-    m_con = aper_con.to_mask(method='exact')
-    mask_aper_con = m_con.to_image(mask_obj.shape)
     
-    data_range_em = (mask_aper_em * mask_obj).astype('bool')
-    data_range_con = (mask_aper_con * mask_obj).astype('bool')
+    seg_aper_em = aper_em.to_mask(method='exact').to_image(seg_obj.shape)
+    seg_em = np.logical_and(seg_aper_em, seg_obj)#.astype('bool')
     
     result_cen = {"x1":x1, "y1":y1, "x2":x2, "y2":y2,
                   "aper_em":aper_em, "aper_con":aper_con,
-                  "img_em":img_em, "img_con":img_con,
-                  "data_range_em":data_range_em, "data_range_con":data_range_con,
+                  "img_em":img_em, "img_con":img_con, "seg_em":seg_em,
+                  "std_pos1":std_pos1, "std_pos2":std_pos2,
                   "aper_ems_eff":aper_ems_eff, "aper_cons_eff":aper_cons_eff}
 
     return result_cen
 
-def measure_offset_isoMMA(img_em, img_con, mask_obj, fwhm=3, smooth=False):
+def measure_offset_iso(seg_obj, img_em, img_con,
+                       std_map_em=None, std_map_con=None):
     
-    data_em = img_em * mask_obj
-    data_con = img_con * mask_obj
+    data_em = img_em * seg_obj
+    data_con = img_con * seg_obj
     x1, y1 = centroid_com(data_em)
     x2, y2 = centroid_com(data_con)
     
+    # Calculate uncertainty in centroid
+    if (std_map_em is not None) & (std_map_con is not None):
+        std_pos1 = compute_centroid_std(np.array([x1, y1]), img_em, std_map_em, seg_obj)
+        std_pos2 = compute_centroid_std(np.array([x2, y2]), img_con, std_map_con, seg_obj)
+    
     result_cen = {"x1":x1, "y1":y1, "x2":x2, "y2":y2,
-                  "img_em":img_em, "img_con":img_con,
-                  "data_range_em":mask_obj, "data_range_con":mask_obj}
+                  "img_em":img_em, "img_con":img_con, "seg_em":seg_obj,
+                  "std_pos1":std_pos1, "std_pos2":std_pos2}
     
     return result_cen
-    
+             
 
+
+def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
+                        std_map_em=None, std_map_con=None,
+                        niter_iso=15, ctol_iso=0.01, n_dilation=2, fwhm=3):
+    
+    # Deformable isophote
+    
+#     seg_obj_dl = seg_obj.copy()
+#     for i in range(n_dilation):
+#         seg_obj_dl = dilation(seg_obj_dl)
+    
+    sigma = fwhm * gaussian_fwhm_to_sigma
+    kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
+    
+    thresh_em = detect_threshold(img_em, nsigma=2)
+    thresh_con = detect_threshold(img_con, nsigma=2)
+    
+    seg_obj = obj.seg_obj
+    mask_em, mask_con = ~seg_obj.copy(), ~seg_obj.copy()
+    
+    for d, (img, mask, thresh) in enumerate(zip([img_em, img_con], [mask_em, mask_con], [thresh_em, thresh_con])):
+        x, y = obj.center_pos
+        for n in range(niter_iso):
+            segm = detect_sources(img, thresh, npixels=5, mask=mask)
+            if segm is None: break
+                
+#             seg_new = convolve(segm.data, kernel, normalize_kernel=True) > 0.5
+#             seg_new = dilation(segm.data)
+            
+            seg_new = segm.data
+            for i in range(n_dilation):
+                seg_new = dilation(seg_new)
+            
+            data = img * seg_new
+            x_new, y_new = centroid_com(data)
+
+            reach_ctol = (math.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_iso)   
+            if reach_ctol:
+                break
+            else:
+                mask = np.logical_not(seg_new*obj.seg_tot)
+                x, y = x_new, y_new
+                
+        if d==0:
+            seg_obj_em = ~mask
+            x1, y1 = x, y
+            
+        elif d==1:
+            seg_obj_con = ~mask
+            x2, y2 = x, y
+            
+    if morph_cen:
+        x1, y1 = centroid_com(seg_obj_em)
+        x2, y2 = centroid_com(seg_obj_con)
+
+    # Calculate uncertainty in centroid
+    if (std_map_em is not None) & (std_map_con is not None):
+        if morph_cen:
+            std_pos1 = [1./np.sum(seg_obj_em)**0.5]*2
+            std_pos2 = [1./np.sum(seg_obj_con)**0.5]*2
+        else:
+            std_pos1 = compute_centroid_std(np.array([x1, y1]), img_em, std_map_em, seg_obj_em)
+            std_pos2 = compute_centroid_std(np.array([x2, y2]), img_con, std_map_con, seg_obj_con)
+    
+    result_cen = {"x1":x1, "y1":y1, "x2":x2, "y2":y2,
+                  "img_em":img_em, "img_con":img_con,
+                  "seg_em":seg_obj_em, "seg_con":seg_obj_con,
+                  "std_pos1":std_pos1, "std_pos2":std_pos2}
+    
+    return result_cen
+
+    
+def measure_local_sky_noise(obj, image_list, k1=5, k2=8, sig_clip=3):
+    """ Measure standard deviation of the local sky using annulus for a list of images """
+    annul_aper = EllipticalAnnulus(positions=obj.center_pos,
+                                   a_in=k1*obj.a_image, a_out=k2*obj.a_image,
+                                   b_out=k2*obj.b_image, theta=obj.theta*180/np.pi)
+    
+    std_s = np.array([])
+    for image in np.atleast_1d(image_list):
+        # Get the region of annnulus mask
+        ma_annu = annul_aper.to_mask(method='center')
+        annu = ma_annu.to_image(image.shape)
+
+        # Sky background in the annulus (nearby objects masked)
+        bkg = image[np.logical_and(annu, obj.seg_tot)]
+        std = np.std(sigma_clip(bkg, sigma=sig_clip, maxiters=10, axis=0))
+        std_s = np.append(std_s, std)
+
+    return std_s
+
+def compute_centroid_std(pos_cen, image, std_image, seg_obj):
+    """ Compute uncertainty of centroid given the uncertainty map of light and segmentation """
+    # pixel position of emission and continuum data
+    pix_pos = np.array(np.where(seg_obj==True)).T
+    
+    # light for each pixel
+    I_i = image[seg_obj]
+    
+    # uncertainty of light for each pixel
+    std_I_i = std_image[seg_obj][:, np.newaxis]
+    
+    std_pos = np.sum((std_I_i * (pix_pos-pos_cen) / I_i.sum())**2, axis=0)
+    
+    return std_pos
+    
 def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             coord_BCG=None,
                             edge=20, n_rand=99,
                             centroid_type="APER",
                             subtract=True, sum_type="weighted", 
-                            k_aper=2, multi_aper=True,
+                            k_apers=[2,5,8], multi_aper=True,
                             aper_size=[0.7,0.85,1.15,1.3,1.],
                             niter_aper=15, ctol_aper=0.01,
+                            niter_iso=15, ctol_iso=0.01, n_dilation=2, morph_cen=False,
                             line_stddev=3, line_ratio=None, mag0=25.2,
                             affil_map=None,
                             plot=True, verbose=True,
@@ -1291,47 +1461,30 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
 
         img_em = np.sum(img_em0*weight_maps, axis=0)
     
-    # Generate stddev map (only account for uncertainty in continuum)
-    stdw_map_con = np.std(cube_con_clip-img_con, axis=0).data
-    stdw_map_em = stdw_map_con * (len(con)-1)/(len(em)-1)
-#     stdw_map_em = np.sqrt(np.sum(weight_maps*(img_em0-img_em)**2 * len(em)/(len(em)-1), axis=0))  # uncertainty in emmission?
-    
     if subtract:
         img_em = img_em - img_con
-        stdw_map_em = np.sqrt(stdw_map_em**2 + stdw_map_con**2)
     
-    mask_obj = obj.mask_seg if centroid_type == "APER" else obj.mask_seg_obj
+    # Generate stddev map (only account for uncertainty in sky)
+    std_em, std_con = measure_local_sky_noise(obj, [img_em, img_con], k1=k_apers[1], k2=k_apers[2])
+    std_map_em, std_map_con = std_em * np.ones_like(img_em), std_con * np.ones_like(img_con)
+    if verbose:
+        print("stddev emission: %.3f / continuum: %.3f"%(std_em, std_con))
     
+#     std_map_em, std_map_con = np.sqrt(abs(img_em) + std_map_em**2), np.sqrt(abs(img_con) + std_map_con**2)
+
     if centroid_type == "APER":
-        res_cen = measure_offset_aperture(obj, img_em, img_con, mask_obj, **kwargs)
+        res_cen = measure_offset_aperture(obj, img_em, img_con, k_aper=k_apers[0],
+                                          std_map_em=std_map_em, std_map_con=std_map_con)
         
-#     elif centroid_type == 'ISO1':
-#         res_cen = measure_offset_isoMMA(obj, img_em, img_con, mask_obj, **kwargs)
-        
-#         sigma = 3.0 * gaussian_fwhm_to_sigma    # FWHM = 3.
-#         kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
-#         kernel.normalize()
-        
-#         threshold1 = detect_threshold(img_em, snr=1.2)
-#         segm1 = detect_sources(img_em, threshold1, npixels=5, filter_kernel=kernel)
-#         segm_deblend_em = deblend_sources(img_em, segm1, npixels=5, filter_kernel=kernel, nlevels=32,contrast=0.001)
-        
-#         threshold2 = detect_threshold(img_con, snr=1.2)
-#         segm2 = detect_sources(img_con, threshold2, npixels=5, filter_kernel=kernel)
-#         segm_deblend_con = deblend_sources(img_con, segm2, npixels=5, filter_kernel=kernel, nlevels=32,contrast=0.001)
-        
-#         tbl_em = source_properties(img_em, segm_deblend_em).to_table()
-#         tbl_con = source_properties(img_con, segm_deblend_con).to_table()
-#         label_em = np.sqrt((tbl_em["xcentroid"].value-obj.img_thumb.shape[1]/2.)**2+(tbl_em["ycentroid"].value-obj.img_thumb.shape[0]/2.)**2).argmin()
-#         label_con = np.sqrt((tbl_con["xcentroid"].value-obj.img_thumb.shape[1]/2.)**2+(tbl_con["ycentroid"].value-obj.img_thumb.shape[0]/2.)**2).argmin()
-#         x1, y1 = tbl_em["xcentroid"][label_em].value, tbl_em["ycentroid"][label_em].value
-#         x2, y2 = tbl_con["xcentroid"][label_con].value, tbl_con["ycentroid"][label_con].value
-        
-#         data_em  = img_em*(segm_deblend_em.data==(1+label_em))
-#         data_con  = img_con*(segm_deblend_con.data==(1+label_con))
-        
-    elif centroid_type == 'ISO-MMA':
-        res_cen = measure_offset_isoMMA(img_em, img_con, mask_obj, **kwargs)
+    elif centroid_type == 'ISO-D':
+        res_cen = measure_offset_isoD(obj, img_em, img_con, morph_cen=morph_cen,
+                                      std_map_em=std_map_em, std_map_con=std_map_con)
+       
+    elif centroid_type == 'ISO':
+        res_cen = measure_offset_iso(obj.seg_obj, img_em, img_con, 
+                                     std_map_em=std_map_em, std_map_con=std_map_con)
+    else:
+        raise NameError('Not given centorid_type')
     
     if res_cen is None:
         return {}
@@ -1355,26 +1508,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     
     # Get computed light-weighted centroid and data used to compute centroid
     x1, y1, x2, y2 = [res_cen[key] for key in ["x1", "y1", "x2", "y2"]]
-    data_range_em, data_range_con = res_cen["data_range_em"], res_cen["data_range_con"]
-    data_em = img_em * data_range_em
-    data_con = img_con * data_range_con
-    
-    # Calculate uncertainty in centroid
-    if uncertainty:
-        pos_cen_1, pos_cen_2 = np.array([x1,y1]), np.array([x2,y2])
-        # pixel position of emission and continuum data
-        pix_pos_1 = np.array(np.where(data_range_em==True)).T
-        pix_pos_2 = np.array(np.where(data_range_con==True)).T
-        
-        I_i1 = img_em[data_range_em]
-        std_I_i1 = stdw_map_em[data_range_em][:, np.newaxis]
-        std_pos1 = np.sum((std_I_i1 * (pix_pos_1-pos_cen_1) / I_i1.sum())**2, axis=0)
-
-        I_i2 = img_con[data_range_con]
-        std_I_i2 = stdw_map_con[data_range_con][:, np.newaxis]
-        std_pos2 = np.sum((std_I_i2 * (pix_pos_2-pos_cen_2) / I_i2.sum())**2, axis=0)
-    else:
-        std_pos1, std_pos2 = None, None
+    std_pos1, std_pos2 = [res_cen[key] for key in ["std_pos1", "std_pos2"]]
     
     if verbose:
         print("Centroid EM: (%.2f+/-%.2f, %.2f+/-%.2f)"%(x1+obj.X_min, std_pos1[0],
@@ -1397,6 +1531,12 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     ###-----------------------------------###
     
     if plot:
+        # Get emission contours and smooth it
+        sigma = fwhm * gaussian_fwhm_to_sigma
+        kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
+        seg_em = res_cen["seg_em"]
+        data_em = convolve(img_em, kernel, normalize_kernel=True) * seg_em
+        seg_obj = obj.seg_obj #convolve(obj.seg_obj, kernel, normalize_kernel=True) > 0.5
         
         if centroid_type=="APER":
             aper_em, aper_con = res_cen["aper_em"], res_cen["aper_con"]
@@ -1438,11 +1578,14 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             aper_em.plot(color='violet',lw=3,axes=ax1,alpha=0.95)
             aper_con.plot(color='w',lw=3,axes=ax2,alpha=0.95)
         else:
-            ax1.contour(mask_obj,colors="w", levels = [0.5], alpha=0.9, linewidths=2)
-            ax2.contour(mask_obj,colors="w", levels = [0.5], alpha=0.9, linewidths=2)
+            if centroid_type == 'ISO-D':
+                ax1.contour(res_cen["seg_em"], colors="violet", levels = [0.5], alpha=0.9, linewidths=2)
+                ax2.contour(res_cen["seg_con"], colors="w", levels = [0.5], alpha=0.9, linewidths=2)
+            ax1.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
+            ax2.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
             
-        ax3.contour(data_em,colors="skyblue",alpha=0.9, linewidths=2,
-                    levels = [0.1*data_em.max(),0.45*data_em.max(),0.8*data_em.max(),data_em.max()])
+        ax3.contour(data_em, colors="skyblue", alpha=0.9, linewidths=2,
+                    levels = [0.1*data_em.max(),0.4*data_em.max(),0.7*data_em.max(),data_em.max()])
         
 #         ax3.set_xlim(xlim)
 #         ax3.set_ylim(ylim)
@@ -1490,7 +1633,7 @@ def measure_pa_offset(pos1, pos2, std_pos1=None, std_pos2=None, origin=0):
     (x2, y2) = pos2
 
     pa = np.mod(270 + np.arctan2(y2-y1,x2-x1)*180/np.pi, 360)
-    offset = math.sqrt((x1-x2)**2+(y1-y2)**2)
+    offset = max(math.sqrt((x1-x2)**2+(y1-y2)**2), 1e-7)
     
     if (std_pos1 is not None) & (std_pos2 is not None):
         (std_x1, std_y1) = std_pos1 

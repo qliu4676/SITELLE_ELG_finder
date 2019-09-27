@@ -1393,7 +1393,7 @@ class Read_Datacube:
                           centroid_type="APER", sum_type="weighted",
                           subtract_continuum=True, from_SE=False,
                           line_width=None, multi_aper=True, 
-                          return_for_plot=False, smooth=False, **kwargs):
+                          return_for_plot=False, **kwargs):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -1439,7 +1439,7 @@ class Read_Datacube:
                                               z_cc=z, wcs=self.wcs,
                                               coord_BCG=self.coord_BCG,
                                               centroid_type=centroid_type,
-                                              sum_type=sum_type, smooth=smooth, 
+                                              sum_type=sum_type, 
                                               k_aper=k_aper, multi_aper=multi_aper,
                                               line_stddev=line_width, 
                                               subtract=subtract_continuum, **kwargs)
@@ -1454,7 +1454,7 @@ class Read_Datacube:
     
     def centroid_analysis_all(self, Num_V, nums=None,
                               centroid_type="APER", sum_type="weighted",
-                              plot=False, verbose=True, smooth=True, **kwargs):
+                              plot=False, verbose=True, smooth=False, morph_cen=False, **kwargs):
         """Compute centroid offset and angle for all SE detections
         
         Parameters
@@ -1462,7 +1462,7 @@ class Read_Datacube:
         Num_V : number list of target candiate in the SE catalog
         centroid_type : method of computing centroid position for emission and continua
             "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
-            "ISO-MMA" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
+            "ISO" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
         """
         
         self.centroid_type = centroid_type
@@ -1470,7 +1470,11 @@ class Read_Datacube:
         self.z_best = self.get_CC_result_best('z_best', 'Ha-NII_gauss')
         self.sigma_best = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss')
         
-        self.result_centroid[centroid_type] = {}
+        key = centroid_type
+        if morph_cen: key += '_mo'
+        if smooth: key += '_sm'
+        
+        self.result_centroid[key] = {}
         
         nums = self.obj_nums if nums is None else np.atleast_1d(nums)
         
@@ -1500,17 +1504,16 @@ class Read_Datacube:
                                                 sum_type=sum_type,
                                                 multi_aper=multi_aper,
                                                 plot=False, verbose=verbose,
-                                                 smooth=smooth, **kwargs)
+                                                 smooth=smooth, morph_cen=morph_cen, **kwargs)
             if (num in Num_V) & (len(res_measure)>0):
                 if verbose:
                     print("Angle: %.2f +/- %.2f"%(res_measure["diff_angle"],res_measure["diff_angle_std"]))
                     print("Offset: %.2f +/- %.2f"%(res_measure["cen_offset"], res_measure["cen_offset_std"]))    
             
-            self.result_centroid[centroid_type]["%s"%num] = res_measure
+            self.result_centroid[key]["%s"%num] = res_measure
             
-        self.result_centroid[centroid_type+'_sm'] = self.result_centroid.pop(centroid_type)
-    
-    def get_centroid_result(self, prop, centroid_type="APER", fill_value=0):
+            
+    def get_centroid_result(self, prop, centroid_type="APER", nums=None, fill_value=0):
         """
         Get the best matched value of a property from centroid analysis results.
         
@@ -1518,7 +1521,11 @@ class Read_Datacube:
         """
         
         result = self.result_centroid[centroid_type]
-        return np.array([result[num].get(prop, fill_value) for num in result.keys()])
+        if nums is None:
+            nums = result.keys()
+        else:
+            nums = nums.astype(str)
+        return np.array([result[num].get(prop, fill_value) for num in nums])
     
             
     def construct_control(self, Num_v, mag_cut=None, mag0=25.2, dist_cut=25, bootstraped=False, n_boot=100):
