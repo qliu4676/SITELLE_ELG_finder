@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import shutil
 
 import math
 import numpy as np
@@ -101,12 +103,15 @@ def coord_Array2Im(x_arr, y_arr, origin=1):
     X_IMAGE, Y_IMAGE = y_arr+origin, x_arr+origin
     return X_IMAGE, Y_IMAGE
 
-def check_save_path(dir_name):
+def check_save_path(dir_name, clear=False):
     if not os.path.exists(dir_name):
         print("%s does not exist. Make a new directory."%dir_name)
         os.makedirs(dir_name)
-
-        
+    else:
+        if clear:
+            print("%s exists. Remove all the content."%dir_name)
+            shutil.rmtree(dir_name)
+            os.makedirs(dir_name)
 
 def timer(func): 
     def execute_func(*args, **kwargs): 
@@ -174,7 +179,7 @@ def mask_streak(file_path, threshold=5, shape_cut=0.15, area_cut=500, save_plot=
     
     return mask_streak
 
-def make_mask_map(image, sn_thre=3, b_size=50, npix=5):
+def make_mask_map(image, sn_thre=3, b_size=100, npix=5):
     """ Make mask map with S/N > sn_thre """
     from photutils import detect_sources, deblend_sources
     
@@ -663,7 +668,7 @@ def use_broad_window(sigma, line_ratio, SNR,
 def xcor_SNR(res, wavl_rebin, 
              temps, wavl_temp, 
              d_wavl, z_sys=0.228, rv=None, 
-             edge=20, h_contrast=0.1,
+             edge=20, edge_pad=15, h_contrast=0.1,
              n_intp=1, kind_intp="linear",
              temp_type="Ha-NII", temp_model="gauss",
              temps_params={'stddev':3,
@@ -729,8 +734,10 @@ def xcor_SNR(res, wavl_rebin,
     Contrasts = np.zeros(temps.shape[0])
     
     # min/max rv based on the wavelength range
-    rv_edge = ((np.max([x[x!=0][0], x[0]+edge])/lam_0-1-z0) * 3e5,   # x=0 is artificially set during the continuum fitting
-               (np.min([x[x!=0][-1], x[-1]-edge])/lam_0-1-z0) * 3e5) 
+    rv_edge = ((max([x[x!=0][0], x[0]+edge])/lam_0-1-z0) * 3e5,   # x=0 is artificially set during the continuum fitting
+               (min([x[x!=0][-1], x[-1]-edge])/lam_0-1-z0) * 3e5)
+    rv_edge_pad = ((max([x[x!=0][0], x[0]+edge+edge_pad])/lam_0-1-z0) * 3e5,   
+                  (min([x[x!=0][-1], x[-1]-edge-edge_pad])/lam_0-1-z0) * 3e5)
     
     # possible range of rv given possible range of redshift 
     rv_zrange = (rv>(zmin-z0)*3e5) & (rv<(zmax-z0)*3e5)
@@ -764,8 +771,8 @@ def xcor_SNR(res, wavl_rebin,
         Interp_Peak = interpolate.interp1d(rv, cc, kind='cubic')
        
         # rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 3*w_l/lam_0*3e5]), np.min([rv_edge[1],rv_p + 3*w_l/lam_0*3e5]), 300)
-        rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 1600]), 
-                              np.min([rv_edge[1],rv_p + 1600]), 200)
+        rv_intp = np.linspace(rv_p - 1600, 
+                              rv_p + 1600, 200)
         cc_intp = Interp_Peak(rv_intp)
         rv_match = rv_intp[np.argmax(cc_intp)]
         rz_match = rv_intp[np.argmax(cc_intp)] / 3e5
@@ -780,7 +787,7 @@ def xcor_SNR(res, wavl_rebin,
         # note: when compute noise of CC function, edge not in use 
         if (temp_type=="Ha-NII") | (temp_type=="Hb-OIII"):
             
-            noise_peak_range = (~peak_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])
+            noise_peak_range = (~peak_range) & (rv > rv_edge_pad[0]) & (rv <  rv_edge_pad[1])
             
             if temp_type=="Ha-NII":
                 signal_range = ((rv > (rv_match - (w_l2+lam_0-6548.)/6548.*3e5)) &\
@@ -789,11 +796,11 @@ def xcor_SNR(res, wavl_rebin,
             elif temp_type=="Hb-OIII":
                 signal_range = (abs(rz-rz_match) < w_l/lam_0) | (abs(rz-4959.*(1+z_cc)/5007.-z0-1)<w_l/lam_0)
                 
-            noise_range = (~signal_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])
+            noise_range = (~signal_range) & (rv > rv_edge_pad[0]) & (rv < rv_edge_pad[1])
                 
         elif temp_type=="OII":
             signal_range = peak_range
-            noise_range = (~signal_range) & (rv > rv_edge[0]) & (rv < rv_edge[1])
+            noise_range = (~signal_range) & (rv > rv_edge_pad[0]) & (rv < rv_edge_pad[1])
             noise_peak_range = noise_range
 
         # compute noise and S/N for the lines and the peak
@@ -831,11 +838,11 @@ def xcor_SNR(res, wavl_rebin,
         
         elif temp_type=="Hb-OIII":
             # For double line template, the second peak is in another rv range
-            rv_intp = np.linspace(np.max([rv_edge[0],rv_p - 1000]),
-                                  np.min([rv_edge[1],rv_p + 1000]), 100)
+            rv_intp = np.linspace(rv_p - 1000,
+                                  rv_p + 1000, 100)
             
-            rv_intp_2 = np.linspace(np.max([rv_edge[0],(4959.*(1+z_cc)/5007.-z0-1)*3e5 - 1000]), 
-                                    np.min([rv_edge[1],(4959.*(1+z_cc)/5007.-z0-1)*3e5 + 1000]), 100)
+            rv_intp_2 = np.linspace((4959.*(1+z_cc)/5007.-z0-1)*3e5 - 1000, 
+                                    (4959.*(1+z_cc)/5007.-z0-1)*3e5 + 1000, 100)
             rv_intp_all = np.concatenate([rv_intp_2,rv_intp])
             
             cc_intp_all = Interp_Peak(rv_intp_all)
@@ -857,6 +864,7 @@ def xcor_SNR(res, wavl_rebin,
 #         best = np.argmax(Contrasts)
 #     else:
     best = np.argmax(Rs)
+#     best = np.argmax(SNRs)
     
     ###-----------------------------------##
     z_best = z_ccs[best]
@@ -865,7 +873,7 @@ def xcor_SNR(res, wavl_rebin,
     ratio_best = temps_ratio[best]
         
     #  if the line is within 25A to the edge, raise a flag caution
-    line_at_edge = ((1+z_best)*lam_0<(x[0]+25)) | ((1+z_best)*lam_0>(x[-1]-25))   
+    line_at_edge = ((1+z_best)*lam_0<(x[0]+edge+edge_pad)) | ((1+z_best)*lam_0>(x[-1]-edge+edge_pad))   
     if line_at_edge: 
         flag_edge = 1
     else: 
@@ -943,13 +951,13 @@ def xcor_SNR(res, wavl_rebin,
                              (z_ccs[best]-z0 + w_l/lam_0)*3e5)  
         
         if temp_type=="Ha-NII":
-            rv_left2, rv_right2 = (np.max([rv_edge[0],(z_ccs[best]-z0 - (w_l2+lam_0-6548.)/6548.) * 3e5]), 
-                                   np.min([rv_edge[1],(z_ccs[best]-z0 + (w_l2+6584.-lam_0)/6584.) * 3e5]))
+            rv_left2, rv_right2 = ((z_ccs[best]-z0 - (w_l2+lam_0-6548.)/6548.) * 3e5, 
+                                   (z_ccs[best]-z0 + (w_l2+6584.-lam_0)/6584.) * 3e5)
             
         elif temp_type=="Hb-OIII":
             rv_left2, rv_right2 = rv_left, rv_right
-            rv_left2b, rv_right2b = (np.max([rv_edge[0],((4959.*(1+z_ccs[best])/5007.-z0-1) - w_l/lam_0) * 3e5]),
-                                     np.min([rv_edge[1],((4959.*(1+z_ccs[best])/5007.-z0-1) + w_l/lam_0) * 3e5]))
+            rv_left2b, rv_right2b = (((4959.*(1+z_ccs[best])/5007.-z0-1) - w_l/lam_0) * 3e5,
+                                     ((4959.*(1+z_ccs[best])/5007.-z0-1) + w_l/lam_0) * 3e5)
             ax2.axvline((4959.*(1+z_best)/5007.-z0-1)*3e5, color="orangered", lw=1.5, ls="--", alpha=0.8)
             ax2.axvspan(rv_left2b, rv_right2b, alpha=0.15, color='indianred', zorder=2)
             
@@ -960,16 +968,16 @@ def xcor_SNR(res, wavl_rebin,
         ax2.axvspan(rv_left2, rv_right2, alpha=0.15, color='indianred')
         
         if temp_type=="Hb-OIII":
-            if rv_edge[0]<rv_left2b:  
-                ax2.axvspan(rv_edge[0], rv_left2b, alpha=0.2, color='gray', zorder=1)
+            if rv_edge_pad[0]<rv_left2b:  
+                ax2.axvspan(rv_edge_pad[0], rv_left2b, alpha=0.2, color='gray', zorder=1)
                 ax2.axvspan(rv_right2b, rv_left2, alpha=0.2, color='gray', zorder=1)
-            if rv_edge[1]>rv_right2: 
-                ax2.axvspan(rv_right2, rv_edge[1], alpha=0.2, color='gray', zorder=1)
+            if rv_edge_pad[1]>rv_right2: 
+                ax2.axvspan(rv_right2, rv_edge_pad[1], alpha=0.2, color='gray', zorder=1)
         else:
-            if rv_edge[0]<rv_left2:  
-                ax2.axvspan(rv_edge[0], rv_left2, alpha=0.2, color='gray', zorder=1)
-            if rv_edge[1]>rv_right2:  
-                ax2.axvspan(rv_right2, rv_edge[1], alpha=0.2, color='gray', zorder=1)
+            if rv_edge_pad[0]<rv_left2:  
+                ax2.axvspan(rv_edge_pad[0], rv_left2, alpha=0.2, color='gray', zorder=1)
+            if rv_edge_pad[1]>rv_right2:  
+                ax2.axvspan(rv_right2, rv_edge_pad[1], alpha=0.2, color='gray', zorder=1)
         
         ##--Label the CC peak--##
         try:
@@ -1050,7 +1058,7 @@ def estimate_EW(spec, wavl, z,
     
     # window range to estimate EW. Filter edges excluded.
     not_at_edge = (wavl>wavl.min()+edge) & (wavl<wavl.max()-edge)
-    line_range = (wavl > lam_0*(1+z)-8*sigma) & (wavl < lam_0*(1+z)+8*sigma) & not_at_edge
+    line_range = (wavl > lam_0*(1+z)-10*sigma) & (wavl < lam_0*(1+z)+10*sigma) & not_at_edge
     
     # estimate conitinum if not given
     if cont is None:
@@ -1276,8 +1284,10 @@ def measure_offset_aperture(obj, img_em, img_con,
 
     return result_cen
 
-def measure_offset_iso(seg_obj, img_em, img_con,
+def measure_offset_isoF(seg_obj, img_em, img_con,
                        std_map_em=None, std_map_con=None):
+    
+    """ Measure centroid with fixed isophote """
     
     data_em = img_em * seg_obj
     data_con = img_con * seg_obj
@@ -1301,7 +1311,7 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
                         std_map_em=None, std_map_con=None,
                         niter_iso=15, ctol_iso=0.01, n_dilation=2, fwhm=3):
     
-    # Deformable isophote
+    """ Measure centroid with deformable isophote """
     
 #     seg_obj_dl = seg_obj.copy()
 #     for i in range(n_dilation):
@@ -1320,7 +1330,8 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
         x, y = obj.center_pos
         for n in range(niter_iso):
             segm = detect_sources(img, thresh, npixels=5, mask=mask)
-            if segm is None: break
+            if segm is None:
+                return None
                 
 #             seg_new = convolve(segm.data, kernel, normalize_kernel=True) > 0.5
 #             seg_new = dilation(segm.data)
@@ -1404,7 +1415,7 @@ def compute_centroid_std(pos_cen, image, std_image, seg_obj):
     
 def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             coord_BCG=None,
-                            edge=20, n_rand=99,
+                            edge=30, n_rand=99,
                             centroid_type="APER",
                             subtract=True, sum_type="weighted", 
                             k_apers=[2,5,8], multi_aper=True,
@@ -1480,7 +1491,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         res_cen = measure_offset_isoD(obj, img_em, img_con, morph_cen=morph_cen,
                                       std_map_em=std_map_em, std_map_con=std_map_con)
        
-    elif centroid_type == 'ISO':
+    elif centroid_type == 'ISO-F':
         res_cen = measure_offset_iso(obj.seg_obj, img_em, img_con, 
                                      std_map_em=std_map_em, std_map_con=std_map_con)
     else:
@@ -1496,7 +1507,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         c_BCG = coord_BCG
 
     else:
-        lab = affil_map[obj.x_c.astype("int64"), obj.y_c.astype("int64")]
+        lab = affil_map[obj.Y_c.astype("int64"), obj.X_c.astype("int64")]
         c_BCG = coord_BCG[0] if lab==1 else coord_BCG[1]
 
     ra0, dec0 = wcs.all_pix2world(obj.X_c, obj.Y_c, obj.origin)
@@ -1790,7 +1801,15 @@ def generate_catalog(save_name, Datacube, Num_v, wcs, n_rand=99):
 
     df.to_csv(save_name,sep=',',index=None)
     
-    
+class HiddenPrints:
+    def __enter__(self):
+        self._original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout.close()
+        sys.stdout = self._original_stdout
+        
 class ApertureMeasurementError(Exception): 
     def __init__(self, msg):
         self.msg = msg

@@ -8,14 +8,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from astropy.io import fits
-from astropy.table import Table, Column, join
+from astropy.table import Table, Column, join, hstack
 from astropy.stats import mad_std
 from astroquery.vizier import Vizier
 
 from utils import *
 
 
-def read_SITELLE_DeepFrame(file_path, name, SE_catalog=None, seg_map=None, mask_edge=None):
+def Read_SITELLE_DeepFrame(file_path, name, SE_catalog=None, seg_map=None, mask_edge=None):
     """ 
     Read raw SITELLE datacube.
     
@@ -64,7 +64,7 @@ class DeepFrame:
         
     def crossmatch_sdss(self, radius=6*u.arcmin, mag_max=18):
         """ Match bright stars with SDSS (optional) """
-        tab_sdss = crossmatch_sdss12(self, self.RA, self.DEC, radius=radius, band='rmag', mag_max=mag_max)
+        tab_sdss = crossmatch_sdss12(self.RA, self.DEC, radius=radius, band='rmag', mag_max=mag_max)
         return tab_sdss
     
     def make_mask_edge(self, save_path = './'):
@@ -119,7 +119,7 @@ class DeepFrame:
             
         check_save_path(save_path)
         hdu_weight_map = fits.PrimaryHDU(data=weight)
-        hdu_weight_map.writeto(os.path.join(save_path, 'weight_map_%s.fits'%self.name), overwrite=True)
+        hdu_weight_map.writeto(os.path.join(save_path, 'weight_map_DF_%s.fits'%self.name), overwrite=True)
     
     def subtract_background(self, b_size=128,
                             display=True, plot=False, save_path = './', suffix=""):
@@ -151,9 +151,9 @@ class DeepFrame:
         
         self.field_sub = field_sub    
         
-    def calculate_seeing(self, R_pix=15, cut=[95,99.5], sigma_guess=1., plot=False):
+    def calculate_seeing(self, tab_SDSS=None, R_pix=15, cut=[95,99.5], sep=1 * u.arcsec, sigma_guess=1., plot=False):
         """ 
-        Use the brigh star-like objects (class_star>0.7) to calculate 
+        Use central SDSS stars or brigh star-like objects (class_star>0.7) to calculate 
         median seeing fwhm by fitting gaussian profiles.
             
         Parameters
@@ -170,14 +170,27 @@ class DeepFrame:
             return None
         else:
             table = self.table
+            
+        if tab_SDSS is None:
+            # Cut in CLASS_STAR, roundness and brightness
+            star_cond = (table["CLASS_STAR"]>0.7) & (table["PETRO_RADIUS"]>0) \
+                        & (table["B_IMAGE"]/table["A_IMAGE"]>0.8) & (table["FLAGS"] <4)
+            tab_star = table[star_cond]
+            
+            F_limit = np.percentile(tab_star["FLUX_AUTO"], cut)
+            tab_star = tab_star[(tab_star["FLUX_AUTO"]>F_limit[0])&(tab_star["FLUX_AUTO"]<F_limit[1])]
+        else:
+            pos_SE = np.vstack([table["X_IMAGE"], table["Y_IMAGE"]]).T
+            coord_SE = self.wcs.all_pix2world(pos_SE, 1)
+            c_SE = SkyCoord(ra=coord_SE[:,0], dec=coord_SE[:,1], unit="deg")
 
-        # Cut in CLASS_STAR, roundness and brightness
-        star_cond = (table["CLASS_STAR"]>0.7) & (table["PETRO_RADIUS"]>0) \
-                    & (table["B_IMAGE"]/table["A_IMAGE"]>0.8) & (table["FLAGS"] <4)
-        tab_star = table[star_cond]
-        F_limit = np.percentile(tab_star["FLUX_AUTO"], cut)
-        tab_star = tab_star[(tab_star["FLUX_AUTO"]>F_limit[0])&(tab_star["FLUX_AUTO"]<F_limit[1])]
-        
+            c_sdss = SkyCoord(ra=tab_SDSS['RA_ICRS'], dec=tab_SDSS['DE_ICRS'])
+            idx, d2d, d3d = c_SE.match_to_catalog_sky(c_sdss)
+            tab_star = table[d2d < sep]
+            
+            tab_star = tab_star[(tab_star["B_IMAGE"]/tab_star["A_IMAGE"]>0.8)]
+            
+            
         FWHM = calculate_seeing(tab_star, self.image, self.seg_map, 
                                 R_pix=R_pix, sigma_guess=sigma_guess, min_num=5, plot=True)
         self.seeing_fwhm = np.median(FWHM)
@@ -185,7 +198,7 @@ class DeepFrame:
         
         
 
-def read_raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550]):
+def Read_Raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550]):
     """ 
     Read raw SITELLE datacube.
     
@@ -212,10 +225,11 @@ class Raw_Datacube:
         self.name = name
         
         # Pixel scale, Step of wavenumber, Start of wavenumber, Number of steps
-        self.pix_scale = self.hdu[0].header["PIXSCAL1"]   #arcsec/pixel
-        self.d_wavn = self.hdu[0].header["CDELT3"]        #cm^-1 / pixel
-        self.wavn_start = self.hdu[0].header["CRVAL3"]    #cm^-1
-        self.nstep = self.hdu[0].header["STEPNB"] 
+        if "PIXSCAL1" in self.header:
+            self.pix_scale = self.header["PIXSCAL1"]   #arcsec/pixel
+        self.d_wavn = self.header["CDELT3"]        #cm^-1 / pixel
+        self.wavn_start = self.header["CRVAL3"]    #cm^-1
+        self.nstep = self.header["STEPNB"] 
         
         # Wavenumber axis
         self.wavn = np.linspace(self.wavn_start, self.wavn_start+(self.nstep-1)*self.d_wavn, self.nstep)  #cm^-1
@@ -225,16 +239,18 @@ class Raw_Datacube:
         self.wavl = 1./self.wavn[wavn_eff_range][::-1]*1e8
         
         # Raw effective datacube and stack field
-        self.raw_datacube = self.hdu[0].data[wavn_eff_range][::-1]
-        self.raw_stack_field = self.raw_datacube.sum(axis=0)
+        self.raw_cube = self.hdu[0].data[wavn_eff_range][::-1]
+        self.cube_process = self.raw_cube.copy()
+        self.shape = self.raw_cube.shape
+        self.raw_stack_field = self.raw_cube.sum(axis=0)
         
         # Field edge/saturations to be masked
         self.mask_edge = self.raw_stack_field < 5 * mad_std(self.raw_stack_field)
         
         # Modify the fits for saving the new cube
-        self.hdu_header_new = self.hdu[0].header.copy()
-        self.hdu_header_new["CRVAL3"] = self.wavn[wavn_eff_range][0]  # New minimum wavenumber in cm-1
-        self.hdu_header_new["STEPNB"] = np.sum(wavn_eff_range)   # New step
+        self.header_new = self.header.copy()
+        self.header_new["CRVAL3"] = self.wavn[wavn_eff_range][0]  # New minimum wavenumber in cm-1
+        self.header_new["STEPNB"] = np.sum(wavn_eff_range)   # New step
         
     def display(self, img, vmax=None, a=0.1):
         # Display a image
@@ -256,18 +272,23 @@ class Raw_Datacube:
         self.mymask = reg.get_mask(hdu=self.hdu[0], shape=self.hdu[0].shape[1:])
 
         weight_map =(~self.mymask).astype("float") + weight
+        self.weight_map = weight_map
         
         check_save_path(save_path)
         hdu_weight_map = fits.PrimaryHDU(data=weight_map)
         hdu_weight_map.writeto(os.path.join(save_path, 'weight_map_stack_%s.fits'%self.name), overwrite=True)
     
+    @property
+    def stack_field(self):
+        return self.cube_process.sum(axis=0)
+        
     def remove_background(self, box_size=128, filter_size=3, n_iter=10, save_path='./bkg/', plot=False):
         """ Remove background (low-frequency component) using SEXtractor estimator (filtering + mode) """
         if plot:
             check_save_path(save_path)
         
-        self.datacube_bkg_sub = np.empty_like(self.raw_datacube)
-        for i, field in enumerate(self.raw_datacube):
+        self.datacube_bkg_sub = np.empty_like(self.raw_cube)
+        for i, field in enumerate(self.raw_cube):
             if np.mod(i+1, 10)==0: print("Removing background... Channel: %d"%(i+1))
             
             back, back_rms = background_sub_SE(field, mask=self.mask_edge,
@@ -282,22 +303,54 @@ class Raw_Datacube:
                 plt.savefig(os.path.join(save_path, "bkg_sub_channel%d.png"%(i+1)),dpi=100)
                 plt.close(fig)  
                 
-        self.stack_field = self.datacube_bkg_sub.sum(axis=0)
+        self.cube_process = self.datacube_bkg_sub.copy()
+    
+    def get_channel(self, wavl_intp_range):
+        x = np.zeros_like(self.wavl, dtype=bool)
+        for w_range in np.atleast_2d(wavl_intp_range):
+            x[(w_range[0]<self.wavl) & (self.wavl<w_range[1])] = True
+        channel = np.where(x)[0] + 1
+        return channel
+            
+    def interp_bad_channel(self, wavl_intp_range=[7980,7995], interp=False):
+        """ Interpolate bad channels, e.g. suffering from strong fringes, from adjacent channels """
+        cube = self.datacube_bkg_sub.copy()
+        bad_channel = self.get_channel(wavl_intp_range=wavl_intp_range)
+        if len(bad_channel)>0:
+            if not interp:
+                return bad_channel
+
+            print("Interpolate bad channels:", ", ".join((bad_channel).astype(str)))
+            good_channel = np.where(~bad)[0] + 1
+
+            for i in range(self.shape[1]):
+                for j in range(self.shape[2]):
+                    y_good = cube[:,i,j][~bad]
+                    cube[bad,i,j] = np.interp(bad_channel, good_channel, cube[:,i,j][~bad])\
+                                            + np.random.normal(scale=mad_std(y_good),size=len(bad_channel))
+            self.cube_process = cube
+            return bad_channel
+        else:
+            print("No bad channles.")
+            self.cube_process = cube
+            return None
+    
         
-    def remove_fringe(self, channels=None, sn_source=2,
+    def remove_fringe(self, channels=None, sn_source=3,
                       box_size=8, filter_size=1, n_iter=20, save_path='./bkg/', plot=False):
-        """ Remove fringe and artifacts for specified channels """
+        """ Clean (fringe and artifacts) for specified channels """
         if channels is None: return None
         
-        check_save_path(save_path)
+        if plot:
+            check_save_path(save_path)
         
         mask_source, segmap = make_mask_map(self.stack_field, sn_thre=sn_source, b_size=128)
-        mask = (self.mask_edge) | (mask_source)
+        mask = dilation((self.mask_edge) | (mask_source))
         
-        self.datacube_bkg_fg_sub = self.datacube_bkg_sub.copy()
+        self.datacube_bkg_fg_sub = self.cube_process.copy()
         for k in channels:
-            field = self.datacube_bkg_sub[k-1]
-            print("Removing fringe... Channel: %d"%k)
+            field = self.cube_process[k-1]
+            print("Cleaning Channel: %d"%k)
                 
             back, back_rms = background_sub_SE(field, mask=mask,
                                                b_size=box_size, f_size=filter_size, n_iter=n_iter)
@@ -309,25 +362,24 @@ class Raw_Datacube:
                 plt.savefig(os.path.join(save_path, "fg_sub_channel%d.png"%k),dpi=100)
                 plt.close(fig)  
                     
-        self.stack_field = self.datacube_bkg_fg_sub.sum(axis=0)
-        self.subtract_fringe = True
+        self.cube_process = self.datacube_bkg_fg_sub.copy()
                     
     def save_fits(self, save_path = './', suffix=""):
         """Write Stacked Image and Datacube after background & fringe subtraction"""
         print("Saving background & fringe subtracted datacube and stacked field...")
         
-        datacube_sub = self.datacube_bkg_fg_sub if self.subtract_fringe else self.datacube_bkg_sub
-        
         check_save_path(save_path)
-        hdu_cube = fits.PrimaryHDU(data = datacube_sub, header=self.hdu_header_new)
+        
+        hdu_cube = fits.PrimaryHDU(data = self.cube_process, header=self.header_new)
         hdu_cube.writeto(os.path.join(save_path, '%s_cube%s.fits'%(self.name, suffix)),overwrite=True)
         
+        self.header_new_stack = self.header_new.copy()
         for keyname in ["CTYPE3","CRVAL3","CUNIT3","CRPIX3","CDELT3","CROTA3"]:
             try:
-                self.hdu_header_new.remove(keyname)
+                self.header_new_stack.remove(keyname)
             except KeyError:
                 pass
-        hdu_stack = fits.PrimaryHDU(data = self.stack_field, header=self.hdu_header_new)
+        hdu_stack = fits.PrimaryHDU(data = self.stack_field, header=self.header_new_stack)
         hdu_stack.writeto(os.path.join(save_path, '%s_stack%s.fits'%(self.name, suffix)),overwrite=True)
         
         
@@ -415,9 +467,13 @@ class Read_Datacube:
         self.CC_result_Temps  = {}
         self.result_centroid = {}
     
-    def get_wcs(self):
+    def get_wcs(self, hide=True):
         """ Read WCS info from the datacube header """
-        self.wcs = WCS(self.header,naxis=2)
+        if hide:
+            with HiddenPrints():
+                self.wcs = WCS(self.header,naxis=2)
+        else:
+            self.wcs = WCS(self.header,naxis=2)
         return self.wcs
 
     def get_centroid(self, num, Xname="xcentroid", Yname="ycentroid"):
@@ -438,10 +494,17 @@ class Read_Datacube:
             image = self.stack_field
         return get_cutout(num, self.table, image, **kwargs) 
     
+    def get_channel(self, wavl_intp_range):
+        x = np.zeros_like(self.wavl, dtype=bool)
+        for w_range in np.atleast_2d(wavl_intp_range):
+            x[(w_range[0]<self.wavl) & (self.wavl<w_range[1])] = True
+        channel = np.where(x)[0] + 1
+        return channel
+    
     def ISO_source_detection(self, sn_thre=2.5, npixels=8,
                              nlevels=64, contrast=0.01, closing=True,
                              add_columns=['equivalent_radius'],
-                             box=(3,3,3), parallel=False, 
+                             box=(3,3,3), parallel=False, mask_map=None,
                              save=True, save_path = './', suffix=""):
         """ Source Extraction based on Isophotal of S/N """
         from skimage import morphology
@@ -477,7 +540,11 @@ class Read_Datacube:
         print("Detecting and deblending source...")
         back, back_rms = background_sub_SE(src_map, b_size=128)
         threshold = back + (sn_thre * back_rms)
-        segm0 = detect_sources(src_map, threshold, npixels=npixels)
+        if mask_map is not None:
+            mask = (fits.open(mask_map)[0].data <1)
+        else:
+            mask = None
+        segm0 = detect_sources(src_map, threshold, npixels=npixels, mask=mask)
         segm = deblend_sources(src_map, segm0, npixels=npixels, nlevels=nlevels, contrast=contrast)
         if closing is True:
             seg_map = morphology.closing(segm.data)
@@ -648,7 +715,7 @@ class Read_Datacube:
         """
         
         if plot:
-            check_save_path(save_path)
+            check_save_path(save_path, clear=True)
             
         if (model=='GP') & (GP_kwds['edge_ratio'] is None):
             # Stacked spectra to estimate edge ratio
@@ -885,10 +952,10 @@ class Read_Datacube:
         
         hdul.writeto(os.path.join(save_path, filename), overwrite=True) 
 
-    def Read_Template(self, dir_name, n_intp=2):
+    def Read_Template(self, dir_name, n_intp=2, name='*'):
         """Read Emission Line Template from directory"""
         
-        temp_list = glob.glob(dir_name+'/Template-%s_*.fits'%self.name)
+        temp_list = glob.glob(dir_name+'/Template-%s_*.fits'%name)
         
         if len(temp_list)>0:
             self.n_intp = n_intp
@@ -917,7 +984,8 @@ class Read_Datacube:
                           temp_type="Ha-NII", 
                           temp_model="gauss",
                           kind_intp="linear",
-                          h_contrast=0.1, edge=20,
+                          h_contrast=0.1,
+                          edge=20, edge_pad=15,
                           const_window=False, 
                           verbose=True, plot=True,
                           fig=None, axes=None):
@@ -960,7 +1028,7 @@ class Read_Datacube:
         line_ratios = self.Line_Ratios_Temps[typ_mod]
         
         # result_cc: ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge
-        result_cc = xcor_SNR(res=res, 
+        result_cc = xcor_SNR(res=res, rv=rv, 
                              wavl_rebin=self.wavl_rebin, 
                              temps=temps, 
                              wavl_temp=wavl_temp, 
@@ -973,7 +1041,7 @@ class Read_Datacube:
                              temps_params={'stddev':stddevs, 
                                            'line_ratio':line_ratios},
                              h_contrast=h_contrast, 
-                             rv=rv, edge=edge,
+                             edge=edge, edge_pad=edge_pad,
                              const_window=const_window, 
                              plot=plot, fig=fig, axes=axes)
         
@@ -991,7 +1059,8 @@ class Read_Datacube:
                                temp_type="Ha-NII", 
                                temp_model="gauss",
                                kind_intp="linear",
-                               edge=20, h_contrast=0.1,
+                               edge=20, edge_pad=15,
+                               h_contrast=0.1,
                                const_window=False, 
                                cores=None, verbose=True):
         
@@ -1007,7 +1076,7 @@ class Read_Datacube:
         stddevs = self.Stddev_Temps[typ_mod]
         line_ratios = self.Line_Ratios_Temps[typ_mod]
         
-        result_cc = self.cross_correlation(num=1, rv=None, edge=edge, 
+        result_cc = self.cross_correlation(num=1, rv=None, edge=edge, edge_pad=edge_pad, 
                                            temp_type=temp_type, temp_model=temp_model,
                                            const_window=const_window, kind_intp=kind_intp,
                                            h_contrast=h_contrast, verbose=False, plot=False)
@@ -1025,9 +1094,10 @@ class Read_Datacube:
                          temp_model=temp_model,
                          temps_params={'stddev':stddevs, 
                                        'line_ratio':line_ratios},
-                         rv=self.rv, edge=edge,
+                         rv=self.rv,
                          n_intp=self.n_intp, 
-                         kind_intp=kind_intp,     
+                         kind_intp=kind_intp,
+                         edge=edge, edge_pad=edge_pad, 
                          h_contrast=h_contrast,
                          const_window=const_window,
                          plot=False)
@@ -1048,11 +1118,12 @@ class Read_Datacube:
             
         return CC_result
     
-    def cross_correlation_all(self, edge=20, 
+    def cross_correlation_all(self, 
                               temp_type="Ha-NII", 
                               temp_model="gauss",
                               kind_intp="linear",
                               h_contrast=0.1,
+                              edge=20, edge_pad=15,
                               parallel=True, cores=None, 
                               const_window=False, verbose=True):
         """Cross-correlation for all SE detections in the catalog.
@@ -1081,7 +1152,8 @@ class Read_Datacube:
         if parallel:
             self.CC_result = self.cross_correlation_pipe(temp_type=temp_type, temp_model=temp_model,
                                                          cores=cores, verbose=verbose,
-                                                         edge=edge, const_window=const_window,
+                                                         edge=edge, edge_pad=edge_pad,
+                                                         const_window=const_window,
                                                          kind_intp=kind_intp, h_contrast=h_contrast)
         else:
             
@@ -1092,13 +1164,13 @@ class Read_Datacube:
                         
                 if j==0:
                     # Compute relative velocity axis only at the first step 
-                    result_cc = self.cross_correlation(num, rv=None, edge=edge,
+                    result_cc = self.cross_correlation(num, rv=None, edge=edge, edge_pad=edge_pad,
                                                        temp_type=temp_type, temp_model=temp_model,
                                                        verbose=verbose, plot=False,
                                                        const_window=const_window,
                                                        kind_intp=kind_intp, h_contrast=h_contrast)
                 else:
-                    result_cc = self.cross_correlation(num, rv=self.rv, edge=edge,
+                    result_cc = self.cross_correlation(num, rv=self.rv, edge=edge, edge_pad=edge_pad,
                                                        temp_type=temp_type, temp_model=temp_model,
                                                        verbose=verbose, plot=False,
                                                        const_window=const_window,
@@ -1198,7 +1270,7 @@ class Read_Datacube:
             print("%s does not exist. Check file path."%filename)
         
         
-    def cc_property(func=None): 
+    def dict_property(func=None): 
         def get_prop(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
@@ -1206,7 +1278,7 @@ class Read_Datacube:
                 print("Template / Property name does not exist.")
         return get_prop
 
-    @cc_property    
+    @dict_property
     def get_CC_result_best(self, prop, typ_mod, nums=None):
         """
         Get the best matched value of a property from CC results.
@@ -1219,7 +1291,6 @@ class Read_Datacube:
         return np.array([self.CC_result_Temps[typ_mod][num][prop]
                          for num in np.atleast_1d(nums).astype(str)])
             
-
     
     def estimate_EW(self, num, z=None, sigma=None, 
                     temp_type="Ha-NII", temp_model="gauss",
@@ -1253,11 +1324,11 @@ class Read_Datacube:
         EW, EW_std = estimate_EW(self.obj_specs_opt[id], self.wavl,
                                  z=z, lam_0=lam_0, sigma=sigma, 
                                  MC_err=MC_err, n_MC=n_MC,
-                                 cont=cont, ax=ax, plot=plot)
+                                 edge=edge, cont=cont, ax=ax, plot=plot)
         
         return EW, EW_std
 
-    def estimate_EW_all(self, temp_type="Ha-NII", temp_model="gauss",
+    def estimate_EW_all(self, temp_type="Ha-NII", temp_model="gauss", sigma=5,
                         MC_err=True, n_MC=250, use_cont_fit=False, edge=20):
             
         typ_mod = temp_type + "_" + temp_model
@@ -1265,11 +1336,14 @@ class Read_Datacube:
         z_bests = self.get_CC_result_best('z_best', typ_mod)
         sigma_bests = self.get_CC_result_best('sigma_best', typ_mod)
         
-        EWs = np.zeros_like(self.obj_nums)
-        EW_stds = np.zeros_like(self.obj_nums)
+        EWs = np.zeros(len(self.obj_nums))
+        EW_stds = np.zeros(len(self.obj_nums))
+        
+        if sigma is None:
+            sigma = sigma_bests[k]
         for k, num in enumerate(self.obj_nums):
             if np.mod(k+1, 400)==0: print("Measure EW... %d/%d"%(k+1, len(self.obj_nums)))
-            EWs[k], EW_stds[k] = self.estimate_EW(num, z=z_bests[k], sigma=sigma_bests[k],
+            EWs[k], EW_stds[k] = self.estimate_EW(num, z=z_bests[k], sigma=sigma,
                                                   temp_type=temp_type, temp_model=temp_model,
                                                   MC_err=MC_err, n_MC=n_MC, edge=edge,
                                                   use_cont_fit=use_cont_fit, plot=False)
@@ -1310,7 +1384,7 @@ class Read_Datacube:
         
         return cat_match
     
-    def plot_candidate(self, num, temp_type="Ha-NII", temp_model="gauss", fig=None):
+    def plot_candidate(self, num, temp_type="Ha-NII", temp_model="gauss", sigma=5, fig=None):
     
         from matplotlib.gridspec import GridSpec
         if fig is None:
@@ -1323,7 +1397,7 @@ class Read_Datacube:
 
         self.rv = self.CC_result_Temps[temp_type+"_"+temp_model]["rv"]
         
-        EW, EW_std = self.estimate_EW(num, temp_type=temp_type, temp_model=temp_model, ax=ax1)
+        EW, EW_std = self.estimate_EW(num, temp_type=temp_type, temp_model=temp_model, sigma=sigma, ax=ax1)
 
         result = self.cross_correlation(num, const_window=False, rv=self.rv,
                                         temp_type=temp_type, temp_model=temp_model,
@@ -1431,15 +1505,14 @@ class Read_Datacube:
         boundary_map = getattr(self, 'boundary_map', None)
         
         if line_width is None:
-            line_width = 3.
-        else:
             line_width = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss', nums=num)[0]
 #         try:
+        affil_map = getattr(self, 'boundary_map', None)
         res_measure = compute_centroid_offset(obj, spec=spec, wavl=self.wavl,
                                               z_cc=z, wcs=self.wcs,
                                               coord_BCG=self.coord_BCG,
                                               centroid_type=centroid_type,
-                                              sum_type=sum_type, 
+                                              sum_type=sum_type, affil_map=affil_map,
                                               k_aper=k_aper, multi_aper=multi_aper,
                                               line_stddev=line_width, 
                                               subtract=subtract_continuum, **kwargs)
@@ -1452,7 +1525,7 @@ class Read_Datacube:
         return res_measure
 
     
-    def centroid_analysis_all(self, Num_V, nums=None,
+    def centroid_analysis_all(self, Num_V, nums_obj=None,
                               centroid_type="APER", sum_type="weighted",
                               plot=False, verbose=True, smooth=False, morph_cen=False, **kwargs):
         """Compute centroid offset and angle for all SE detections
@@ -1471,14 +1544,14 @@ class Read_Datacube:
         self.sigma_best = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss')
         
         key = centroid_type
-        if morph_cen: key += '_mo'
-        if smooth: key += '_sm'
+        if morph_cen: key += 'm'
+        if smooth: key += 's'
         
         self.result_centroid[key] = {}
         
-        nums = self.obj_nums if nums is None else np.atleast_1d(nums)
+        nums_obj = self.obj_nums if nums_obj is None else np.atleast_1d(nums_obj)
         
-        for num in nums:
+        for num in nums_obj:
             if verbose:
                 print("\nCandidate: #%d"%num)
             ind = np.where(self.obj_nums==num)[0][0]
@@ -1511,21 +1584,60 @@ class Read_Datacube:
                     print("Offset: %.2f +/- %.2f"%(res_measure["cen_offset"], res_measure["cen_offset_std"]))    
             
             self.result_centroid[key]["%s"%num] = res_measure
-            
-            
+    
+    @property
+    def centroid_result_names(self):
+        return ['diff_angle', 'cen_offset', 'diff_angle_std', 'cen_offset_std',
+                'pa', 'clus_cen_angle', 'dist_clus_cen']
+    
+    @dict_property        
     def get_centroid_result(self, prop, centroid_type="APER", nums=None, fill_value=0):
         """
         Get the best matched value of a property from centroid analysis results.
         
         prop: 'diff_angle', 'cen_offset', 'diff_angle_std', 'cen_offset_std', ...
         """
-        
-        result = self.result_centroid[centroid_type]
-        if nums is None:
-            nums = result.keys()
-        else:
-            nums = nums.astype(str)
-        return np.array([result[num].get(prop, fill_value) for num in nums])
+        if prop in self.centroid_result_names:
+            result = self.result_centroid[centroid_type]
+            if nums is None:
+                nums = result.keys()
+            else:
+                nums = nums.astype(str)
+            return np.array([result[num].get(prop, fill_value) for num in nums])
+    
+    def save_centroid_measurement(self, Num_v, save_path='./', suffix="", ID_field=""):
+        if hasattr(self, 'result_centroid'):
+            check_save_path(save_path)
+            
+            ID = [str(num) + ID_field for num in Num_v]
+            pos = np.array([self.get_centroid(num) for num in Num_v])
+            
+            coords = np.around(self.wcs.all_pix2world(pos, 0),4)
+            
+            z_best =  np.around(self.get_CC_result_best('z_best', 'Ha-NII_gauss', Num_v), 4)
+            SN_Ha  = np.around(self.get_CC_result_best('SNR', 'Ha-NII_gauss', Num_v), 3)
+            SN_OIII = np.around(self.get_CC_result_best('SNR', 'Hb-OIII_gauss', Num_v), 3)
+            SN_OII = np.around(self.get_CC_result_best('SNR', 'OII_gauss', Num_v), 3)
+            
+            tab = Table(np.vstack([ID, coords[:,0], coords[:,1], z_best,
+                                   pos[:,0], pos[:,1], SN_Ha, SN_OIII, SN_OII]).T,
+                        names=["ID","ra","dec","z","X","Y",'SN_Ha', 'SN_OIII', 'SN_OII'])
+            
+            for k, centroid_type in enumerate(self.result_centroid.keys()):
+                for prop_name in self.centroid_result_names:
+                    common_prop = prop_name in ['clus_cen_angle', 'dist_clus_cen'] 
+                    if common_prop & (k<len(self.result_centroid.keys())-1):
+                        continue
+                    else:
+                        fval = np.nan #99 if 'std' in prop_name else 0
+                        prop = self.get_centroid_result(prop_name, centroid_type, fill_value=fval)
+                        colname = prop_name if common_prop else prop_name+'_'+centroid_type
+                        tab[colname] = np.around(prop, 3)
+                    
+            fname = os.path.join(save_path, 'centroid_analysis_%s%s.txt'%(self.name, suffix))
+            tab.write(fname, format='ascii', delimiter=' ', overwrite=True)
+
+            print("Save centroid measurement as catalog: ", fname)
     
             
     def construct_control(self, Num_v, mag_cut=None, mag0=25.2, dist_cut=25, bootstraped=False, n_boot=100):
