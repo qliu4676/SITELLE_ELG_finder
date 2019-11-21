@@ -39,12 +39,12 @@ from photutils.utils import make_random_cmap, NoDetectionsWarning
 rand_state = 12345
 rand_cmap = make_random_cmap(3000, random_state=rand_state)
 rand_cmap.set_under(color='black')
+rand_cmap.colors[0] = [0,0,0]
 
 import warnings
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     warnings.warn("no detection", NoDetectionsWarning)
-
 
 ############################################
 # Basic
@@ -249,8 +249,9 @@ def moving_average(x, w=5):
     """ 1D moving average"""
     return np.convolve(x, np.ones(w), 'valid') / w
 
-def moving_average_cube(cube, box=(3,3,3), mask=None):
+def moving_average_cube(cube, box=[3,3,3], mask=None):
     """ 3D moving average on cube"""
+    box[2] = box[2]//2 * 2 + 1
     out = convolve(cube, np.ones(box), mask=mask,
                    nan_treatment='fill', normalize_kernel=True)
     return out
@@ -260,13 +261,21 @@ def moving_average_by_col(icol, cube, w=5):
     y = np.array([moving_average(row, w=w) for row in rows])
     return y 
 
-def background_sub_SE(field, mask=None, b_size=128, f_size=3, n_iter=10):
+
+def convolve2D_cube(i, cube, kernel, mask=None, nan_treatment='fill'):
+    """ 2D convolution on cube"""
+    output = convolve(cube[i], kernel, mask=mask,
+                      nan_treatment=nan_treatment, normalize_kernel=True)
+    return output
+
+
+def background_sub_SE(field, mask=None, b_size=128, f_size=3, maxiters=10):
     """ Subtract background using SE estimator with mask """ 
     from photutils import Background2D, SExtractorBackground
     try:
         Bkg = Background2D(field, mask=mask, bkg_estimator=SExtractorBackground(),
-                           box_size=(b_size, b_size), filter_size=(f_size, f_size),
-                           sigma_clip=SigmaClip(sigma=3., maxiters=n_iter))
+                           box_size=b_size, filter_size=f_size,
+                           sigma_clip=SigmaClip(sigma=3., maxiters=maxiters))
         back = Bkg.background
         back_rms = Bkg.background_rms
     except ValueError:
@@ -291,6 +300,25 @@ def display_background_sub(field, back, vmax=1e3):
     plt.tight_layout()
     return fig
 
+def inspec_spaxel(x,y, raw_datacube, w=2, wavl_mask=None, wcs=None):
+    from matplotlib import patches
+    if wcs is not None:
+        ra, dec = wcs.all_pix2world(x,y,0)
+        print("RA DEC : %.4f, %.4f"%(ra, dec))
+    i, j = y, x
+    plt.figure(figsize=(10,3))
+    ax1=plt.subplot2grid((1, 3), (0, 0), colspan=2)
+    plt.plot(raw_datacube.wavl, raw_datacube.datacube_bkg_sub[:,i-w:i+w+1,j-w:j+w+1].sum(axis=1).sum(axis=1), label='bkg sub')
+    plt.plot(raw_datacube.wavl, raw_datacube.cube_process[:,i-w:i+w+1,j-w:j+w+1].sum(axis=1).sum(axis=1), label='fg sub')
+    if wavl_mask is not None:
+        for wavl_ma in np.atleast_2d(wavl_mask):
+            plt.axvspan(wavl_ma[0],wavl_ma[1],color='gray',alpha=0.15)
+    plt.legend()
+    ax2=plt.subplot2grid((1, 3), (0, 2))
+    plt.imshow(raw_datacube.stack_field[i-2*w:i+2*w+1,j-2*w:j+2*w+1], norm=norm1, origin="lower", vmin=0, vmax=3)
+    rec = patches.Rectangle((w*3//2-1-0.5,w*3//2-1-0.5), 2*w+1, 2*w+1, edgecolor='r', linewidth=2, facecolor='none')
+    ax2.add_patch(rec)
+    plt.show()
 
 ############################################
 # Measurement
@@ -376,6 +404,7 @@ class Obj_detection:
 
         self.seg_thumb = seg_map[x_min:(x_max+1), y_min:(y_max+1)]
         self.seg_tot = (self.seg_thumb==num) | (self.seg_thumb==0)
+        self.seg_sky = (self.seg_thumb==0)
         self.seg_obj = (self.seg_thumb==num)
 
         self.cube_thumb = cube[:,x_min:(x_max+1), y_min:(y_max+1)]
@@ -424,8 +453,8 @@ class Obj_detection:
         area_annu = m1.to_image(self.img_thumb.shape)
         area_annu[self.mask_thumb] = 0
 
-        bkg = self.img_thumb[np.logical_and(area_annu>=0.5,self.seg_tot)]
-        signal = self.img_thumb[np.logical_and(area_aper>=0.5,self.seg_tot)]
+        bkg = self.img_thumb[np.logical_and(area_annu>=0.5, self.seg_sky)]
+        signal = self.img_thumb[np.logical_and(area_aper>=0.5, self.seg_tot)]
         n_pix = len(signal)
         
         if (len(signal)==0)|(len(bkg)==0):
@@ -656,7 +685,7 @@ def use_broad_window(sigma, line_ratio, SNR,
                      temp_type="Ha-NII",
                      temp_model="gauss"):
     
-    strong_NII = (temp_type=="Ha-NII")&(line_ratio.max()/3 < 3)
+    strong_NII = (temp_type=="Ha-NII") and (line_ratio.max()/3 < 3)
     broad_line = (sigma>sigma_thre)|(temp_model=="box")
     high_SN = (SNR>=sn_thre)
     
@@ -1021,9 +1050,9 @@ def xcor_SNR(res, wavl_rebin,
         axb.set_xlabel("Redshift",fontsize=14)      
     
     result_cc = {}
-    for (prop, vals) in zip(["ccf", "rv", "z_best", "sigma_best", 
+    for (prop, vals) in zip(["ccf", "rv", "z_best", "sigma_best", "ratio_best", 
                             "R", "contrast", "SNR", "SNR_p", "flag_e"],
-                           [ccs[best], rv, z_best, sig_best, Rs[best], 
+                           [ccs[best], rv, z_best, sig_best, ratio_best, Rs[best], 
                             Contrasts[best], SNRs[best], SNR_ps[best], flag_edge]):
 #                            [ccs, rv, z_ccs, Rs, Contrasts, SNRs, SNR_ps, flag_edge]):
         result_cc[prop] = vals
@@ -1033,8 +1062,9 @@ def xcor_SNR(res, wavl_rebin,
 
 def measure_dist_to_edge(table, mask_edge, pad=200,
                          Xname="xcentroid", Yname="ycentroid"):
-    """ Measure distance of each detection to the edges of the field.
-        This is to reduce some spurious detection around edges."""
+    """ Measure distance of each detection to the edges of the field
+        to reduce some spurious detection around edges.
+        Detection with X or Y far away from edges will not be calculated for efficiency."""
     
     shape = mask_edge.shape
     # Note photutils is 0-based while DS9 and SExtractor is 1-based
@@ -1051,18 +1081,20 @@ def measure_dist_to_edge(table, mask_edge, pad=200,
     return dist_edge
     
 def estimate_EW(spec, wavl, z, 
-                lam_0=6563., sigma=5, edge=20,
+                lam_0=6563., sigma=5, edge=10,
                 MC_err=False, n_MC=250, spec_err=0.15, 
                 cont=None, ax=None, plot=True):
     """ Estimate Equivalent Width of the line(s) """
     
     # window range to estimate EW. Filter edges excluded.
-    not_at_edge = (wavl>wavl.min()+edge) & (wavl<wavl.max()-edge)
-    line_range = (wavl > lam_0*(1+z)-10*sigma) & (wavl < lam_0*(1+z)+10*sigma) & not_at_edge
+    not_at_edge = lambda x: (wavl>wavl.min()+x) & (wavl<wavl.max()-x)
+    line_range = (wavl > lam_0*(1+z)-8*sigma) & (wavl < lam_0*(1+z)+8*sigma) & not_at_edge(edge)
     
     # estimate conitinum if not given
     if cont is None:
-        cont = np.median(spec[(~line_range) & not_at_edge])
+        y_cont = spec[(~line_range) & not_at_edge(2*edge)]
+        y_cont = sigma_clip(y_cont, sigma=3, maxiters=10)
+        cont = np.mean(y_cont)
     
     # EW = intg{F_l / F_0 - 1} (EW>0: emission)
     x = wavl[line_range]
@@ -1071,10 +1103,15 @@ def estimate_EW(spec, wavl, z,
     
     if MC_err is True:
         if np.ndim(spec_err)==0:
-            y_err = spec_err*(abs(y-cont))
+#             y_std = mad_std(y_cont)
+            y_std = np.std(y_cont)
+            y_err = y_std * np.ones(line_range.sum())
+            
+#             y_err = spec_err*(abs(y-cont))/cont
         else:
             y_err = spec_err[line_range]
-        EW_err = [np.trapz(y=(y+np.random.normal(0, scale=y_err))/cont-1, x=x) for i in range(n_MC)]
+
+        EW_err = [np.trapz(y=y+np.random.normal(0, scale=y_err), x=x) for i in range(n_MC)]
         EW_std = np.std(EW_err)
     else:
         EW_std = np.nan
@@ -1308,8 +1345,8 @@ def measure_offset_isoF(seg_obj, img_em, img_con,
 
 
 def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
-                        std_map_em=None, std_map_con=None,
-                        niter_iso=15, ctol_iso=0.01, n_dilation=2, fwhm=3):
+                        std_map_em=None, std_map_con=None, sn_thre=1.5,
+                        niter_iso=3, ctol_iso=0.01, n_dilation=1, fwhm=3):
     
     """ Measure centroid with deformable isophote """
     
@@ -1319,36 +1356,55 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
     
     sigma = fwhm * gaussian_fwhm_to_sigma
     kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
-    
-    thresh_em = detect_threshold(img_em, nsigma=2)
-    thresh_con = detect_threshold(img_con, nsigma=2)
+
+    # masked pixels are true
+    thre_em = detect_threshold(img_em, nsigma=sn_thre, mask=~obj.seg_sky)
+    thre_con = detect_threshold(img_con, nsigma=sn_thre, mask=~obj.seg_sky)
     
     seg_obj = obj.seg_obj
+    
+#     if morph_cen is True:
+#     seg_obj = convolve(obj.seg_obj, kernel, normalize_kernel=True) > 0.5
+        
     mask_em, mask_con = ~seg_obj.copy(), ~seg_obj.copy()
     
-    for d, (img, mask, thresh) in enumerate(zip([img_em, img_con], [mask_em, mask_con], [thresh_em, thresh_con])):
+    for d, (img, mask, thre) in enumerate(zip([img_em, img_con], [mask_em, mask_con], [thre_em, thre_con])):
         x, y = obj.center_pos
         for n in range(niter_iso):
-            segm = detect_sources(img, thresh, npixels=5, mask=mask)
+            # masked pixels are true
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', NoDetectionsWarning)
+                segm = detect_sources(img, thre, npixels=5, mask=mask)
+            
+#             img2 = img.copy()
+#             img2[mask] = 0
+#             plt.imshow(img2, vmin=0, vmax=1,norm=norm1, cmap='viridis' if d==0 else 'hot')
+#             plt.show()
+            
             if segm is None:
                 return None
                 
-#             seg_new = convolve(segm.data, kernel, normalize_kernel=True) > 0.5
 #             seg_new = dilation(segm.data)
-            
             seg_new = segm.data
-            for i in range(n_dilation):
-                seg_new = dilation(seg_new)
+            
+            if morph_cen is True:
+                seg_new = convolve(seg_new, kernel, normalize_kernel=True) > 0.5
             
             data = img * seg_new
             x_new, y_new = centroid_com(data)
 
             reach_ctol = (math.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_iso)   
+            x, y = x_new, y_new
+                
             if reach_ctol:
                 break
             else:
-                mask = np.logical_not(seg_new*obj.seg_tot)
-                x, y = x_new, y_new
+                for i in range(n_dilation):
+                    seg_new = dilation(seg_new)
+                    
+                # new mask is the new segmentation removing nearby sources
+#                 mask = np.logical_not(seg_new*obj.seg_sky)
+                mask = np.logical_not(seg_new * obj.seg_tot)
                 
         if d==0:
             seg_obj_em = ~mask
@@ -1392,7 +1448,7 @@ def measure_local_sky_noise(obj, image_list, k1=5, k2=8, sig_clip=3):
         annu = ma_annu.to_image(image.shape)
 
         # Sky background in the annulus (nearby objects masked)
-        bkg = image[np.logical_and(annu, obj.seg_tot)]
+        bkg = image[np.logical_and(annu, obj.seg_sky)]
         std = np.std(sigma_clip(bkg, sigma=sig_clip, maxiters=10, axis=0))
         std_s = np.append(std_s, std)
 
@@ -1421,33 +1477,30 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             k_apers=[2,5,8], multi_aper=True,
                             aper_size=[0.7,0.85,1.15,1.3,1.],
                             niter_aper=15, ctol_aper=0.01,
-                            niter_iso=15, ctol_iso=0.01, n_dilation=2, morph_cen=False,
+                            niter_iso=15, ctol_iso=0.01,
+                            sn_thre=1.5, n_dilation=1, morph_cen=False,
                             line_stddev=3, line_ratio=None, mag0=25.2,
                             affil_map=None,
                             plot=True, verbose=True,
                             fwhm=3, smooth=False,
                             uncertainty=True, 
-                            return_for_plot=False, **kwargs):    
+                            return_image=False, **kwargs):    
     """ Compute the centroid of emission and continua, and plot """
     
     # Window width of lines
-    w_l, w_l2 = line_stddev * 3, line_stddev * 5
-    
-#     if (line_ratio<3) & (line_stddev>5):
+    w_l = line_stddev * 3
     em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
-#     else: 
-#         em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
         
     # Emission channels
     em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
     
     # Continuum channels
     con = (~em) & (wavl > wavl[0]+edge) & (wavl < wavl[-1]-edge) \
-                & ((wavl > (6584.+w_l2)*(1+z_cc)) | (wavl < (6548.-w_l2)*(1+z_cc)))
+                & ((wavl > (6584.+w_l)*(1+z_cc)) | (wavl < (6548.-w_l)*(1+z_cc)))
     
     if smooth:
         sigma = fwhm * gaussian_fwhm_to_sigma
-        kernel = Gaussian2DKernel(sigma, x_size=5, y_size=5)
+        kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
         cube_thumb_sm = np.empty_like(obj.cube_thumb)
         for k in range(obj.cube_thumb.shape[0]):
             cube_thumb_sm[k] =  convolve(obj.cube_thumb[k], kernel, normalize_kernel=True)
@@ -1456,7 +1509,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         cube = obj.cube_thumb
     
     # Make emission image and continuum image from datacube
-    cube_con_clip = sigma_clip(cube[con,:,:], sigma=3, maxiters=10, axis=0)
+    cube_con_clip = sigma_clip(cube[con,:,:], sigma=3, maxiters=20, axis=0)
     img_con = np.mean(cube_con_clip, axis=0).data
     
     if sum_type=="mean":
@@ -1489,10 +1542,11 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         
     elif centroid_type == 'ISO-D':
         res_cen = measure_offset_isoD(obj, img_em, img_con, morph_cen=morph_cen,
-                                      std_map_em=std_map_em, std_map_con=std_map_con)
+                                      std_map_em=std_map_em, std_map_con=std_map_con, sn_thre=sn_thre)
        
     elif centroid_type == 'ISO-F':
-        res_cen = measure_offset_iso(obj.seg_obj, img_em, img_con, 
+        seg_obj = dilation(obj.seg_obj)
+        res_cen = measure_offset_isoF(seg_obj, img_em, img_con, 
                                      std_map_em=std_map_em, std_map_con=std_map_con)
     else:
         raise NameError('Not given centorid_type')
@@ -1539,6 +1593,10 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                    "pa":pa, "clus_cen_angle":clus_cen_angle,
                    "dist_clus_cen":dist_clus_cen}
     
+    if return_image:
+        res_measure['img_em'] = img_em
+        res_measure['img_con'] = img_con
+    
     ###-----------------------------------###
     
     if plot:
@@ -1547,13 +1605,14 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         kernel = Gaussian2DKernel(sigma, x_size=3, y_size=3)
         seg_em = res_cen["seg_em"]
         data_em = convolve(img_em, kernel, normalize_kernel=True) * seg_em
-        seg_obj = obj.seg_obj #convolve(obj.seg_obj, kernel, normalize_kernel=True) > 0.5
+        seg_obj = obj.seg_obj
+#         seg_obj = convolve(seg_obj, kernel, normalize_kernel=True) > 0.5
         
         if centroid_type=="APER":
             aper_em, aper_con = res_cen["aper_em"], res_cen["aper_con"]
             aper_ems_eff, aper_cons_eff = res_cen["aper_ems_eff"], res_cen["aper_cons_eff"]
         
-        plt.figure(figsize=(13,9))
+        plt.figure(figsize=(15,10))
         ax0 = plt.subplot2grid((2, 3), (0, 0), colspan=3, rowspan=1)
         ax0.plot(wavl, spec, "k",alpha=0.7,lw=3)
         ax0.plot(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=3)
@@ -1566,17 +1625,17 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         ax0.text(0.85,0.85,"z = %.3f"%z_cc,color="k",fontsize=20,transform=ax0.transAxes)
 
         ax1 = plt.subplot2grid((2, 3), (1, 0), colspan=1, rowspan=1)
-        s1 = ax1.imshow(img_em, origin="lower",cmap="viridis",vmin=0.00, vmax=0.5, norm=norm1)
+        s1 = ax1.imshow(img_em, origin="lower",cmap="viridis",vmin=0.0, vmax=0.1, norm=norm0)
         colorbar(s1)
 
         ax2 = plt.subplot2grid((2, 3), (1, 1), colspan=1, rowspan=1)
-        s2 = ax2.imshow(img_con, origin="lower",cmap="hot",vmin=0.00, vmax=0.5, norm=norm2)
+        s2 = ax2.imshow(img_con, origin="lower",cmap="hot",vmin=0.00, vmax=0.1, norm=norm0)
         colorbar(s2)
         
         ax3 = plt.subplot2grid((2, 3), (1, 2), colspan=1, rowspan=1)
         
         if hasattr(obj, 'deep_thumb'):
-            s=ax3.imshow(obj.deep_thumb, origin="lower", cmap="gray", vmin=0.5, vmax=1000, norm=norm3)
+            s=ax3.imshow(obj.deep_thumb, origin="lower", cmap="gray", vmin=0.5, vmax=3e3, norm=norm3)
             colorbar(s)
         xlim,ylim = ax3.get_xlim(), ax3.get_ylim()
         if centroid_type == "APER":
@@ -1597,10 +1656,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             
         ax3.contour(data_em, colors="skyblue", alpha=0.9, linewidths=2,
                     levels = [0.1*data_em.max(),0.4*data_em.max(),0.7*data_em.max(),data_em.max()])
-        
-#         ax3.set_xlim(xlim)
-#         ax3.set_ylim(ylim)
-        
+
         # Ticks
         tick_base = 10 if img_em.shape[0]<100 else 20
         loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
@@ -1624,19 +1680,16 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
                  head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
         
-        ax2.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=18,transform=ax.transAxes)
-        ax2.text(0.05,0.12,r"$\bf \Delta\,d:{\ }%.1f$"%offset,color="lavender",fontsize=18,transform=ax.transAxes)
+        ax3.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax3.transAxes)
+        ax3.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=14,transform=ax3.transAxes)
         #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
         #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
         if np.ndim(coord_BCG)>0:
             text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
             ax2.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
-        plt.subplots_adjust(left=0.05,right=0.95,top=0.95, bottom=0.05, wspace=0.25, hspace=0.2)
+        plt.subplots_adjust(left=0.08,right=0.95,top=0.95, bottom=0.05, wspace=0.35, hspace=0.2)
     
-    if return_for_plot:
-        return (em, con), (img_em, img_con), data_em, (aper_em, aper_con), ((x1,y1),(x2,y2))
-    else:
-        return res_measure
+    return res_measure
 
     
 def measure_pa_offset(pos1, pos2, std_pos1=None, std_pos2=None, origin=0):

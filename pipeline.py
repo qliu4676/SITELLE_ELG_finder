@@ -138,13 +138,13 @@ class DeepFrame:
             mask = (segmap2!=0) | (self.mask_edge)
         
         # Subtract background, mask SE detections if has a first run
-        back, back_rms = background_sub_SE(field, mask=mask, b_size=b_size, f_size=3, n_iter=20)
+        back, back_rms = background_sub_SE(field, mask=mask, b_size=b_size, f_size=3, maxiters=20)
         field_sub = field - back
         
         if display:
             display_background_sub(field, back, vmax=1e3)
         if plot:
-            check_save_path(save_path)
+            check_save_path(save_path, clear=True)
             hdu_new = fits.PrimaryHDU(data=field_sub, header=self.header)
             hdu_new.writeto(os.path.join(save_path, '%s_DF%s.fits'%(self.name, suffix)), overwrite=True)
             print("Saved background subtracted image as %s_DF%s.fits"%(self.name, suffix))
@@ -198,7 +198,7 @@ class DeepFrame:
         
         
 
-def Read_Raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550]):
+def Read_Raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550], wavl_mask=None):
     """ 
     Read raw SITELLE datacube.
     
@@ -213,13 +213,13 @@ def Read_Raw_SITELLE_datacube(file_path, name, wavn_range=[12100, 12550]):
     raw_datacube: raw SITTLE datacube class.
     
     """
-    raw_datacube = Raw_Datacube(file_path, name, wavn_range=wavn_range)
+    raw_datacube = Raw_Datacube(file_path, name, wavn_range=wavn_range, wavl_mask=wavl_mask)
     return raw_datacube
 
 class Raw_Datacube: 
     """ A class for raw SITTLE datacube """
     
-    def __init__(self, file_path, name, wavn_range):
+    def __init__(self, file_path, name, wavn_range, wavl_mask=None):
         self.hdu = fits.open(file_path)
         self.header = self.hdu[0].header
         self.name = name
@@ -246,6 +246,15 @@ class Raw_Datacube:
         
         # Field edge/saturations to be masked
         self.mask_edge = self.raw_stack_field < 5 * mad_std(self.raw_stack_field)
+        
+        # Masked channels making stack
+        if wavl_mask is not None:
+            _, mask_wl = self.get_channel(wavl_mask)
+            print(wavl_mask," will be masked in making maximum map.")
+        else:
+            mask_wl = np.zeros(self.shape[0], dtype=bool)
+        self.wavl_mask = wavl_mask
+        self.mask_wl = mask_wl
         
         # Modify the fits for saving the new cube
         self.header_new = self.header.copy()
@@ -280,19 +289,19 @@ class Raw_Datacube:
     
     @property
     def stack_field(self):
-        return self.cube_process.sum(axis=0)
+        return self.cube_process[~self.mask_wl].sum(axis=0)
         
-    def remove_background(self, box_size=128, filter_size=3, n_iter=10, save_path='./bkg/', plot=False):
+    def remove_background(self, box_size=128, filter_size=3, maxiters=10, save_path='./bkg/', plot=False):
         """ Remove background (low-frequency component) using SEXtractor estimator (filtering + mode) """
         if plot:
-            check_save_path(save_path)
+            check_save_path(save_path, clear=True)
         
         self.datacube_bkg_sub = np.empty_like(self.raw_cube)
         for i, field in enumerate(self.raw_cube):
             if np.mod(i+1, 10)==0: print("Removing background... Channel: %d"%(i+1))
             
             back, back_rms = background_sub_SE(field, mask=self.mask_edge,
-                                               b_size=box_size, f_size=filter_size, n_iter=n_iter)
+                                               b_size=box_size, f_size=filter_size, maxiters=maxiters)
             field_sub = field - back
 
             self.datacube_bkg_sub[i] = field_sub
@@ -305,17 +314,20 @@ class Raw_Datacube:
                 
         self.cube_process = self.datacube_bkg_sub.copy()
     
-    def get_channel(self, wavl_intp_range):
-        x = np.zeros_like(self.wavl, dtype=bool)
+    def get_channel(self, wavl_intp_range=None):
+        if wavl_intp_range is None:
+            wavl_intp_range =  [self.wavl[0], self.wavl[-1]]
+            
+        mask = np.zeros_like(self.wavl, dtype=bool)
         for w_range in np.atleast_2d(wavl_intp_range):
-            x[(w_range[0]<self.wavl) & (self.wavl<w_range[1])] = True
-        channel = np.where(x)[0] + 1
-        return channel
+            mask[(w_range[0]<=self.wavl) & (self.wavl<=w_range[1])] = True
+        channel = np.where(mask)[0] + 1
+        return channel, mask
             
     def interp_bad_channel(self, wavl_intp_range=[7980,7995], interp=False):
         """ Interpolate bad channels, e.g. suffering from strong fringes, from adjacent channels """
         cube = self.datacube_bkg_sub.copy()
-        bad_channel = self.get_channel(wavl_intp_range=wavl_intp_range)
+        bad_channel, bad = self.get_channel(wavl_intp_range=wavl_intp_range)
         if len(bad_channel)>0:
             if not interp:
                 return bad_channel
@@ -326,47 +338,105 @@ class Raw_Datacube:
             for i in range(self.shape[1]):
                 for j in range(self.shape[2]):
                     y_good = cube[:,i,j][~bad]
-                    cube[bad,i,j] = np.interp(bad_channel, good_channel, cube[:,i,j][~bad])\
-                                            + np.random.normal(scale=mad_std(y_good),size=len(bad_channel))
+                    cube[bad,i,j] = np.interp(bad_channel, good_channel, cube[:,i,j][~bad])
+                                            #\+ np.random.normal(scale=mad_std(y_good),size=len(bad_channel))
             self.cube_process = cube
-            return bad_channel
+            return cube
         else:
             print("No bad channles.")
             self.cube_process = cube
             return None
     
         
-    def remove_fringe(self, channels=None, sn_source=3,
-                      box_size=8, filter_size=1, n_iter=20, save_path='./bkg/', plot=False):
+    def remove_fringe(self, channels=None, sn_source=3, n_iter=3,
+                      k_size=(12,3), box_size=16, filter_size=1, maxiters=10,
+                      method='SE', save_path='./bkg/',
+                      verbose=False, parallel=False, clear=True, plot=False):
         """ Clean (fringe and artifacts) for specified channels """
-        if channels is None: return None
+        if channels is None:
+            return None
         
         if plot:
-            check_save_path(save_path)
-        
-        mask_source, segmap = make_mask_map(self.stack_field, sn_thre=sn_source, b_size=128)
-        mask = dilation((self.mask_edge) | (mask_source))
-        
-        self.datacube_bkg_fg_sub = self.cube_process.copy()
-        for k in channels:
-            field = self.cube_process[k-1]
-            print("Cleaning Channel: %d"%k)
-                
-            back, back_rms = background_sub_SE(field, mask=mask,
-                                               b_size=box_size, f_size=filter_size, n_iter=n_iter)
-            self.datacube_bkg_fg_sub[k-1] = field - back
+            check_save_path(save_path, clear=clear)
+            
+        print("Run iteration to clean fringes for channels: \n", channels)
+        if len(channels)>20: parallel = True
+        inds = np.atleast_1d(channels)-1
 
-            # Save fringe subtraction
-            if plot:
-                fig = display_background_sub(field, back, vmax=1)
-                plt.savefig(os.path.join(save_path, "fg_sub_channel%d.png"%k),dpi=100)
-                plt.close(fig)  
+        kernel = Gaussian2DKernel(k_size[0],k_size[1])
+        
+        stack_field = self.datacube_bkg_sub.sum(axis=0) if method=="SE" else self.stack_field
+        n_source = 0
+        
+        if (method=="LPF") & parallel:
+            from parallel import parallel_compute
+            from functools import partial
+            if verbose:
+                print("'\nRun low-pass filtering in parallel. Used when run on >20 channels.")
+
+        for n in range(n_iter):
+            # In every iteration, detect, count and mask sources
+            # The cube does not change but the stack field is inherited from previous iteration
+            # Final fringe (small-scale background) subtraction depends on the final stack field
+            if verbose:
+                print("Iteration %d : %d sources detected."%(n+1, n_source))
+                
+            self.cube_process = self.datacube_bkg_sub.copy()
+            
+            mask_source, segmap = make_mask_map(stack_field, sn_thre=sn_source, b_size=128)
+            mask = (self.mask_edge) | (mask_source)
+            
+            n_source_new = segmap.max()
+            stable_source_SE = (abs(n_source-n_source_new)/n_source_new < 0.05)
+            
+            # if < 5% new sources are detected, or reach max_iter, break
+            break_cond = (stable_source_SE) | (n+1==n_iter)
+            
+            if (method=="LPF") & parallel:
+                
+                p_convolve2D_cube = partial(convolve2D_cube,
+                                            cube=self.cube_process.copy(),
+                                            kernel=kernel, mask=mask)
+                backs = parallel_compute(inds, p_convolve2D_cube,
+                                         lengthy_computation=True, verbose=False)
+                for i, ind in enumerate(inds):
+                    backs[i][self.mask_edge] = 0
+                    self.cube_process[ind] -= backs[i]
                     
-        self.cube_process = self.datacube_bkg_fg_sub.copy()
+            else:
+                backs = np.zeros_like(self.cube_process)
+                for i, ind in enumerate(inds):
+                    field = self.cube_process[ind].copy()
+                    
+                    if method=="LPF":
+                        backs[i] = convolve(field, kernel, mask=mask, normalize_kernel=True)
+                        backs[i][self.mask_edge] = 0
+
+                    elif method=="SE":    
+                        backs[i], _ = background_sub_SE(field, mask=mask,
+                                                        b_size=box_size, f_size=filter_size, maxiters=20)
+
+                    self.cube_process[ind] = field - backs[i]
+
+            if break_cond :
+                if verbose: print("\nIteration finished.")
+                # Save fringe subtraction
+                if plot:
+                    for i, ind in enumerate(inds):
+                        fig = display_background_sub(self.datacube_bkg_sub[ind], backs[i], vmax=1)
+                        plt.savefig(os.path.join(save_path, "fg_sub_channel%d.png"%(i+1)),dpi=80)
+                        plt.close(fig)
+                break
+            
+            # new stack field and # of sources
+            n_source = n_source_new
+            stack_field = self.stack_field
+            
+        self.datacube_bkg_fg_sub = self.cube_process.copy()
                     
     def save_fits(self, save_path = './', suffix=""):
-        """Write Stacked Image and Datacube after background & fringe subtraction"""
-        print("Saving background & fringe subtracted datacube and stacked field...")
+        """Write processed datacube and stacked Image subtraction"""
+        print("Saving processed datacube and stacked field...")
         
         check_save_path(save_path)
         
@@ -401,7 +471,8 @@ class Read_Datacube:
     """
     
     def __init__(self, cube_path, name, mode="MMA",
-                 table=None, seg_map=None, mask_edge=None,
+                 cube_supplementary=None, wavl_mask=None,
+                 table=None, seg_map=None, mask_edge=None, 
                  deep_frame=None, z0=None):
         
         self.name = name
@@ -412,11 +483,10 @@ class Read_Datacube:
         self.DEC = self.header["TARGETD"]
         
         self.cube = self.hdu[0].data
-        self.stack_field = self.cube.sum(axis=0)
         self.shape = self.cube.shape
         self.mode = mode
         
-        if (mode=="MMA")|(mode=="m2"):            
+        if (mode=="MMA"):            
             if table is not None:
                 self.table = Table.read(table, format='ascii')
         elif mode=="APER":
@@ -424,18 +494,21 @@ class Read_Datacube:
             self.table = Table.read(table, format="ascii.sextractor")
                          
         else:
-            raise ValueError("Choose an extraction mode: 'MMA' or 'm2' or 'APER' ('APER' requires SExtractor output)")
+            raise ValueError("Choose an extraction mode: 'MMA' or 'APER' ('APER' requires SExtractor output)")
         
         try:
-            self.seg_map = fits.open(seg_map)[0].data
+            self.seg_map = fits.getdata(seg_map)
         except ValueError:
             self.seg_map = None
+            
+        if cube_supplementary is not None:
+            self.cube_sup = fits.getdata(cube_supplementary)
         
         if mask_edge is not None:
-            self.mask_edge = fits.open(mask_edge)[0].data.astype('bool')
+            self.mask_edge = fits.getdata(mask_edge).astype('bool')
             
         if deep_frame is not None:
-            self.deep_frame = fits.open(deep_frame)[0].data
+            self.deep_frame = fits.getdata(deep_frame)
         else:
             self.deep_frame = None
         
@@ -450,19 +523,21 @@ class Read_Datacube:
         # Effective data range from 12100 cm^-1 to 12550 cm^-1 
         self.wavl = 1./self.wavn[::-1]*1e8
         self.d_wavl = np.diff(self.wavl).mean()
+                
+        # Masked channels making stack
+        if wavl_mask is not None:
+            _, mask_wl = self.get_channel(wavl_mask)
+            print(wavl_mask," are affected by edge / fringes.")
+        else:
+            mask_wl = np.zeros(self.shape[0], dtype=bool)
+        self.mask_wl = mask_wl
+        self.wavl_mask = wavl_mask
         
         # For generating different templates 
         self.Temp_Lib = {}
         self.wavl_temps = {}
         self.Stddev_Temps = {}
         self.Line_Ratios_Temps = {}
-        
-        # Fot CC using different templates
-#         self.CC_zccs_Temps = {}
-#         self.CC_Rs_Temps = {}
-#         self.CC_SNRs_Temps = {}
-#         self.CC_SNR_ps_Temps = {}
-#         self.CC_flag_edge_Temps = {}
         
         self.CC_result_Temps  = {}
         self.result_centroid = {}
@@ -475,6 +550,10 @@ class Read_Datacube:
         else:
             self.wcs = WCS(self.header,naxis=2)
         return self.wcs
+    
+    @property
+    def stack_field(self):
+        return self.cube[~self.mask_wl].sum(axis=0)
 
     def get_centroid(self, num, Xname="xcentroid", Yname="ycentroid"):
         """ Get centorids of the cutout for a detection """
@@ -494,71 +573,81 @@ class Read_Datacube:
             image = self.stack_field
         return get_cutout(num, self.table, image, **kwargs) 
     
-    def get_channel(self, wavl_intp_range):
-        x = np.zeros_like(self.wavl, dtype=bool)
+    def get_channel(self, wavl_intp_range=None):
+        if wavl_intp_range is None:
+            wavl_intp_range =  [self.wavl[0], self.wavl[-1]]
+        mask = np.zeros_like(self.wavl, dtype=bool)
         for w_range in np.atleast_2d(wavl_intp_range):
-            x[(w_range[0]<self.wavl) & (self.wavl<w_range[1])] = True
-        channel = np.where(x)[0] + 1
-        return channel
+            mask[(w_range[0]<=self.wavl) & (self.wavl<=w_range[1])] = True
+        channel = np.where(mask)[0] + 1
+        return channel, mask
     
-    def ISO_source_detection(self, sn_thre=2.5, npixels=8,
-                             nlevels=64, contrast=0.01, closing=True,
+    def ISO_source_detection(self, sn_thre=3, npixels=8, b_size=128,
+                             nlevels=64, contrast=0.01, closing=False,
                              add_columns=['equivalent_radius'],
-                             box=(3,3,3), parallel=False, mask_map=None,
-                             save=True, save_path = './', suffix=""):
+                             box=[3,3,3], seeing=1, mask_map=None,
+                             parallel=False, save=True, save_path = './', suffix=""):
         """ Source Extraction based on Isophotal of S/N """
         from skimage import morphology
         from photutils import source_properties
         
         # Pixel-wise manipulation in wavelength
         
+        mask_edge_cube = np.repeat(self.mask_edge[np.newaxis, :, :], self.shape[0], axis=0)
+
+        mask_wl = self.mask_wl
+        
+        # datacube used to detect source, use supplementray cube if given
+        cube_detect = getattr(self, 'cube_sup', self.cube.copy())
+        
         if self.mode == "MMA":
             print("Use the map of maximum of moving average (MMA) to detect source.")
             print("Box shape: ",box)
             
-            mask_edge_cube = np.repeat(self.mask_edge[np.newaxis, :, :], self.shape[0], axis=0)
-            
             if parallel:
                 print("Run moving average in parallel. This could be slower using few cores.")
                 
-                from usid_processing import parallel_compute
+                from parallel import parallel_compute
                 from functools import partial
-                p_moving_average_cube = partial(moving_average_by_col, cube=self.cube.copy())
+                
+                
+                p_moving_average_cube = partial(moving_average_by_col, cube=cube_detect)
                 results = parallel_compute(np.arange(self.shape[2]), p_moving_average_cube,
                                            lengthy_computation=False, verbose=True)
                 src_map = np.max(results,axis=2).T
                 
             else:
-                cube_MMA = moving_average_cube(self.cube, box=box, mask=mask_edge_cube)
-                src_map = np.max(cube_MMA, axis=0)
-                    
-        elif self.mode == "m2":
-            print("Use the map of second maximum (m2) along wavelength to detect source.")
-            src_map = np.partition(self.cube, kth=-2, axis=0)[-2]
+                cube_MA = moving_average_cube(cube_detect, box=box, mask=mask_edge_cube)
+                src_map = np.max(cube_MA[~mask_wl], axis=0)
+        elif self.mode == "stack":
+            src_map = self.stack_field
         
         # Detect + deblend source
         print("Detecting and deblending source...")
-        back, back_rms = background_sub_SE(src_map, b_size=128)
+        mask_source, _ = make_mask_map(self.stack_field, sn_thre=sn_thre, b_size=b_size)
+#         if mask_map is not None:
+#             mask_weight = fits.getdata(mask_map) < 1e-3
+        mask = dilation(self.mask_edge) | (mask_source)
+        
+        back, back_rms = background_sub_SE(src_map, mask=mask, b_size=b_size, f_size=1)
         threshold = back + (sn_thre * back_rms)
-        if mask_map is not None:
-            mask = (fits.open(mask_map)[0].data <1)
-        else:
-            mask = None
-        segm0 = detect_sources(src_map, threshold, npixels=npixels, mask=mask)
+
+        segm0 = detect_sources(src_map, threshold, npixels=npixels)
         segm = deblend_sources(src_map, segm0, npixels=npixels, nlevels=nlevels, contrast=contrast)
+        
         if closing is True:
             seg_map = morphology.closing(segm.data)
         else:
             seg_map = segm.data
         
-        # Save 2nd max map and segmentation map
+        # Save max map and segmentation map
         if save:
             check_save_path(save_path)
             src_map_name = '%s_%s%s.fits'%(self.name, self.mode, suffix)
             seg_map_name = '%s_segm_%s%s.fits'%(self.name, self.mode, suffix)
 
-            hdu_m2 = fits.PrimaryHDU(data=src_map, header=self.header)
-            hdu_m2.writeto(os.path.join(save_path, src_map_name), overwrite=True)
+            hdu_src = fits.PrimaryHDU(data=src_map, header=self.header)
+            hdu_src.writeto(os.path.join(save_path, src_map_name), overwrite=True)
             hdu_seg = fits.PrimaryHDU(data=seg_map, header=None)
             hdu_seg.writeto(os.path.join(save_path, seg_map_name), overwrite=True)
         
@@ -577,21 +666,25 @@ class Read_Datacube:
         if save:
             check_save_path(save_path)
             tab.rename_column('id', 'NUMBER')
-            tab_name = '%s_%s%s.dat'%(self.name, self.mode, suffix)
-            tab.write(os.path.join(save_path, tab_name), format='ascii', overwrite=True)
-            
+            tab_name = os.path.join(save_path,'%s_%s%s.dat'%(self.name, self.mode, suffix))
+            tab.write(tab_name, format='ascii', overwrite=True)
+            print("Finish. Saved as %s"%tab_name)
+        
         self.table = tab
         self.src_map = src_map
  
-        return src_map, segm, seg_map
+        return src_map, seg_map
     
     def ISO_spec_extraction_all(self, seg_map):
         labels = np.unique(seg_map)[1:]
+        cube_detect = getattr(self, 'cube_sup', self.cube.copy())
         
         for k, lab in enumerate(labels):
             if np.mod(k+1, 400)==0: print("Extract spectra... %d/%d"%(k+1, len(labels)))
             spec_opt = self.cube[:, seg_map==lab].sum(axis=1)
-            self.obj_specs_opt = np.vstack([self.obj_specs_opt, spec_opt]) if k>0 else [spec_opt]   
+            self.obj_specs_opt = np.vstack([self.obj_specs_opt, spec_opt]) if k>0 else [spec_opt]
+            spec_det = cube_detect[:, seg_map==lab].sum(axis=1)
+            self.obj_specs_det = np.vstack([self.obj_specs_det, spec_det]) if k>0 else [spec_det]   
         
         self.obj_nums = labels
         
@@ -692,8 +785,12 @@ class Read_Datacube:
             plt.savefig(os.path.join(save_path, "#%d.png"%n),dpi=100)
             plt.close()
             
+    @property
+    def spec_stack(self):
+        return (self.obj_specs_opt).sum(axis=0)
+    
     def fit_continuum_all(self, model='GP', save_path='./fit_cont/', plot=False, verbose=True,
-                          GP_kwds={'edge_ratio':None, 'kernel_scale':100, 'kenel_noise':1e-3}):   
+                          edge_ratio=None, kernel_scale=100, kenel_noise=1e-3):   
         """
         Fit continuum of all the extracted spectrum
 
@@ -717,13 +814,13 @@ class Read_Datacube:
         if plot:
             check_save_path(save_path, clear=True)
             
-        if (model=='GP') & (GP_kwds['edge_ratio'] is None):
+        
+        if (model=='GP') & (edge_ratio is None):
             # Stacked spectra to estimate edge ratio
-            self.spec_stack = (self.obj_specs_opt/self.obj_specs_opt.max(axis=1).reshape(-1,1)).sum(axis=0)
-            GP_kwds['edge_ratio'] = 0.5*np.sum((self.spec_stack - np.median(self.spec_stack) \
-                                            <= -2.5*mad_std(self.spec_stack))) / len(self.wavl)
+            spec_stack = self.spec_stack
+            edge_ratio = 0.5*np.sum((spec_stack-np.median(spec_stack) <= -2.5*mad_std(spec_stack))) / len(self.wavl)
             if verbose:
-                print('Fit continuum with GP. No edge_ratio is given. Use estimate = %.2f'%GP_kwds['edge_ratio'])
+                print('Fit continuum with GP. No edge_ratio is given. Use estimate = %.2f'%edge_ratio)
         
         spurious_nums = np.array([], dtype=int)
         for n in self.table["NUMBER"]:
@@ -744,15 +841,15 @@ class Read_Datacube:
                 res, cont_fit = (random_array, blank_array)
             else:    
                 if verbose:
-                    if np.mod(n, 200)==0: 
+                    if np.mod(n, 400)==0: 
                         print("Fit spectra continuum ... %d/%d"%(n, len(self.table["NUMBER"])))
                 try:   
                     # Fit continuum
-                    spec = self.obj_specs_opt[self.obj_nums==n][0]
+                    spec = self.obj_specs_det[self.obj_nums==n][0]
                     res, wavl_rebin, cont_fit = fit_continuum(spec, self.wavl, model=model, 
-                                                              edge_ratio=GP_kwds['edge_ratio'],
-                                                              kernel_scale=GP_kwds['kernel_scale'], 
-                                                              kenel_noise=GP_kwds['kenel_noise'],
+                                                              edge_ratio=edge_ratio,
+                                                              kernel_scale=kernel_scale, 
+                                                              kenel_noise=kenel_noise,
                                                               verbose=False, plot=plot)
                     if plot:
                         plt.savefig(os.path.join(save_path, "#%d.png"%n),dpi=100)
@@ -763,7 +860,7 @@ class Read_Datacube:
                     if verbose:
                         print("Spectrum #%d continuum fit failed ... Skip"%n)
             
-            self.obj_res_opt = np.vstack((self.obj_res_opt, res)) if n>1 else [res]
+            self.obj_res_det = np.vstack((self.obj_res_det, res)) if n>1 else [res]
             self.obj_cont_fit = np.vstack((self.obj_cont_fit, cont_fit)) if n>1 else [cont_fit]
         if verbose:
             print("Skip spurious detection: ",
@@ -780,15 +877,15 @@ class Read_Datacube:
         hdu_num = fits.PrimaryHDU(data=self.obj_nums)
         
         hdu_spec_opt = fits.ImageHDU(data=self.obj_specs_opt)
+        hdu_spec_det = fits.ImageHDU(data=self.obj_specs_det)
         hdu_cont_fit = fits.ImageHDU(data=self.obj_cont_fit)
-#         hdu_size = fits.BinTableHDU.from_columns([fits.Column(name="size",array=self.obj_aper_opt,format="E")])
         
-        hdu_res_opt = fits.ImageHDU(data=self.obj_res_opt)
+        hdu_res_det = fits.ImageHDU(data=self.obj_res_det)
         hdu_wavl_rebin = fits.ImageHDU(data=self.wavl_rebin)
         hdu_num_spurious = fits.ImageHDU(data=self.num_spurious)
         
-        hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_opt, hdu_cont_fit,
-                                  hdu_res_opt, hdu_wavl_rebin, hdu_num_spurious])
+        hdul = fits.HDUList(hdus=[hdu_num, hdu_spec_opt, hdu_spec_det, hdu_cont_fit,
+                                  hdu_res_det, hdu_wavl_rebin, hdu_num_spurious])
         filename = '%s-spec-%s%s.fits'%(self.name, self.mode, suffix)
         hdul.writeto(os.path.join(save_path, filename), overwrite=True)
         
@@ -803,11 +900,12 @@ class Read_Datacube:
 #         self.k_apers_cen = hdu_spec[2].data['k_aper_cen']
         
         self.obj_specs_opt = hdu_spec[1].data.copy()
-        self.obj_cont_fit = hdu_spec[2].data.copy()
+        self.obj_specs_det = hdu_spec[2].data.copy()
+        self.obj_cont_fit = hdu_spec[3].data.copy()
         
-        self.obj_res_opt = hdu_spec[3].data.copy()
-        self.wavl_rebin = hdu_spec[4].data.copy()
-        self.num_spurious = hdu_spec[5].data.copy()
+        self.obj_res_det = hdu_spec[4].data.copy()
+        self.wavl_rebin = hdu_spec[5].data.copy()
+        self.num_spurious = hdu_spec[6].data.copy()
         
         
     def generate_template(self, n_ratio=50, n_stddev=10, n_intp=2,
@@ -1018,7 +1116,7 @@ class Read_Datacube:
                 fig, axes = plt.subplots(nrows=2, ncols=1,figsize=(9,7))
         
         # Note spurious detections are skipped
-        res = self.obj_res_opt[self.obj_nums==num][0]  # Read residual spectra
+        res = self.obj_res_det[self.obj_nums==num][0]  # Read residual spectra
         
         # Read the template information, and pass to cross-correlation
         typ_mod = temp_type + "_" + temp_model
@@ -1064,7 +1162,7 @@ class Read_Datacube:
                                const_window=False, 
                                cores=None, verbose=True):
         
-        from usid_processing import parallel_compute
+        from parallel import parallel_compute
         from functools import partial
         
         CC_result = {}
@@ -1103,7 +1201,7 @@ class Read_Datacube:
                          plot=False)
         
         start = time.time()
-        results_cc = parallel_compute(self.obj_res_opt[1:], p_xcor, cores=cores,
+        results_cc = parallel_compute(self.obj_res_det[1:], p_xcor, cores=cores,
                                       lengthy_computation=False, verbose=verbose)
         end = time.time()
         if verbose:
@@ -1248,7 +1346,7 @@ class Read_Datacube:
         """Save cross-correlation results as pkl"""
         import pickle
         check_save_path(save_path)
-        filename = os.path.join(save_path, '%s-cc%s'%(self.name, suffix))
+        filename = os.path.join(save_path, '%s-cc-%s%s'%(self.name, self.mode, suffix))
         
         with open(filename + '.pkl', 'wb') as file:
             pickle.dump(self.CC_result_Temps, file, pickle.HIGHEST_PROTOCOL)
@@ -1294,7 +1392,7 @@ class Read_Datacube:
     
     def estimate_EW(self, num, z=None, sigma=None, 
                     temp_type="Ha-NII", temp_model="gauss",
-                    MC_err=True, n_MC=250, edge=20,
+                    MC_err=True, n_MC=250, edge=10,
                     use_cont_fit=False, ax=None, plot=True):
         
         id = num-1
@@ -1317,6 +1415,10 @@ class Read_Datacube:
                 sigma = self.d_wavl
             else:
                 sigma = self.CC_result_Temps[typ_mod][str(num)]['sigma_best']
+
+#         ratio_best = self.CC_result_Temps[typ_mod][str(num)]['ratio_best']
+#         if ratio_best.max()/3 < 3:
+#             sigma *= 2
         
         if z is None:
             z = self.CC_result_Temps[typ_mod][str(num)]['z_best']
@@ -1329,7 +1431,7 @@ class Read_Datacube:
         return EW, EW_std
 
     def estimate_EW_all(self, temp_type="Ha-NII", temp_model="gauss", sigma=5,
-                        MC_err=True, n_MC=250, use_cont_fit=False, edge=20):
+                        MC_err=True, n_MC=250, use_cont_fit=False, edge=10):
             
         typ_mod = temp_type + "_" + temp_model
        
@@ -1466,18 +1568,16 @@ class Read_Datacube:
     def centroid_analysis(self, num, z=None,
                           centroid_type="APER", sum_type="weighted",
                           subtract_continuum=True, from_SE=False,
-                          line_width=None, multi_aper=True, 
-                          return_for_plot=False, **kwargs):
+                          line_width=None, multi_aper=True, **kwargs):
         """Centroid analysis for one candidate.
         
         Parameters
         ----------
         num : number of object in the SE catalog
         z : candidate redshift
-        k_wid : half-width of the thumbnail (note: not to be too small)
         centroid_type : method of computing centroid position for emission and continua
             "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
-            "ISO2" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
+            "ISO-D" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
         line_width : width of emission window. Fixed for non-candidate.
         
         Returns
@@ -1489,8 +1589,8 @@ class Read_Datacube:
         
         ind = np.where(self.obj_nums==num)[0][0]
         
-        obj = Obj_detection(self.table[ind], cube=self.cube,
-                            seg_map=self.seg_map, deep_frame=self.deep_frame, mask_edge=self.mask_edge)
+        obj = Obj_detection(self.table[ind], cube=self.cube, seg_map=dilation(self.seg_map),
+                            deep_frame=self.deep_frame, mask_edge=self.mask_edge)
 
         spec = self.obj_specs_opt[ind]
 
@@ -1516,17 +1616,12 @@ class Read_Datacube:
                                               k_aper=k_aper, multi_aper=multi_aper,
                                               line_stddev=line_width, 
                                               subtract=subtract_continuum, **kwargs)
-        
-#         except (ValueError) as error:
-#             res_measure = {}
-#             if verbose:
-#                 print("Unable to compute centroid! Error raised.")
             
         return res_measure
 
     
     def centroid_analysis_all(self, Num_V, nums_obj=None,
-                              centroid_type="APER", sum_type="weighted",
+                              centroid_type="APER", sum_type="weighted", subtract=True,
                               plot=False, verbose=True, smooth=False, morph_cen=False, **kwargs):
         """Compute centroid offset and angle for all SE detections
         
@@ -1559,7 +1654,7 @@ class Read_Datacube:
             if num in Num_V:  # Candidate
                 z = self.z_best[ind]
                 line_width = self.sigma_best[ind]
-                subtract=True
+                subtract = subtract
                 multi_aper = True
                 
             else:  # For non-emission galaxies, pick a random window excluding the edge 
@@ -1571,12 +1666,12 @@ class Read_Datacube:
                 multi_aper = False
                 
             res_measure = self.centroid_analysis(num, z=z,
-                                                centroid_type=centroid_type, 
-                                                line_width=line_width,
-                                                subtract_continuum=subtract,
-                                                sum_type=sum_type,
-                                                multi_aper=multi_aper,
-                                                plot=False, verbose=verbose,
+                                                 centroid_type=centroid_type, 
+                                                 line_width=line_width,
+                                                 subtract_continuum=subtract,
+                                                 sum_type=sum_type,
+                                                 multi_aper=multi_aper,
+                                                 plot=False, verbose=verbose,
                                                  smooth=smooth, morph_cen=morph_cen, **kwargs)
             if (num in Num_V) & (len(res_measure)>0):
                 if verbose:
