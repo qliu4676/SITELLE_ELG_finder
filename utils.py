@@ -263,13 +263,19 @@ def moving_average_by_col(icol, cube, w=5):
 
 
 def convolve2D_cube(i, cube, kernel, mask=None, nan_treatment='fill'):
-    """ 2D convolution on cube"""
+    """ 2D convolution on i-th channel of datacube"""
     output = convolve(cube[i], kernel, mask=mask,
                       nan_treatment=nan_treatment, normalize_kernel=True)
     return output
 
+def convolve2D(image, kernel, mask=None, nan_treatment='fill'):
+    """ 2D convolution on image"""
+    output = convolve(image, kernel, mask=mask,
+                      nan_treatment=nan_treatment, normalize_kernel=True)
+    return output
 
-def background_sub_SE(field, mask=None, b_size=128, f_size=3, maxiters=10):
+def background_sub_SE(field, mask=None, return_rms=True,
+                      b_size=128, f_size=3, maxiters=10):
     """ Subtract background using SE estimator with mask """ 
     from photutils import Background2D, SExtractorBackground
     try:
@@ -283,10 +289,15 @@ def background_sub_SE(field, mask=None, b_size=128, f_size=3, maxiters=10):
         if mask is not None:
             img[mask] = np.nan
         back, back_rms = np.nanmedian(field) * np.ones_like(field), np.nanstd(field) * np.ones_like(field)
+        
     if mask is not None:
         back *= ~mask
         back_rms *= ~mask
-    return back, back_rms
+        
+    if return_rms:
+        return back, back_rms
+    else:
+        return back
 
 def display_background_sub(field, back, vmax=1e3):
     # Display and save background subtraction result with comparison 
@@ -1088,7 +1099,7 @@ def estimate_EW(spec, wavl, z,
     
     # window range to estimate EW. Filter edges excluded.
     not_at_edge = lambda x: (wavl>wavl.min()+x) & (wavl<wavl.max()-x)
-    line_range = (wavl > lam_0*(1+z)-8*sigma) & (wavl < lam_0*(1+z)+8*sigma) & not_at_edge(edge)
+    line_range = (wavl > lam_0*(1+z)-5*sigma) & (wavl < lam_0*(1+z)+5*sigma) & not_at_edge(edge)
     
     # estimate conitinum if not given
     if cont is None:
@@ -1133,7 +1144,7 @@ def estimate_EW(spec, wavl, z,
     return EW, EW_std
 
     
-def save_ds9_region(name, obj_pos, size, color="green", origin=1):
+def save_ds9_region(name, obj_pos, size, color="green", origin=1, save_path=''):
 
     import pyregion
     
@@ -1478,7 +1489,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             aper_size=[0.7,0.85,1.15,1.3,1.],
                             niter_aper=15, ctol_aper=0.01,
                             niter_iso=15, ctol_iso=0.01,
-                            sn_thre=1.5, n_dilation=1, morph_cen=False,
+                            sn_thre=2.0, n_dilation=1, morph_cen=False,
                             line_stddev=3, line_ratio=None, mag0=25.2,
                             affil_map=None,
                             plot=True, verbose=True,
@@ -1676,9 +1687,9 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
         
         ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="lightblue",
-                 head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
+                 head_width=0.02, head_length=0.02,lw=3,transform=ax2.transAxes,alpha=0.95)
         ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
-                 head_width=0.02, head_length=0.02,lw=3,transform=ax.transAxes,alpha=0.95)
+                 head_width=0.02, head_length=0.02,lw=3,transform=ax2.transAxes,alpha=0.95)
         
         ax3.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax3.transAxes)
         ax3.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=14,transform=ax3.transAxes)
