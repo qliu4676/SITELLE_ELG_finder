@@ -11,6 +11,10 @@ from astropy.table import Table, Column, join, hstack, vstack
 from astropy.stats import mad_std
 from astroquery.vizier import Vizier
 from tqdm import tqdm
+
+import warnings
+from astropy.wcs import FITSFixedWarning
+from photutils.utils import NoDetectionsWarning
     
 from utils import *
 
@@ -391,7 +395,7 @@ class Raw_Datacube:
         if channels is None:
             return None
             
-        print("\nStart iteration to clean fringes for channels: \n", channels)
+        print("\nStart iteration to remove fringes for channels: \n", channels)
         if len(channels)>20: parallel = True
         inds = np.atleast_1d(channels)-1
 
@@ -470,7 +474,7 @@ class Raw_Datacube:
                     
     def save_fits(self, save_path = './', suffix=""):
         """Write processed datacube and stacked Image subtraction"""
-        print("Saving processed datacube and stacked field...")
+        print("Saving processed datacube and stacked field...\n")
         
         check_save_path(save_path)
         
@@ -504,7 +508,7 @@ class Read_Datacube:
 
     """
     
-    def __init__(self, cube_path, name, z0=None,
+    def __init__(self, cube_path, name, z0=None, wcs=None,
                  mode="MMA", cube_detection=None,
                  wavl_mask=None, table=None, seg_map=None,
                  deep_frame=None, mask_edge=None):
@@ -515,6 +519,7 @@ class Read_Datacube:
         self.header = self.hdu[0].header
         self.RA = self.header["TARGETR"]
         self.DEC = self.header["TARGETD"]
+        self.wcs = wcs
         
         self.cube = self.hdu[0].data
         self.shape = self.cube.shape
@@ -582,11 +587,16 @@ class Read_Datacube:
     
     def get_wcs(self, hide=True):
         """ Read WCS info from the datacube header """
-        if hide:
-            with HiddenPrints():
+        if self.wcs is None:
+            if hide:
+                with HiddenPrints():
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", FITSFixedWarning)
+#                         warnings.warn("FITSFixed", FITSFixedWarning)
+                        self.wcs = WCS(self.header,naxis=2)
+            else:
                 self.wcs = WCS(self.header,naxis=2)
-        else:
-            self.wcs = WCS(self.header,naxis=2)
+                
         return self.wcs
     
     @property
@@ -697,8 +707,10 @@ class Read_Datacube:
         
         # Meausure properties of detections
         cat = source_properties(src_map, segm)
-        columns = ['id', 'xcentroid', 'ycentroid', 'ellipticity', 'area', 'orientation'] + add_columns
-        tab = cat.to_table(columns=columns)   
+        columns = ['id', 'xcentroid', 'ycentroid', 'ellipticity', 'orientation'] + add_columns
+        tab = cat.to_table(columns=columns)
+#         ra, dec = self.wcs.all_pix2world(tab['xcentroid'], tab['ycentroid'], 0)
+#         tab['ra'], tab['dec'] = ra, dec
         for name in tab.colnames:
             if name!="id":
                 try:
@@ -783,8 +795,8 @@ class Read_Datacube:
         """
         
         id = np.where(self.table["NUMBER"]==num)[0][0]
-        obj_SE = Obj_detection(self.table[id], cube=self.cube, deep_frame=self.deep_frame,
-                               seg_map=self.seg_map, mask_edge=self.mask_edge)
+        obj_SE = Obj_detection(self.table[id], self.seg_map, cube=self.cube,
+                               deep_frame=self.deep_frame, mask_edge=self.mask_edge)
         
         if obj_SE.R_petro==0:
             if verbose: print("Error in measuring R_petro, dubious source")
@@ -947,7 +959,7 @@ class Read_Datacube:
         filename = os.path.join(save_path,
                                 '%s-spec-%s%s.fits'%(self.name, self.mode, suffix))
         hdul.writeto(filename, overwrite=True)
-        print("Save extracted spectra as %s"%filename)
+        print("Save extracted spectra as %s\n"%filename)
         
         
     def read_spec(self, file_path):
@@ -955,9 +967,6 @@ class Read_Datacube:
         hdu_spec = fits.open(file_path)
         
         self.obj_nums = hdu_spec[0].data.copy()
-        
-#         self.obj_specs_cen = hdu_spec[1].data
-#         self.k_apers_cen = hdu_spec[2].data['k_aper_cen']
         
         self.obj_specs_opt = hdu_spec[1].data.copy()
         self.obj_specs_det = hdu_spec[2].data.copy()
@@ -977,6 +986,7 @@ class Read_Datacube:
                           temp_params={'box_width':4,
                                        'sigma_max':200,
                                        'a_sinc':5},
+                          verbose=True,
                           plot=False):
         
         """
@@ -1032,7 +1042,8 @@ class Read_Datacube:
         else: print('Model type: "box" or "gauss" or "sincgauss"')
         
         num_temp = n_ratio * n_stddev
-        print("Template: %s_%s  Total Number: %d"%(temp_type, temp_model, num_temp))
+        if verbose:
+            print("Template: %s_%s  Total Number: %d"%(temp_type, temp_model, num_temp))
         
         if ratio_prior=="log-uniform":    
             # ratio of 1st peak vs 2nd peak
@@ -1580,14 +1591,14 @@ class Read_Datacube:
 
         if hasattr(self, "src_map"):
             cutout = self.get_cutout(num, self.src_map, bounds=bounds, cen_pos=(X_cen, Y_cen))
-            ax4.imshow(cutout, norm=norm1, origin="lower", vmin=np.median(self.src_map), vmax=1)
+            ax4.imshow(cutout, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.src_map), vmax=2*vmax_5sig(self.src_map))
         
         cutout_stack = self.get_cutout(num, self.stack_field, bounds=bounds, cen_pos=(X_cen, Y_cen))
-        ax5.imshow(cutout_stack, norm=norm2, origin="lower", vmin=np.median(self.stack_field), vmax=1e2)
+        ax5.imshow(cutout_stack, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.stack_field), vmax=2*vmax_5sig(self.stack_field))
         
         if self.deep_frame is not None:
             cutout_deep = self.get_cutout(num, self.deep_frame, bounds=bounds, cen_pos=(X_cen, Y_cen))
-            ax6.imshow(cutout_deep, norm=norm3, origin="lower", vmin=np.median(self.deep_frame)-1, vmax=1e4)
+            ax6.imshow(cutout_deep, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.deep_frame)-1, vmax=5e3)
         else:
             ax6.set_visible(False)
 
@@ -1621,18 +1632,18 @@ class Read_Datacube:
         else:
             print("BCG is not in the field. Assign BCG position mannually: Datacube.pos_BCG=(x,y) (in pix)")
             
-    def assign_BCG_coordinate(self, coord_BCG):
+    def assign_BCG_coordinate(self, coord_BCG, unit='hmsdms'):
         """Assign BCG position (ra, dec) in deg from id_BCG, ((ra1,dec1),(ra2,dec2)) for double cluster""" 
         # WCS
         if np.ndim(coord_BCG)==1:
             self.coord_BCG = SkyCoord(coord_BCG[0], coord_BCG[1], frame='icrs', unit="deg")
-            print("BCG coordinate: ", self.coord_BCG.to_string('hmsdms'))
+            print("BCG coordinate: ", self.coord_BCG.to_string(unit))
         elif np.ndim(coord_BCG)==2:
             coord_BCG1 = SkyCoord(coord_BCG[0][0], coord_BCG[0][1], frame='icrs', unit="deg")
             coord_BCG2 = SkyCoord(coord_BCG[1][0], coord_BCG[1][1], frame='icrs', unit="deg")
             self.coord_BCG = (coord_BCG1, coord_BCG2)
-            print("BCG1 coordinate: ", coord_BCG1.to_string('hmsdms'))
-            print("BCG2 coordinate: ", coord_BCG2.to_string('hmsdms'))
+            print("BCG1 coordinate: ", coord_BCG1.to_string(unit))
+            print("BCG2 coordinate: ", coord_BCG2.to_string(unit))
         
         
     def centroid_analysis(self, num, z=None,
@@ -1656,16 +1667,15 @@ class Read_Datacube:
         offset : centroid offset of emission and contiuum distribution (in pixel)
         dist_clus : distance to cluster center (in pixel)
         """ 
-        
         ind = np.where(self.obj_nums==num)[0][0]
         
-        obj = Obj_detection(self.table[ind], cube=self.cube, seg_map=dilation(self.seg_map),
+        obj = Obj_detection(self.table[ind], dilation(self.seg_map), cube=self.cube,
                             deep_frame=self.deep_frame, mask_edge=self.mask_edge)
 
-        spec = self.obj_specs_opt[ind]
+        spec = self.obj_specs_det[ind]
 
         if from_SE is True:
-            k_aper =  self.k_apers_opt[ind][0]
+            k_aper =  self.k_apers_det[ind][0]
         else:
             k_aper = None
         
@@ -1691,8 +1701,9 @@ class Read_Datacube:
 
     
     def centroid_analysis_all(self, Num_V, nums_obj=None,
-                              centroid_type="APER", sum_type="weighted", subtract=True,
-                              plot=False, verbose=True, smooth=False, morph_cen=False, **kwargs):
+                              centroid_type="APER", sum_type="weighted",
+                              sub_cont=True, morph_cen=False,
+                              plot=False, verbose=True, smooth=False, **kwargs):
         """Compute centroid offset and angle for all SE detections
         
         Parameters
@@ -1724,7 +1735,6 @@ class Read_Datacube:
             if num in Num_V:  # Candidate
                 z = self.z_best[ind]
                 line_width = self.sigma_best[ind]
-                subtract = subtract
                 multi_aper = True
                 
             else:  # For non-emission galaxies, pick a random window excluding the edge 
@@ -1732,13 +1742,13 @@ class Read_Datacube:
                                       high=(self.wavl[-1]-25)/6563.-1)
                 use_good = False
                 line_width = 3
-                subtract = False
+                sub_cont = False
                 multi_aper = False
                 
             res_measure = self.centroid_analysis(num, z=z,
                                                  centroid_type=centroid_type, 
                                                  line_width=line_width,
-                                                 subtract_continuum=subtract,
+                                                 subtract_continuum=sub_cont,
                                                  sum_type=sum_type,
                                                  multi_aper=multi_aper,
                                                  plot=False, verbose=verbose,

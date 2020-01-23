@@ -1,13 +1,11 @@
 import os
 import re
 import sys
-import shutil
+import glob
 
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as plticker
-plt.rcParams['image.origin'] = 'lower'
 
 from scipy import interpolate, signal, integrate, stats
 
@@ -20,16 +18,17 @@ from skimage.morphology import dilation
 import astropy.units as u
 from astropy.wcs import WCS
 from astropy.io import fits
+from astropy.table import Table
+from astropy.modeling import models, fitting
 from astropy.coordinates import SkyCoord
+from astropy.utils import lazyproperty
 from astropy.stats import SigmaClip, sigma_clip, mad_std, gaussian_fwhm_to_sigma
 from astropy.convolution import convolve, Gaussian1DKernel, Gaussian2DKernel
-from astropy.modeling import models, fitting
-from astropy.table import Table
 
 from astropy.visualization import LogStretch, SqrtStretch, AsinhStretch
 from astropy.visualization.mpl_normalize import ImageNormalize
 norm1, norm2, norm3 = [ImageNormalize(stretch=LogStretch()) for i in range(3)]
-norm0 = ImageNormalize(stretch=AsinhStretch())
+norm0 = ImageNormalize(stretch=AsinhStretch(a=0.01))
 
 from photutils import Background2D, SExtractorBackground
 from photutils import EllipticalAnnulus, EllipticalAperture, aperture_photometry
@@ -42,9 +41,29 @@ rand_cmap.set_under(color='black')
 rand_cmap.colors[0] = [0,0,0]
 
 import warnings
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    warnings.warn("no detection", NoDetectionsWarning)
+from photutils.utils import NoDetectionsWarning
+
+from matplotlib import rcParams
+import matplotlib.ticker as plticker
+import matplotlib.patheffects as PathEffects
+from matplotlib import patches
+
+plt.rcParams['image.origin'] = 'lower'
+plt.rcParams["font.serif"] = "Times New Roman"
+rcParams.update({'xtick.major.pad': '5.0'})
+rcParams.update({'xtick.major.size': '4'})
+rcParams.update({'xtick.major.width': '1.'})
+rcParams.update({'xtick.minor.pad': '5.0'})
+rcParams.update({'xtick.minor.size': '4'})
+rcParams.update({'xtick.minor.width': '0.8'})
+rcParams.update({'ytick.major.pad': '5.0'})
+rcParams.update({'ytick.major.size': '4'})
+rcParams.update({'ytick.major.width': '1.'})
+rcParams.update({'ytick.minor.pad': '5.0'})
+rcParams.update({'ytick.minor.size': '4'})
+rcParams.update({'ytick.minor.width': '0.8'})
+rcParams.update({'axes.labelsize': 14})
+rcParams.update({'font.size': 16})
 
 ############################################
 # Basic
@@ -57,7 +76,7 @@ def gaussian_func(x, a, sigma):
             # Define a gaussian function with offset
             return a * np.exp(-x**2/(2*sigma**2))
 
-def colorbar(mappable, pad=0.2, size="5%", loc="right", **args):
+def colorbar(mappable, pad=0.2, size="5%", loc="right", labelsize=10, **args):
     from mpl_toolkits.axes_grid1 import make_axes_locatable
     ax = mappable.axes
     fig = ax.figure
@@ -71,8 +90,17 @@ def colorbar(mappable, pad=0.2, size="5%", loc="right", **args):
         rot = 0
     cax = divider.append_axes(loc, size=size, pad=pad)
     cb = fig.colorbar(mappable, cax=cax, orientation=orent, **args)
-    cb.ax.set_xticklabels(cb.ax.get_xticklabels(),rotation=rot)
+    cb.ax.tick_params(labelsize=labelsize) 
     return cb
+
+def LogNorm():
+    from astropy.visualization import LogStretch
+    return ImageNormalize(stretch=LogStretch())
+
+def AsinhNorm(a=0.1):
+    from astropy.visualization import AsinhStretch
+    return ImageNormalize(stretch=AsinhStretch(a=a))
+
 
 def vmax_3sig(img):
     # upper limit of visual imshow defined by 3 sigma above median
@@ -110,8 +138,8 @@ def check_save_path(dir_name, clear=False):
     else:
         if clear:
             print("%s exists. Remove all the content."%dir_name)
-            shutil.rmtree(dir_name)
-            os.makedirs(dir_name)
+            filelist = glob.glob(os.path.join(dir_name,'*'))
+            [os.remove(f) for f in filelist]
 
 def timer(func): 
     def execute_func(*args, **kwargs): 
@@ -376,9 +404,9 @@ def get_cutout(num, table, image,
     return cutout
 
 class Obj_detection:
-    def __init__(self, tab, from_SE=False, cube=None,
-                 seg_map=None, deep_frame=None, mask_edge=None):
-        num = tab["NUMBER"]
+    def __init__(self, tab, seg_map, from_SE=False, cube=None,
+                 deep_frame=None, mask_edge=None):
+        self.number = num = tab["NUMBER"]
         if from_SE==True:
             self.X_c, self.Y_c = tab["X_IMAGE"], tab["Y_IMAGE"]
             self.x_c, self.y_c = coord_ImtoArray(self.X_c, self.Y_c)
@@ -397,7 +425,6 @@ class Obj_detection:
             
         else:
             self.X_c, self.Y_c = tab["xcentroid"], tab["ycentroid"]
-#             self.x_c, self.y_c = coord_ImtoArray(self.X_c, self.Y_c, 0)
             self.a_image = 0.5*tab['equivalent_radius']
             self.b_image = self.a_image * (1-tab['ellipticity'])
             self.theta = tab['orientation']
@@ -406,6 +433,8 @@ class Obj_detection:
                                                       cen_pos=(self.X_c, self.Y_c))
             self.origin = 0
         
+        self. x_min, self. x_max = x_min, x_max
+        self. y_min, self. y_max = y_min, y_max
         self.bounds = (x_min, y_min, x_max, y_max)
         
         self.X_min, self.Y_min = coord_Array2Im(x_min, y_min, origin=self.origin)
@@ -414,19 +443,21 @@ class Obj_detection:
         self.mask_thumb = mask_edge[x_min:(x_max+1), y_min:(y_max+1)]
 
         self.seg_thumb = seg_map[x_min:(x_max+1), y_min:(y_max+1)]
-        self.seg_tot = (self.seg_thumb==num) | (self.seg_thumb==0)
-        self.seg_sky = (self.seg_thumb==0)
         self.seg_obj = (self.seg_thumb==num)
-
-        self.cube_thumb = cube[:,x_min:(x_max+1), y_min:(y_max+1)]
-        self.img_thumb = self.cube_thumb.sum(axis=0)
+        self.seg_sky = (self.seg_thumb==0)
+        self.seg_tot = (self.seg_obj) | (self.seg_sky)
         
+        self.cube_thumb = cube[:,self.x_min:(self.x_max+1),self.y_min:(self.y_max+1)]
         if deep_frame is not None:
-            self.deep_thumb = deep_frame[x_min:(x_max+1), y_min:(y_max+1)]
+            self.deep_thumb =  deep_frame[self.x_min:(self.x_max+1),
+                                          self.y_min:(self.y_max+1)]
         else:
-            self.deep_thumb = None
-                
-                
+            self.deep_thumb =  None
+            
+    @lazyproperty
+    def img_thumb(self):
+        return self.cube_thumb.sum(axis=0)
+        
     def img_display(self, vmin=0., vmax=None, norm=norm0):
         fig,ax=plt.subplots(1,1)
             
@@ -1333,7 +1364,7 @@ def measure_offset_aperture(obj, img_em, img_con,
     return result_cen
 
 def measure_offset_isoF(seg_obj, img_em, img_con,
-                       std_map_em=None, std_map_con=None):
+                        std_map_em=None, std_map_con=None):
     
     """ Measure centroid with fixed isophote """
     
@@ -1357,7 +1388,7 @@ def measure_offset_isoF(seg_obj, img_em, img_con,
 
 def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
                         std_map_em=None, std_map_con=None, sn_thre=1.5,
-                        niter_iso=3, ctol_iso=0.01, n_dilation=1, fwhm=3):
+                        niter_iso=5, ctol_iso=0.01, n_dilation=1, fwhm=3):
     
     """ Measure centroid with deformable isophote """
     
@@ -1378,7 +1409,7 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
 #     seg_obj = convolve(obj.seg_obj, kernel, normalize_kernel=True) > 0.5
         
     mask_em, mask_con = ~seg_obj.copy(), ~seg_obj.copy()
-    
+
     for d, (img, mask, thre) in enumerate(zip([img_em, img_con], [mask_em, mask_con], [thre_em, thre_con])):
         x, y = obj.center_pos
         for n in range(niter_iso):
@@ -1387,21 +1418,29 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
                 warnings.simplefilter('ignore', NoDetectionsWarning)
                 segm = detect_sources(img, thre, npixels=5, mask=mask)
             
+#             #verify
 #             img2 = img.copy()
 #             img2[mask] = 0
-#             plt.imshow(img2, vmin=0, vmax=1,norm=norm1, cmap='viridis' if d==0 else 'hot')
+#             plt.imshow(img2, vmin=0, vmax=0.5,
+#                        norm=norm0, cmap='viridis' if d==0 else 'hot')
 #             plt.show()
-            
+#             plt.close()
+
             if segm is None:
+#                 mask_new = mask.copy()
                 return None
-                
-#             seg_new = dilation(segm.data)
-            seg_new = segm.data
+            else:    
+#                 seg_new = segm.data
+#                 mask_new = seg_new > 0
+                mask_new = segm.data > 0
             
+            # smooth the contour if measuring morphological centroid
             if morph_cen is True:
-                seg_new = convolve(seg_new, kernel, normalize_kernel=True) > 0.5
+                mask_new = convolve(mask_new, kernel, normalize_kernel=True) > 0.5
             
-            data = img * seg_new
+            data = img * mask_new
+            
+            # Compute new centroid
             x_new, y_new = centroid_com(data)
 
             reach_ctol = (math.sqrt((x-x_new)**2+(y-y_new)**2) < ctol_iso)   
@@ -1411,12 +1450,19 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
                 break
             else:
                 for i in range(n_dilation):
-                    seg_new = dilation(seg_new)
+                    mask_new = dilation(mask_new)
                     
                 # new mask is the new segmentation removing nearby sources
-#                 mask = np.logical_not(seg_new*obj.seg_sky)
-                mask = np.logical_not(seg_new * obj.seg_tot)
+                mask = np.logical_not(mask_new * obj.seg_tot)
                 
+                # verify
+#                 fig, (ax1,ax2,ax3) = plt.subplots(1,3)
+#                 ax1.imshow(obj.seg_sky, cmap="gray")
+#                 ax2.imshow(obj.seg_tot, cmap="gray")
+#                 ax3.imshow(mask, cmap="gray")
+#                 plt.show()
+#                 plt.close()
+    
         if d==0:
             seg_obj_em = ~mask
             x1, y1 = x, y
@@ -1446,7 +1492,7 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
     return result_cen
 
     
-def measure_local_sky_noise(obj, image_list, k1=5, k2=8, sig_clip=3):
+def measure_local_sky_noise(obj, image_list, k1=4, k2=8, sig_clip=3):
     """ Measure standard deviation of the local sky using annulus for a list of images """
     annul_aper = EllipticalAnnulus(positions=obj.center_pos,
                                    a_in=k1*obj.a_image, a_out=k2*obj.a_image,
@@ -1460,7 +1506,8 @@ def measure_local_sky_noise(obj, image_list, k1=5, k2=8, sig_clip=3):
 
         # Sky background in the annulus (nearby objects masked)
         bkg = image[np.logical_and(annu, obj.seg_sky)]
-        std = np.std(sigma_clip(bkg, sigma=sig_clip, maxiters=10, axis=0))
+        std = np.std(sigma_clip(bkg[~np.isnan(bkg)], sigma=sig_clip,
+                                    maxiters=10, axis=0))
         std_s = np.append(std_s, std)
 
     return std_s
@@ -1482,7 +1529,7 @@ def compute_centroid_std(pos_cen, image, std_image, seg_obj):
     
 def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             coord_BCG=None,
-                            edge=30, n_rand=99,
+                            edge=20, n_rand=99,
                             centroid_type="APER",
                             subtract=True, sum_type="weighted", 
                             k_apers=[2,5,8], multi_aper=True,
@@ -1499,15 +1546,20 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     """ Compute the centroid of emission and continua, and plot """
     
     # Window width of lines
-    w_l = line_stddev * 3
-    em_range = ((6548.-w_l)*(1+z_cc), (6584.+w_l)*(1+z_cc))
+    w_l = 5
+    em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
         
     # Emission channels
     em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
+    # Deal with edge effect
+    while not (True in em):
+        w_l +=1
+        em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
+        em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
     
     # Continuum channels
     con = (~em) & (wavl > wavl[0]+edge) & (wavl < wavl[-1]-edge) \
-                & ((wavl > (6584.+w_l)*(1+z_cc)) | (wavl < (6548.-w_l)*(1+z_cc)))
+                & ((wavl > (6584.+3*w_l)*(1+z_cc)) | (wavl < (6548.-3*w_l)*(1+z_cc)))
     
     if smooth:
         sigma = fwhm * gaussian_fwhm_to_sigma
@@ -1538,7 +1590,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     
     if subtract:
         img_em = img_em - img_con
-    
+
     # Generate stddev map (only account for uncertainty in sky)
     std_em, std_con = measure_local_sky_noise(obj, [img_em, img_con], k1=k_apers[1], k2=k_apers[2])
     std_map_em, std_map_con = std_em * np.ones_like(img_em), std_con * np.ones_like(img_con)
@@ -1624,29 +1676,47 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             aper_ems_eff, aper_cons_eff = res_cen["aper_ems_eff"], res_cen["aper_cons_eff"]
         
         plt.figure(figsize=(15,10))
-        ax0 = plt.subplot2grid((2, 3), (0, 0), colspan=3, rowspan=1)
-        ax0.plot(wavl, spec, "k",alpha=0.7,lw=3)
-        ax0.plot(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=3)
-        ax0.plot(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))], "firebrick",alpha=0.9,lw=3)
-        ax0.plot(wavl[em],spec[em],"steelblue",alpha=1,lw=2.5)
-        ax0.axvline(np.max([wavl[0], em_range[0]]), color="steelblue", lw=1.5, ls="-.", alpha=0.7)
-        ax0.axvline(np.min([wavl[-1], em_range[1]]), color="steelblue", lw=1.5, ls="-.", alpha=0.7)
+        
+        ax0 = plt.subplot2grid((5, 1), (0, 0), colspan=1, rowspan=2)
+        ax0.hlines(0, xmin=wavl[0], xmax=wavl[-1], color='k',
+                   linewidth=2,linestyle='--', alpha=0.9)
+        ax0.step(wavl, spec, color="k",  where='mid', alpha=0.7,lw=4)
+        ax0.step(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))],
+                 color="firebrick", where='mid', alpha=0.9,lw=5)
+        ax0.step(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))],
+                 color="firebrick", where='mid', alpha=0.9,lw=5)
+        ax0.fill_between(wavl[con & (wavl>6563.*(1+z_cc))],
+                         spec[con & (wavl>6563.*(1+z_cc))], 0,
+                         step='mid', color="firebrick", alpha=0.3)
+        ax0.fill_between(wavl[con & (wavl<6563.*(1+z_cc))],
+                         spec[con & (wavl<6563.*(1+z_cc))], 0,
+                         step='mid', color="firebrick", alpha=0.3)
+        em_dl = convolve(em, kernel=[1,1,1]).astype(bool)
+        ax0.step(wavl[em_dl],spec[em_dl],color="steelblue", where='mid', alpha=1,lw=5.5)
+        ax0.fill_between(wavl[em_dl],spec[em_dl],0, step='mid', color="steelblue", alpha=0.3)
+        
+#         ax0.axvline(np.max([wavl[0], wavl[em_dl][0]]), color="steelblue", lw=2., ls="-.", alpha=0.7)
+#         ax0.axvline(np.min([wavl[-1], wavl[em_dl][-1]]), color="steelblue", lw=2., ls="-.", alpha=0.7)
         ax0.set_xlabel('Wavelength ($\AA$)',fontsize=20)
         ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2$)',fontsize=18)
         ax0.text(0.85,0.85,"z = %.3f"%z_cc,color="k",fontsize=20,transform=ax0.transAxes)
+        ax0.text(0.05,0.85,"#%s"%obj.number,color="k",fontsize=20,transform=ax0.transAxes)
 
-        ax1 = plt.subplot2grid((2, 3), (1, 0), colspan=1, rowspan=1)
-        s1 = ax1.imshow(img_em, origin="lower",cmap="viridis",vmin=0.0, vmax=0.1, norm=norm0)
+        ax1 = plt.subplot2grid((5, 9), (2, 0), colspan=3, rowspan=3)
+        s1 = ax1.imshow(img_em, origin="lower",cmap="viridis",
+                        vmin=0.0, vmax=0.1, norm=AsinhNorm(a=0.1))
         colorbar(s1)
 
-        ax2 = plt.subplot2grid((2, 3), (1, 1), colspan=1, rowspan=1)
-        s2 = ax2.imshow(img_con, origin="lower",cmap="hot",vmin=0.00, vmax=0.1, norm=norm0)
+        ax2 = plt.subplot2grid((5, 9), (2, 3), colspan=3, rowspan=3)
+        s2 = ax2.imshow(img_con, origin="lower",cmap="hot",
+                        vmin=0.00, vmax=0.1, norm=AsinhNorm(a=0.1))
         colorbar(s2)
         
-        ax3 = plt.subplot2grid((2, 3), (1, 2), colspan=1, rowspan=1)
+        ax3 = plt.subplot2grid((5, 9), (2, 6), colspan=3, rowspan=3)
         
         if hasattr(obj, 'deep_thumb'):
-            s=ax3.imshow(obj.deep_thumb, origin="lower", cmap="gray", vmin=0.5, vmax=3e3, norm=norm3)
+            s=ax3.imshow(obj.deep_thumb, origin="lower", cmap="gray",
+                         vmin=0.5, vmax=500, norm=AsinhNorm(a=0.01))
             colorbar(s)
         xlim,ylim = ax3.get_xlim(), ax3.get_ylim()
         if centroid_type == "APER":
@@ -1660,20 +1730,27 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             aper_con.plot(color='w',lw=3,axes=ax2,alpha=0.95)
         else:
             if centroid_type == 'ISO-D':
-                ax1.contour(res_cen["seg_em"], colors="violet", levels = [0.5], alpha=0.9, linewidths=2)
-                ax2.contour(res_cen["seg_con"], colors="w", levels = [0.5], alpha=0.9, linewidths=2)
-            ax1.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
-            ax2.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
-            
+                ax1.contour(res_cen["seg_em"], colors="violet", levels = [0.5], alpha=0.9, linewidths=3)
+                ax2.contour(res_cen["seg_con"], colors="w", levels = [0.5], alpha=0.9, linewidths=3)
+#             ax1.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
+#             ax2.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
+        
+        val_em_max = data_em.max()
         ax3.contour(data_em, colors="skyblue", alpha=0.9, linewidths=2,
-                    levels = [0.1*data_em.max(),0.4*data_em.max(),0.7*data_em.max(),data_em.max()])
+                    levels=np.array([0.1,0.4,0.7,1]) * val_em_max)
 
         # Ticks
         tick_base = 10 if img_em.shape[0]<100 else 20
         loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
         for ax in (ax1, ax2, ax3):
+            ax.grid()
+            plt.setp(ax.spines.values(), color='w')
+            plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
             ax.xaxis.set_major_locator(loc)
             ax.yaxis.set_major_locator(loc)
+            ax.tick_params(axis="y", color='w', width=2, direction="in")
+            ax.tick_params(axis="x", color='w', width=2, direction="in")
+            
             ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=11)
             ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=11)
             ax.set_xlabel("X (pix)",fontsize=13)
@@ -1686,10 +1763,11 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             cen_aper2 = EllipticalAperture(positions=(x2,y2), a=std_pos2[0], b=std_pos2[1], theta=0)   
             cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
         
-        ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,color="lightblue",
-                 head_width=0.02, head_length=0.02,lw=3,transform=ax2.transAxes,alpha=0.95)
-        ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,color="orange",
-                 head_width=0.02, head_length=0.02,lw=3,transform=ax2.transAxes,alpha=0.95)
+        ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10, color="lightblue",
+                 head_width=0.04, head_length=0.04,lw=4,transform=ax2.transAxes,alpha=0.95)
+        ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
+                  color="orange",
+                 head_width=0.04, head_length=0.04,lw=4,transform=ax2.transAxes,alpha=0.95)
         
         ax3.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax3.transAxes)
         ax3.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=14,transform=ax3.transAxes)
@@ -1698,7 +1776,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         if np.ndim(coord_BCG)>0:
             text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
             ax2.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
-        plt.subplots_adjust(left=0.08,right=0.95,top=0.95, bottom=0.05, wspace=0.35, hspace=0.2)
+        plt.subplots_adjust(left=0.08,right=0.95,top=0.95, bottom=0.02, wspace=2, hspace=0.2)
     
     return res_measure
 
@@ -1865,6 +1943,12 @@ def generate_catalog(save_name, Datacube, Num_v, wcs, n_rand=99):
 
     df.to_csv(save_name,sep=',',index=None)
     
+def set_radius(tab, datacube):
+    radius = datacube.table['equivalent_radius'].data
+    num = datacube.table["NUMBER"].astype(str)
+    tab['radius'] = np.array([radius[num==re.findall(r'\d+', ID)[0][0]]
+                              for ID in tab['ID']]).ravel() 
+
 class HiddenPrints:
     def __enter__(self):
         self._original_stdout = sys.stdout

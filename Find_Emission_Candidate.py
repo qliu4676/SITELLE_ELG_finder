@@ -2,12 +2,12 @@ import sys
 import getopt
 from pipeline import *
 from utils import *
-
+    
 def main(argv):
     # File Path
     output_dir = './output'
     data_path = argv[0]
-    deep_path = "/home/qliu/data/A2390C_deep.fits"
+    deep_path = None
     
     # Cluster Info
     name = 'A2390C'
@@ -38,17 +38,19 @@ def main(argv):
     
     # Get Script Options
     try:
-        optlists, args = getopt.getopt(argv, "n:z:m:d:vpw",
+        optlists, args = getopt.getopt(argv[1:], "n:z:m:d:vpw",
                                        ["NAME=", "Z=", "MODE=", "WAVL_MASK=",
-                                        "OUT_DIR=", "DEEP=", "BOX_SIZE=", "KERNEL_SIZE=", 
-                                        "SN_THRE=", "N_LEVELS=", "CONTRAST=", "MMA_BOX=", 
-                                        "VERBOSE", "PLOT_VERBOSE", "WRITE", "skip="])
+                                        "OUT_DIR=", "DEEP_FRAME=", "skip=",
+                                        "BOX_SIZE=", "KERNEL_SIZE=", "SN_THRE=", 
+                                        "N_LEVELS=", "CONTRAST=", "MMA_BOX=", 
+                                        "VERBOSE", "PLOT_VERBOSE", "WRITE"])
         opts = [opt for opt, arg in optlists]        
         
     except getopt.GetoptError:
         print('Wrong Option.')
         sys.exit(2)
-
+        
+    
     for opt, arg in optlists:
         if opt in ("-n", "--NAME"):
             name = arg
@@ -62,7 +64,7 @@ def main(argv):
             wavl_mask = np.array(re.findall(r"\d*\.\d+|\d+", arg), dtype=float).reshape(-1,2)
         elif opt in ("--OUT_DIR"):
             output_dir = arg
-        elif opt in ("-d", "--DEEP"):
+        elif opt in ("-d", "--DEEP_FRAME"):
             deep_path = arg
         elif opt in ("--skip"):
             if 'raw' in arg : PROC_RAW = False
@@ -91,7 +93,7 @@ def main(argv):
     
     save_path = os.path.join(output_dir, name)
     check_save_path(save_path)
-        
+    
     cube_path = os.path.join(save_path, '%s_cube.fits'%name)
     table_path = os.path.join(save_path, '%s_%s_lpf.dat'%(name, mode))
     seg_path = os.path.join(save_path, '%s_segm_%s_lpf.fits'%(name, mode))
@@ -102,14 +104,14 @@ def main(argv):
     candidate_path = os.path.join(save_path, 'pic/candidate_%s_lpf'%mode)
     
     
-# output_dir = './output' 
-# name = 'A2390C'
-# name = 'A2390E'
-# name = 'A2390W'
+    # output_dir = './output' 
+    # name = 'A2390C'
+    # name = 'A2390E'
+    # name = 'A2390W'
 
-# data_path = "/home/qliu/data/A2390C4new.fits"
-# data_path = "/home/qliu/data/A2390F/A2390SEC4.fits"
-# data_path = "/home/qliu/data/A2390F/A2390NWC4.fits"
+    # data_path = "/home/qliu/data/A2390C4new.fits"
+    # data_path = "/home/qliu/data/A2390F/A2390SEC4.fits"
+    # data_path = "/home/qliu/data/A2390F/A2390NWC4.fits"
 
     #################################################
     # 1. Read raw cube and remove background + fringe
@@ -188,12 +190,12 @@ def main(argv):
 
         # build gaussian templates for different lines
         datacube.generate_template(n_ratio=1, n_stddev=10, n_intp=2,
-                                   ratio_prior="log-uniform",
-                                   temp_type="OII", temp_model='gauss')
-        datacube.generate_template(n_ratio=8, n_stddev=10, n_intp=2,
+                                   temp_type="OII", temp_model='gauss',
+                                   ratio_prior="log-uniform", verbose=verbose)
+        datacube.generate_template(n_ratio=8, n_stddev=10, n_intp=2, verbose=verbose,
                                    ratio_range = (2., 4.), ratio_prior="log-uniform", 
                                    temp_type="Hb-OIII", temp_model='gauss')
-        datacube.generate_template(n_ratio=40, n_stddev=10, n_intp=2,
+        datacube.generate_template(n_ratio=40, n_stddev=10, n_intp=2, verbose=verbose,
                                    ratio_range = (1., 8), ratio_prior="log-uniform", 
                                    temp_type="Ha-NII", temp_model='gauss')
 
@@ -235,7 +237,7 @@ def main(argv):
 
         datacube = Read_Datacube(cube_path, name, z0, mode=mode,
                                  wavl_mask=wavl_mask, table=table_path,
-                                 deep_frame=deep_path,
+                                 deep_frame=deep_path, 
                                  mask_edge=mask_edge_path)
 
         datacube.read_spec(spec_path)
@@ -323,9 +325,9 @@ def main(argv):
         if save:
             check_save_path(candidate_path+'/V', clear=True)
             
-    def write_table(save=True):
-        table_all = Table.read(table_path, format='ascii')
+    def write_table():
         
+        table_all = Table.read(table_path, format='ascii')
         candidate_path_C = os.path.join(candidate_path,"C/%s#*.png"%name)
         dir_C = glob.glob(candidate_path_C)
         Num_C = np.sort(np.array([re.compile(r'\d+').findall(el)[-1] for el in dir_C]).astype("int"))
@@ -356,34 +358,14 @@ def main(argv):
         print("Save candidate list as :", f_name)
         
     # Execute
-    if PROC_RAW:
-        process_raw_cube()
-    else:
-        print("Skip processing raw datacube.")
+    process_raw_cube() if PROC_RAW else print("Skip processing raw datacube.")
+    extract_spectra() if EXTR_SPEC else print("Skip extraction of spectra.")
+    build_template() if MAKE_TEMP else print("Skip building template.")
+    cross_correlation() if CROS_CORR else print("Skip cross-correlation.")
+    save_candidate(save=True) if PLOT_CAND else print("Skip ploting ELG candidate.")
         
-    if EXTR_SPEC:
-        extract_spectra()
-    else:
-        print("Skip extraction of spectra.")
-        
-    if MAKE_TEMP:
-        build_template()
-    else:
-        print("Skip building template.")
-        
-    if CROS_CORR:
-        cross_correlation()
-    else:
-        print("Skip cross-correlation.")
-        
-    if PLOT_CAND:
-        save_candidate(save=False)
-    else:
-        print("Skip ploting ELG candidate.")
-        
-    if WRITE_TABLE: write_table(save=False)
+    if WRITE_TABLE: write_table()
 
-        
     return opts
     
     
