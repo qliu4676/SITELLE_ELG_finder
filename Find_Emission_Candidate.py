@@ -38,7 +38,7 @@ def main(argv):
     
     # Get Script Options
     try:
-        optlists, args = getopt.getopt(argv[1:], "n:z:m:d:vpw",
+        optlists, args = getopt.getopt(argv[1:], "n:z:m:d:K:vpw",
                                        ["NAME=", "Z=", "MODE=", "WAVL_MASK=",
                                         "OUT_DIR=", "DEEP_FRAME=", "skip=",
                                         "BOX_SIZE=", "KERNEL_SIZE=", "SN_THRE=", 
@@ -47,10 +47,8 @@ def main(argv):
         opts = [opt for opt, arg in optlists]        
         
     except getopt.GetoptError:
-        print('Wrong Option.')
-        sys.exit(2)
+        sys.exit('Wrong Option.')
         
-    
     for opt, arg in optlists:
         if opt in ("-n", "--NAME"):
             name = arg
@@ -74,8 +72,9 @@ def main(argv):
             if 'out' in arg : PLOT_CAND = False
         elif opt in ("--BOX_SIZE"):
             box_size = np.int(arg)
-        elif opt in ("--KERNEL_SIZE"):
+        elif opt in ("-K","--KERNEL_SIZE"):
             kernel_size = np.array(re.findall(r"\d*\.\d+|\d+", arg), dtype=int)
+            print(kernel_size)
         elif opt in ("--SN_THRE"):
             sn_thre = np.float(arg)
         elif opt in ("--N_LEVELS"):
