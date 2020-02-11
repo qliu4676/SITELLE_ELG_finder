@@ -48,16 +48,17 @@ import matplotlib.ticker as plticker
 import matplotlib.patheffects as PathEffects
 from matplotlib import patches
 
+plt.rcParams['text.usetex'] = True
 plt.rcParams['image.origin'] = 'lower'
 plt.rcParams["font.serif"] = "Times New Roman"
 rcParams.update({'xtick.major.pad': '5.0'})
-rcParams.update({'xtick.major.size': '4'})
+rcParams.update({'xtick.major.size': '6'})
 rcParams.update({'xtick.major.width': '1.'})
 rcParams.update({'xtick.minor.pad': '5.0'})
 rcParams.update({'xtick.minor.size': '4'})
 rcParams.update({'xtick.minor.width': '0.8'})
 rcParams.update({'ytick.major.pad': '5.0'})
-rcParams.update({'ytick.major.size': '4'})
+rcParams.update({'ytick.major.size': '6'})
 rcParams.update({'ytick.major.width': '1.'})
 rcParams.update({'ytick.minor.pad': '5.0'})
 rcParams.update({'ytick.minor.size': '4'})

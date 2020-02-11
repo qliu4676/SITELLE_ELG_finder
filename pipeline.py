@@ -633,7 +633,7 @@ class Read_Datacube:
     def ISO_source_detection(self, sn_thre=3, npixels=8, b_size=128,
                              nlevels=64, contrast=0.01, closing=False,
                              add_columns=['equivalent_radius'],
-                             box=[3,3,3], seeing=1, mask_map=None,
+                             box=[3,3,5], mask_map=None,
                              parallel=False, save=True, save_path = './', suffix=""):
         """ Source Extraction based on Isophotal of S/N """
         from skimage import morphology
