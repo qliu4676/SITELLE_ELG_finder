@@ -24,7 +24,8 @@ def main(argv):
     sn_thre = 3
     nlevels = 64
     contrast_deblend = 0.01
-    MMA_box = [3,3,5]
+    MMA_box = [5,3,3]
+    suffix = ''
     
     plot_verbose = False
     verbose = False
@@ -43,7 +44,7 @@ def main(argv):
                                         "OUT_DIR=", "DEEP_FRAME=", "skip=",
                                         "BOX_SIZE=", "KERNEL_SIZE=", "SN_THRE=", 
                                         "N_LEVELS=", "CONTRAST=", "MMA_BOX=", 
-                                        "VERBOSE", "PLOT_VERBOSE", "WRITE"])
+                                        "VERBOSE", "PLOT_VERBOSE", "WRITE", "suffix"])
         opts = [opt for opt, arg in optlists]        
         
     except getopt.GetoptError:
@@ -83,6 +84,8 @@ def main(argv):
             contrast_deblend = np.float(arg)
         elif opt in ("--MMA_BOX"):
             MMA_BOX = np.array(re.findall(r"\d*\.\d+|\d+", arg), dtype=int)
+        elif opt in ("--OUT_DIR"):
+            suffix = arg
             
     if ("--VERBOSE" in opts)|('-v' in opts): verbose = True
     if ("--PLOT_VERBOSE" in opts)|('-p' in opts): plot_verbose = True
@@ -222,7 +225,7 @@ def main(argv):
             datacube.cross_correlation_all(temp_type=line, temp_model="gauss",
                                            edge=20, verbose=False)
         print("Cross-correlation Finished!\n")
-
+ 
         # Save CC results
         datacube.save_cc_result(save_path=save_path, suffix="_lpf")
 
@@ -324,7 +327,7 @@ def main(argv):
         if save:
             check_save_path(candidate_path+'/V', clear=True)
             
-    def write_table():
+    def write_table(suffix=""):
         
         table_all = Table.read(table_path, format='ascii')
         candidate_path_C = os.path.join(candidate_path,"C/%s#*.png"%name)
@@ -352,7 +355,7 @@ def main(argv):
             irow = np.where(table_target["NUMBER"]==num)[0][0]
             table_target['flag'][irow] = 2
         
-        f_name = os.path.join(save_path,'%s_ELG_list.txt'%name)
+        f_name = os.path.join(save_path,'%s_ELG_list%s.txt'%(name,suffix))
         table_target.write(f_name, format='ascii', overwrite=True)
         print("Save candidate list as :", f_name)
         
@@ -363,7 +366,7 @@ def main(argv):
     cross_correlation() if CROS_CORR else print("Skip cross-correlation.")
     save_candidate(save=True) if PLOT_CAND else print("Skip ploting ELG candidate.")
         
-    if WRITE_TABLE: write_table()
+    if WRITE_TABLE: write_table(suffix)
 
     return opts
     

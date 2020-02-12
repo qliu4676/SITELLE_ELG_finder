@@ -16,7 +16,7 @@ sub_cont = False
 save = False
 
 mode = "MMA"
-output_dir = './output'
+output_dir = './output1'
 LPF = False
 
 if 'A2390' in name: 

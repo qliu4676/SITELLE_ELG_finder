@@ -1494,7 +1494,7 @@ class Read_Datacube:
         if z is None:
             z = self.CC_result_Temps[typ_mod][str(num)]['z_best']
         
-        EW, EW_std = estimate_EW(self.obj_specs_opt[id], self.wavl,
+        EW, EW_std = estimate_EW(self.obj_specs_det[id], self.wavl,
                                  z=z, lam_0=lam_0, sigma=sigma, 
                                  MC_err=MC_err, n_MC=n_MC,
                                  edge=edge, cont=cont, ax=ax, plot=plot)

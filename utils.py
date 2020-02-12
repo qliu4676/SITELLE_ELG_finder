@@ -280,7 +280,7 @@ def moving_average(x, w=5):
 
 def moving_average_cube(cube, box=[3,3,3], mask=None):
     """ 3D moving average on cube"""
-    box[2] = box[2]//2 * 2 + 1
+    box[0] = box[0]//2 * 2 + 1
     out = convolve(cube, np.ones(box), mask=mask,
                    nan_treatment='fill', normalize_kernel=True)
     return out
