@@ -51,20 +51,20 @@ from matplotlib import patches
 plt.rcParams['text.usetex'] = True
 plt.rcParams['image.origin'] = 'lower'
 plt.rcParams["font.serif"] = "Times New Roman"
-rcParams.update({'xtick.major.pad': '5.0'})
-rcParams.update({'xtick.major.size': '6'})
-rcParams.update({'xtick.major.width': '1.'})
-rcParams.update({'xtick.minor.pad': '5.0'})
-rcParams.update({'xtick.minor.size': '4'})
-rcParams.update({'xtick.minor.width': '0.8'})
-rcParams.update({'ytick.major.pad': '5.0'})
-rcParams.update({'ytick.major.size': '6'})
-rcParams.update({'ytick.major.width': '1.'})
-rcParams.update({'ytick.minor.pad': '5.0'})
-rcParams.update({'ytick.minor.size': '4'})
-rcParams.update({'ytick.minor.width': '0.8'})
-rcParams.update({'axes.labelsize': 14})
-rcParams.update({'font.size': 16})
+rcParams.update({'xtick.major.pad': '6.0'})
+rcParams.update({'xtick.major.size': '8'})
+rcParams.update({'xtick.major.width': '1.2'})
+rcParams.update({'xtick.minor.pad': '6.0'})
+rcParams.update({'xtick.minor.size': '6'})
+rcParams.update({'xtick.minor.width': '1.0'})
+rcParams.update({'ytick.major.pad': '6.0'})
+rcParams.update({'ytick.major.size': '8'})
+rcParams.update({'ytick.major.width': '1.2'})
+rcParams.update({'ytick.minor.pad': '6.0'})
+rcParams.update({'ytick.minor.size': '6'})
+rcParams.update({'ytick.minor.width': '1.0'})
+rcParams.update({'axes.labelsize': 20})
+rcParams.update({'font.size': 20})
 
 ############################################
 # Basic
@@ -77,7 +77,8 @@ def gaussian_func(x, a, sigma):
             # Define a gaussian function with offset
             return a * np.exp(-x**2/(2*sigma**2))
 
-def colorbar(mappable, pad=0.2, size="5%", loc="right", labelsize=10, **args):
+def colorbar(mappable, pad=0.2, size="5%", loc="right",
+             direction='out', labelsize=10, length=10, **args):
     from mpl_toolkits.axes_grid1 import make_axes_locatable
     ax = mappable.axes
     fig = ax.figure
@@ -91,7 +92,7 @@ def colorbar(mappable, pad=0.2, size="5%", loc="right", labelsize=10, **args):
         rot = 0
     cax = divider.append_axes(loc, size=size, pad=pad)
     cb = fig.colorbar(mappable, cax=cax, orientation=orent, **args)
-    cb.ax.tick_params(labelsize=labelsize) 
+    cb.ax.tick_params(direction=direction, length=length, labelsize=labelsize) 
     return cb
 
 def LogNorm():
@@ -1676,7 +1677,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             aper_em, aper_con = res_cen["aper_em"], res_cen["aper_con"]
             aper_ems_eff, aper_cons_eff = res_cen["aper_ems_eff"], res_cen["aper_cons_eff"]
         
-        plt.figure(figsize=(15,10))
+        plt.figure(figsize=(14,10))
         
         ax0 = plt.subplot2grid((5, 1), (0, 0), colspan=1, rowspan=2)
         ax0.hlines(0, xmin=wavl[0], xmax=wavl[-1], color='k',
@@ -1699,26 +1700,26 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
 #         ax0.axvline(np.max([wavl[0], wavl[em_dl][0]]), color="steelblue", lw=2., ls="-.", alpha=0.7)
 #         ax0.axvline(np.min([wavl[-1], wavl[em_dl][-1]]), color="steelblue", lw=2., ls="-.", alpha=0.7)
         ax0.set_xlabel('Wavelength ($\AA$)',fontsize=20)
-        ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2$)',fontsize=18)
-        ax0.text(0.85,0.85,"z = %.3f"%z_cc,color="k",fontsize=20,transform=ax0.transAxes)
-        ax0.text(0.05,0.85,"#%s"%obj.number,color="k",fontsize=20,transform=ax0.transAxes)
+        ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2$)',fontsize=20)
+        ax0.text(0.8,0.85,"z = %.3f"%z_cc,color="k",fontsize=22,transform=ax0.transAxes)
+        ax0.text(0.05,0.85,"#%sE"%obj.number,color="k",fontsize=22,transform=ax0.transAxes)
 
         ax1 = plt.subplot2grid((5, 9), (2, 0), colspan=3, rowspan=3)
         s1 = ax1.imshow(img_em, origin="lower",cmap="viridis",
                         vmin=0.0, vmax=0.1, norm=AsinhNorm(a=0.1))
-        colorbar(s1)
+#         colorbar(s1, pad=0., direction='in', length=12, labelsize=14)
 
         ax2 = plt.subplot2grid((5, 9), (2, 3), colspan=3, rowspan=3)
         s2 = ax2.imshow(img_con, origin="lower",cmap="hot",
                         vmin=0.00, vmax=0.1, norm=AsinhNorm(a=0.1))
-        colorbar(s2)
+#         colorbar(s2, pad=0., direction='in', length=12, labelsize=14)
         
         ax3 = plt.subplot2grid((5, 9), (2, 6), colspan=3, rowspan=3)
         
         if hasattr(obj, 'deep_thumb'):
             s=ax3.imshow(obj.deep_thumb, origin="lower", cmap="gray",
                          vmin=0.5, vmax=500, norm=AsinhNorm(a=0.01))
-            colorbar(s)
+#             colorbar(s, pad=0., direction='in', length=12, labelsize=14)
         xlim,ylim = ax3.get_xlim(), ax3.get_ylim()
         if centroid_type == "APER":
             for k, (aper1, aper2) in enumerate(zip(aper_ems_eff,aper_cons_eff)):
@@ -1749,13 +1750,13 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
             ax.xaxis.set_major_locator(loc)
             ax.yaxis.set_major_locator(loc)
-            ax.tick_params(axis="y", color='w', width=2, direction="in")
-            ax.tick_params(axis="x", color='w', width=2, direction="in")
+            ax.tick_params(axis="y", color='w', width=2, direction="in", length=5, labelsize=0)
+            ax.tick_params(axis="x", color='w', width=2, direction="in", length=5, labelsize=0)
             
-            ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=11)
-            ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=11)
-            ax.set_xlabel("X (pix)",fontsize=13)
-            ax.set_ylabel("Y (pix)",fontsize=13)
+            ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=0)
+            ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=0)
+            ax.set_xlabel("X (pix)",fontsize=0)
+            ax.set_ylabel("Y (pix)",fontsize=0)
             ax.plot(x1, y1, color="violet", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=4)
             ax.plot(x2, y2, color="w", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=3)
             
@@ -1764,11 +1765,15 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             cen_aper2 = EllipticalAperture(positions=(x2,y2), a=std_pos2[0], b=std_pos2[1], theta=0)   
             cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
         
-        ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10, color="lightblue",
-                 head_width=0.04, head_length=0.04,lw=4,transform=ax2.transAxes,alpha=0.95)
+        
         ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
-                  color="orange",
-                 head_width=0.04, head_length=0.04,lw=4,transform=ax2.transAxes,alpha=0.95)
+                  edgecolor="orange", facecolor='none',
+                  head_width=0.03, head_length=0.03,lw=3,transform=ax2.transAxes,alpha=0.95)
+        ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,
+                  edgecolor="lightblue", facecolor='none',
+                 head_width=0.03, head_length=0.03,lw=3,transform=ax2.transAxes,alpha=0.95)
+        
+        
         
         ax3.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax3.transAxes)
         ax3.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=14,transform=ax3.transAxes)
