@@ -589,7 +589,7 @@ class Read_Datacube:
         """ Read WCS info from the datacube header """
         if self.wcs is None:
             if hide:
-                with HiddenPrints():
+                with HidePrints():
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", FITSFixedWarning)
 #                         warnings.warn("FITSFixed", FITSFixedWarning)
@@ -1452,7 +1452,7 @@ class Read_Datacube:
         """
         Get the best matched value of a property from CC results.
         
-        prop: 'sigma_best', 'ratio_best', 'z_best', 'SNR' ...
+        prop: 'sigma_best', 'ratio_best', 'z_best', 'SNR', 'R', ...
         """
         
         if nums is None:

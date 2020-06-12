@@ -17,8 +17,8 @@ from skimage.morphology import dilation
 
 import astropy.units as u
 from astropy.wcs import WCS
-from astropy.io import fits
-from astropy.table import Table
+from astropy.io import fits, ascii
+from astropy.table import Table, Column, join, vstack, setdiff
 from astropy.modeling import models, fitting
 from astropy.coordinates import SkyCoord
 from astropy.utils import lazyproperty
@@ -570,7 +570,7 @@ class Obj_detection:
     
 
 def fit_continuum(spec, wavl, model='GP', 
-                  kernel_scale=100, kenel_noise=1e-3, edge_ratio=0.15,
+                  kernel_scale=100, kenel_noise=1e-3, edge_ratio=0.15, norm=True,
                   verbose=True, plot=True, fig=None, ax=None):
     """
     Fit continuum of the spectrum with Trapezoid1D model or Gaussian Process
@@ -598,13 +598,18 @@ def fit_continuum(spec, wavl, model='GP',
     # rebin wavelength linearly in log scale
     logwavl = np.log(wavl)
     n_wavl = int(len(wavl))
-    logwavl_intp = np.linspace(logwavl[0],logwavl[-1],n_wavl+1)
+    logwavl_intp = np.linspace(logwavl[0],logwavl[-1],n_wavl)
     f_interp = interpolate.interp1d(logwavl, spec, kind="cubic", fill_value="extrapolate")
     
     spec_intp = f_interp(logwavl_intp)
     wavl_rebin = np.e**logwavl_intp
-    y_intp = spec_intp/spec_intp.max() # normalized spectra
     
+    if norm: 
+        # normalized spectra
+        y_intp = spec_intp/spec_intp.max() 
+    else:
+        y_intp = spec_intp
+        
     if model=='Trapz':
         # Fit continuum with Trapezoid 1D model in astropy
         cont = np.ma.masked_array(y_intp, mask=np.zeros_like(y_intp))
@@ -653,18 +658,24 @@ def fit_continuum(spec, wavl, model='GP',
         # Plot the data with the best-fit model
         if fig==None:  
             fig, ax = plt.subplots(figsize=(8,3))
-        ax.step(wavl, spec/spec.max(), "k", label="spec.", where="mid", alpha=0.9)
+        if norm:
+            spec /= spec.max()
+        ax.step(wavl, spec, "k", label="spec.", where="mid", alpha=0.9)
         ax.plot(np.e**logwavl_intp[fit_range], cont[fit_range], "s", color='indianred', ms=4, label="cont.",alpha=0.7)
         ax.plot(np.e**logwavl_intp[~fit_range], cont[~fit_range], "s", mec='indianred', mew=1.5, mfc="white", ms=4, alpha=0.7)
         ax.plot(wavl_rebin, cont_fit, "orange", label="cont. fit", alpha=0.9)        
         ax.step(wavl_rebin, res, "royalblue",label="residual", where="mid",zorder=5, alpha=0.9)
-        ax.set_xlabel('wavelength ($\AA$)')
-        ax.set_ylabel('norm Flux')
+        ax.set_xlabel('Wavelength ($\AA$)')
+        if norm:
+            ax.set_ylabel('Normed Flux')
+        else:
+            ax.set_ylabel('Flux')
         ax.legend(ncol=2)
         plt.tight_layout()
           
     res -= np.median(res)
-    res /= res.max()
+    if norm:
+        res /= res.max()
     
     return res, wavl_rebin, cont_fit
 
@@ -1949,13 +1960,102 @@ def generate_catalog(save_name, Datacube, Num_v, wcs, n_rand=99):
 
     df.to_csv(save_name,sep=',',index=None)
     
-def set_radius(tab, datacube):
-    radius = datacube.table['equivalent_radius'].data
-    num = datacube.table["NUMBER"].astype(str)
-    tab['radius'] = np.array([radius[num==re.findall(r'\d+', ID)[0][0]]
-                              for ID in tab['ID']]).ravel() 
+    
+def set_sextractor_radius(table, sex_table):
+    # assign radii of source to table from sextractor tables (for plotting)
+    radius = sex_table['equivalent_radius'].data
+    num = sex_table["NUMBER"].astype(str)
+    table['radius'] = np.array([radius[num==re.findall(r'\d+', ID)[0][0]]
+                              for ID in table['ID']]).ravel()
+    
+def stack_tables(tables, sex_tables=None, sep=3*u.arcsec):
+    # stack measurement tables of different fields
+    # tables : tables to stack, first one needs to be central
+    # sex_tables : sextractor tables, the same order as tables
+    
+    # assign radii from sextractor
+    if sex_tables is not None:
+        for table, sex_table in zip(tables, sex_tables):
+            set_sextractor_radius(table, sex_table)
 
-class HiddenPrints:
+    # Match with each other
+    coords = [SkyCoord(tab['ra'], tab['dec'], frame='icrs', unit="deg")
+             for tab in tables]
+    coord_C, tab_C = coords[0], tables[0]
+    
+    # Stack tables
+    tab_stack = vstack(tables, join_type='inner')
+    
+    # Iterate flanking fields to cross match with central field
+    for coord_F, tab_F in zip(coords[1:], tables[1:]):
+        idx, d2d, d3d = coord_F.match_to_catalog_sky(coord_C)
+        match = d2d < sep
+        tab_FC = tab_F[match]
+        tab_CF = tab_C[idx[match]]
+
+        # Remove repeated source with lower SNR of Ha
+        good = tab_FC['SN_Ha']>tab_CF['SN_Ha']
+        id_rm_FC = tab_FC['ID'][~good].data
+        id_rm_CF = tab_CF['ID'][good].data
+
+        for id_rm in np.concatenate([id_rm_FC, id_rm_CF]):
+            row_rm = np.where(tab_stack['ID']==id_rm)[0][0]
+            tab_stack.remove_row(row_rm)
+            
+    return tab_stack
+
+
+def remove_by_ID(table, ID_rm=None):
+    tab = table.copy()
+    
+    if ID_rm is not None:
+        print("%r will be removed."%list(ID_rm))
+
+        #Remove non-cluster member
+        irow_rm = np.array([],dtype=int)
+        for id in ID_rm:
+            irow_rm = np.append(irow_rm, np.argwhere(tab['ID']==id))
+        tab.remove_rows(irow_rm)
+    
+    return tab
+
+
+def calculate_coverage(coords_field, coord_BCG,
+                       field_radius, wcs, plot=True):
+    # calculate field coverages (size x size in pixel) in fraction
+
+    p1, p2, p3, p4 = wcs.calc_footprint()
+
+    rv_ra = stats.uniform(loc=p3[0], scale=p1[0]-p3[0])
+    rv_dec = stats.uniform(loc=p1[1], scale=p2[1]-p1[1])
+
+    rvs_ra, rvs_dec = rv_ra.rvs(100000), rv_dec.rvs(100000)
+    
+    cond_cover = [np.hypot(rvs_ra-coord[0], 
+                           rvs_dec-coord[1]) <= field_radius
+                  for coord in coords_field]
+    covered = np.logical_or.reduce(cond_cover, axis=0)
+    
+    bins = np.linspace(0, 3.5*field_radius, 50)
+    r_bin = (bins[1:] + bins[:-1]) / 2
+    r = np.hypot(rvs_ra-coord_BCG[0], rvs_dec-coord_BCG[1])
+    hist_all, _ = np.histogram(r, bins)
+    hist_covered, _ = np.histogram(r[covered], bins)
+    frac_cover = hist_covered / hist_all
+    
+    if plot:
+        plt.figure(figsize=(6,6))
+        plt.scatter(rvs_ra[~covered], rvs_dec[~covered], s=1, alpha=0.8)
+        plt.scatter(rvs_ra[covered], rvs_dec[covered], c="r", s=1, alpha=0.8)
+        plt.figure(figsize=(6,4))
+        plt.plot(r_bin, frac_cover, "k-")
+        plt.ylabel("Fraction of Spatial Coverage")
+        plt.xlabel("Radius (deg)")
+        
+    return r_bin, frac_cover
+    
+
+class HidePrints:
     def __enter__(self):
         self._original_stdout = sys.stdout
         sys.stdout = open(os.devnull, 'w')
