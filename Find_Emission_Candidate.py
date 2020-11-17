@@ -1,18 +1,31 @@
+""" 
+Search Emission-line Galaxy (ELG) candidates in the cluster using the SITELLE datacube
+
+Usage: 
+1. from jupyter notebook
+%run Find_Emission_Candidate.py "A2390C4new.fits" --NAME 'A2390C' -z 0.228 -m 'MMA' -v --OUT_DIR './output' --DEEP_FRAME "A2390C_deep.fits"
+
+2. from terminal
+python 
+python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -m MMA -v --OUT_DIR ./output --DEEP_FRAME A2390C_deep.fits
+"""
+
 import sys
 import getopt
 from pipeline import *
 from utils import *
     
 def main(argv):
-    # File Path
+    # Example File Path
     output_dir = './output'
     data_path = argv[0]
     deep_path = None
     
-    # Cluster Info
+    # Example Cluster Info (A2390C4new.fits)
     name = 'A2390C'
     z0 = 0.228
     
+    # masked wavelength not in use (with strong sky emission)
     wavl_mask = [[7950,8006], [8020,8040], [8230,8280]]
     
     # Parameter for Processing Raw Datacube
@@ -27,6 +40,7 @@ def main(argv):
     MMA_box = [5,3,3]
     suffix = ''
     
+    # Default Arguments
     plot_verbose = False
     verbose = False
     
@@ -104,16 +118,6 @@ def main(argv):
     template_path = os.path.join(output_dir, 'template')
     CC_res_path = os.path.join(save_path, '%s-cc-%s_lpf.pkl'%(name, mode))
     candidate_path = os.path.join(save_path, 'pic/candidate_%s_lpf'%mode)
-    
-    
-    # output_dir = './output' 
-    # name = 'A2390C'
-    # name = 'A2390E'
-    # name = 'A2390W'
-
-    # data_path = "/home/qliu/data/A2390C4new.fits"
-    # data_path = "/home/qliu/data/A2390F/A2390SEC4.fits"
-    # data_path = "/home/qliu/data/A2390F/A2390NWC4.fits"
 
     #################################################
     # 1. Read raw cube and remove background + fringe
@@ -326,7 +330,11 @@ def main(argv):
 
         if save:
             check_save_path(candidate_path+'/V', clear=True)
-            
+    
+    #################################################
+    # 5. Save to table
+    #################################################
+    
     def write_table(suffix=""):
         
         table_all = Table.read(table_path, format='ascii')

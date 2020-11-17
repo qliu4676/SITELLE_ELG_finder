@@ -5,20 +5,26 @@ import warnings
 warnings.simplefilter('ignore', RuntimeWarning)
 
 """ 
-Usage: %run -i Measure_Centroid.py 'A2465C' -z 0.245 --SN_THRE 2.5 --SUM_TYPE 'mean' --SUB_CONT --LPF --SAVE
+Measure Centroid of ELGs with the datacube of the target cluster.
+
+Usage: 
+1. from jupyter notebook
+%run -i Measure_Centroid.py 'A2465C' -z 0.245 --SN_THRE 2.5 --SUM_TYPE 'mean' --SUB_CONT --LPF --SAVE --PLOT
+
+2. from terminal
+python Measure_Centroid.py A2465C -z 0.245 --SN_THRE 2.5 --SUM_TYPE mean --SUB_CONT --LPF --SAVE --PLOT
+
 """
 
-# Arugument
+# Default Aruguments
 name = sys.argv[1]
 sn_thre = 2.0
 sum_type = "mean"
-sub_cont = False
-save = False
-
 mode = "MMA"
-output_dir = './output1'
-LPF = False
+output_dir = './output'
+identifier = ''
 
+# Fast cluster-specfic info 
 if 'A2390' in name: 
     z0 = 0.228
     coords_BCG = (328.403512,17.695440)
@@ -31,13 +37,19 @@ if 'A2465' in name:
     cluster_bounds = "./A2465C/A2465C_bound_v2.fits"
     double_cluster = True
     
+if 'RXJ2129' in name: 
+    z0 = 0.234
+    coords_BCG = (322.41625, 0.08916667)
+    double_cluster = False
+    
+# masked wavelength not in use (with strong sky emission)
 wavl_mask = [[7950,8006], [8020,8040], [8230,8280]]
     
-# Options
+# Script Options
 try:
     optlists, args = getopt.getopt(sys.argv[2:], "z:",
-                                   ["SN_THRE=", "SUM_TYPE=", "LPF",
-                                    "SAVE", "SUB_CONT", "OUT_DIR="])
+                                   ["SN_THRE=", "SUM_TYPE=", "SUB_CONT", "LPF",
+                                    "SAVE", 'PLOT', 'ID=', "OUT_DIR="])
     opts = [opt for opt, arg in optlists]        
 except getopt.GetoptError:
     print('Wrong Option.')
@@ -50,29 +62,46 @@ for opt, arg in optlists:
         sn_thre = np.float(arg)
     elif opt in ("--SUM_TYPE"):
         sum_type = arg
+    elif opt in ("-ID"):
+        identifier = str(arg)
     elif opt in ("--OUT_DIR"):
         output_dir = arg
-if ("--LPF" in opts): LPF = True
-if ("--SUB_CONT" in opts): sub_cont = True
-if ("--SAVE" in opts): save = True
+        
+LPF = True if ("--LPF" in opts) else False
+sub_cont = True if ("--SUB_CONT" in opts) else False
+save = True if ("--SAVE" in opts) else False
+plot = True if ("--PLOT" in opts) else False
+
+# if ("--SUB_CONT" in opts):
+#     sub_cont = True
+# else:
+#     sub_cont = False
+    
+# if ("--SAVE" in opts):
+#     save = True
+# else:
+#     save = False
+    
+# if ("--PLOT" in opts):
+#     plot = True
+# else:
+#     plot = False
 
 print("S/N = %.1f"%(sn_thre))
 print("Emission: %s"%(sum_type))
 print("Continuum Subtracted?: %s"%(sub_cont))
-print("Use LPF cube?: %s"%LPF)
+print("Use LPF processed cube?: %s"%LPF)
 
 # Suffix
 suffix = "_%s_sn%.1f"%(sum_type, sn_thre)
-if sub_cont:
-    suffix += '_contsub'
-if LPF:
-    suffix += '_lpf'
-
+if sub_cont: suffix += '_contsub'
+if LPF: suffix += '_lpf'
 suffix += '_NB'
 
 # Collect File Path
 save_path = os.path.join(output_dir, name)
 centroid_path = os.path.join(output_dir, 'centroid', name)
+check_save_path(save_path)
 check_save_path(centroid_path)
     
 table_path = os.path.join(save_path, '%s_%s_lpf.dat'%(name, mode))
@@ -89,7 +118,7 @@ if LPF:
 else:
     cube_path = os.path.join(save_path, '%s_cube.fits'%name)
     
-# Read
+# Read datacube
 datacube = Read_Datacube(cube_path, name, z0, 
                          mode=mode, wavl_mask=wavl_mask,
                          table=table_path, seg_map=seg_path,
@@ -103,7 +132,7 @@ datacube.read_spec(spec_path)
 datacube.read_template(template_path, n_intp=2, name=name, verbose=False)
 datacube.read_cc_result(CC_res_path)
 
-# BCG
+# set BCG position
 datacube.assign_BCG_coordinate(coords_BCG)
 
 if double_cluster:
@@ -113,12 +142,12 @@ else:
                                               datacube.coord_BCG.dec, 0)
     datacube.pos_BCG = (X_BCG, Y_BCG)
 
-# Candidate
+# Get candidate number
 candidate_path_V = os.path.join(candidate_path,"V/%s#*.png"%name)
 dir_V = glob.glob(candidate_path_V)
 Num_V = np.sort(np.array([re.compile(r'\d+').findall(el)[-1] for el in dir_V]).astype("int"))
 
-# Measure
+# Measure centroids
 print("Measure Centroid...")
 datacube.centroid_analysis_all(Num_V, nums_obj=Num_V, centroid_type="ISO-D", sub_cont=sub_cont,
                                sn_thre=sn_thre, sum_type=sum_type, morph_cen=False, verbose=False)
@@ -128,39 +157,40 @@ datacube.centroid_analysis_all(Num_V, nums_obj=Num_V, centroid_type="ISO-D",
 
 # Save
 if save:
+    if identifier == '': identifier=name[-1]
     datacube.save_centroid_measurement(Num_V, save_path=save_path,
-                                       suffix=suffix, ID_field=name[-1])
+                                       suffix=suffix, identifier=identifier)
 
 # Plot histogram
-z_V =  datacube.get_CC_result_best('z_best', 'Ha-NII_gauss', Num_V)
+if plot:
+    z_V =  datacube.get_CC_result_best('z_best', 'Ha-NII_gauss', Num_V)
 
-diff_angle_iso_d = datacube.get_centroid_result('diff_angle', 'ISO-D', fill_value=0)
-diff_angle_std_iso_d = datacube.get_centroid_result('diff_angle_std', 'ISO-D', fill_value=99)
-cen_off_iso_d = datacube.get_centroid_result('cen_offset', 'ISO-D', fill_value=0)
-cen_off_std_iso_d = datacube.get_centroid_result('cen_offset_std', 'ISO-D', fill_value=99)
+    diff_angle_iso_d = datacube.get_centroid_result('diff_angle', 'ISO-D', fill_value=0)
+    diff_angle_std_iso_d = datacube.get_centroid_result('diff_angle_std', 'ISO-D', fill_value=99)
+    cen_off_iso_d = datacube.get_centroid_result('cen_offset', 'ISO-D', fill_value=0)
+    cen_off_std_iso_d = datacube.get_centroid_result('cen_offset_std', 'ISO-D', fill_value=99)
 
-diff_angle_iso_dm = datacube.get_centroid_result('diff_angle', 'ISO-Dm', fill_value=0)
-cen_off_iso_dm = datacube.get_centroid_result('cen_offset', 'ISO-Dm', fill_value=0)
-cen_off_std_iso_dm = datacube.get_centroid_result('cen_offset_std', 'ISO-Dm', fill_value=99)
+    diff_angle_iso_dm = datacube.get_centroid_result('diff_angle', 'ISO-Dm', fill_value=0)
+    cen_off_iso_dm = datacube.get_centroid_result('cen_offset', 'ISO-Dm', fill_value=0)
+    cen_off_std_iso_dm = datacube.get_centroid_result('cen_offset_std', 'ISO-Dm', fill_value=99)
 
-def condition_1(cen_off, cen_off_std, z_V):
-    return (cen_off>0.85) & (cen_off>3*cen_off_std) & (abs(z_V-z0)<0.015)
+    def condition_1(cen_off, cen_off_std, z_V):
+        return (cen_off>0.85) & (cen_off>3*cen_off_std) & (abs(z_V-z0)<0.015)
 
-def condition_2(cen_off, cen_off_std, z_V):
-    return (cen_off>0.85+3*cen_off_std) & (abs(z_V-z0)<0.015)
+    def condition_2(cen_off, cen_off_std, z_V):
+        return (cen_off>0.85+3*cen_off_std) & (abs(z_V-z0)<0.015)
 
-d_angle_d1 = diff_angle_iso_d[condition_1(cen_off_iso_d, cen_off_std_iso_d, z_V)]
-d_angle_dm1 = diff_angle_iso_dm[condition_1(cen_off_iso_dm, cen_off_std_iso_dm, z_V)]
+    d_angle_d1 = diff_angle_iso_d[condition_1(cen_off_iso_d, cen_off_std_iso_d, z_V)]
+    d_angle_dm1 = diff_angle_iso_dm[condition_1(cen_off_iso_dm, cen_off_std_iso_dm, z_V)]
 
-d_angle_d2 = diff_angle_iso_d[condition_2(cen_off_iso_d, cen_off_std_iso_d, z_V)]
-d_angle_dm2 = diff_angle_iso_dm[condition_2(cen_off_iso_dm, cen_off_std_iso_dm, z_V)]
+    d_angle_d2 = diff_angle_iso_d[condition_2(cen_off_iso_d, cen_off_std_iso_d, z_V)]
+    d_angle_dm2 = diff_angle_iso_dm[condition_2(cen_off_iso_dm, cen_off_std_iso_dm, z_V)]
 
-# Plot
-fig, (ax1,ax2)=plt.subplots(1,2,figsize=(11,4))
-ax1.hist(d_angle_d1-2, bins=np.linspace(0,180,8)-2,histtype="step",hatch="/", lw=4, alpha=0.7,label='ISO-1')
-ax1.hist(d_angle_dm1, bins=np.linspace(0,180,8),histtype="step", lw=4, hatch="", alpha=0.7,label='morph-1')
-ax1.legend()
-ax2.hist(d_angle_d2-2, bins=np.linspace(0,180,8)-2,histtype="step",hatch="/", lw=4, alpha=0.7,label='ISO-2')
-ax2.hist(d_angle_dm2, bins=np.linspace(0,180,8),histtype="step", lw=4, hatch="", alpha=0.7,label='morph-2')
-ax2.legend()
-plt.show()
+    # Plot
+    fig, (ax1,ax2)=plt.subplots(1,2,figsize=(11,4))
+    ax1.hist(d_angle_d1-2, bins=np.linspace(0,180,8)-2,histtype="step",hatch="/", lw=4, alpha=0.7,label='ISO-1')
+    ax1.hist(d_angle_dm1, bins=np.linspace(0,180,8),histtype="step", lw=4, hatch="", alpha=0.7,label='morph-1')
+    ax1.legend()
+    ax2.hist(d_angle_d2-2, bins=np.linspace(0,180,8)-2,histtype="step",hatch="/", lw=4, alpha=0.7,label='ISO-2')
+    ax2.hist(d_angle_dm2, bins=np.linspace(0,180,8),histtype="step", lw=4, hatch="", alpha=0.7,label='morph-2')
+    ax2.legend()

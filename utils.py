@@ -13,7 +13,7 @@ import pandas as pd
 
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, RationalQuadratic
-from skimage.morphology import dilation
+from skimage.morphology import dilation, closing
 
 import astropy.units as u
 from astropy.wcs import WCS
@@ -78,7 +78,7 @@ def gaussian_func(x, a, sigma):
             return a * np.exp(-x**2/(2*sigma**2))
 
 def colorbar(mappable, pad=0.2, size="5%", loc="right",
-             direction='out', labelsize=10, length=10, **args):
+             direction='out', labelsize=10, length=10, **kwargs):
     from mpl_toolkits.axes_grid1 import make_axes_locatable
     ax = mappable.axes
     fig = ax.figure
@@ -91,7 +91,7 @@ def colorbar(mappable, pad=0.2, size="5%", loc="right",
         orent = "vertical"
         rot = 0
     cax = divider.append_axes(loc, size=size, pad=pad)
-    cb = fig.colorbar(mappable, cax=cax, orientation=orent, **args)
+    cb = fig.colorbar(mappable, cax=cax, orientation=orent, **kwargs)
     cb.ax.tick_params(direction=direction, length=length, labelsize=labelsize) 
     return cb
 
@@ -1137,7 +1137,7 @@ def measure_dist_to_edge(table, mask_edge, pad=200,
     
 def estimate_EW(spec, wavl, z, 
                 lam_0=6563., sigma=5, edge=10,
-                MC_err=False, n_MC=250, spec_err=0.15, 
+                MC_err=False, n_MC=200, spec_err=0.15, 
                 cont=None, ax=None, plot=True):
     """ Estimate Equivalent Width of the line(s) """
     
@@ -1158,8 +1158,7 @@ def estimate_EW(spec, wavl, z,
     
     if MC_err is True:
         if np.ndim(spec_err)==0:
-#             y_std = mad_std(y_cont)
-            y_std = np.std(y_cont)
+            y_std = mad_std(y_cont)
             y_err = y_std * np.ones(line_range.sum())
             
 #             y_err = spec_err*(abs(y-cont))/cont
@@ -1186,6 +1185,80 @@ def estimate_EW(spec, wavl, z,
         ax.set_ylabel(r'Flux ($\rm 10^{-17}\,erg/cm^2/s/\AA$)',fontsize=13) 
         
     return EW, EW_std
+
+def estimate_Flux(spec, wavl, z, 
+                  lam_0=6563., sigma=5, 
+                  n_MC=250, edge=10, 
+                  unit='10^{-17}\,erg/cm^2/s',
+                  ax=None, plot=True):
+    """ Estimate Flux of the line(s) from residual spectrum """
+    
+    # window range to estimate EW. Filter edges excluded.
+    not_at_edge = lambda x: (wavl>wavl.min()+x) & (wavl<wavl.max()-x)
+    line_range = (wavl > lam_0*(1+z)-5*sigma) & (wavl < lam_0*(1+z)+5*sigma) & not_at_edge(edge)
+    
+    # estimate conitinum
+    y_cont = spec[(~line_range) & not_at_edge(2*edge)]
+    y_cont = sigma_clip(y_cont, sigma=3, maxiters=10)
+    cont = np.mean(y_cont)
+    cont_std = mad_std(y_cont)
+    
+    x = wavl[line_range]
+    y = spec[line_range]
+    Flux = np.trapz(y=y, x=x)
+    
+    # Perturb emission line w/ continuum error
+    y_prtb = y + np.random.normal(0, cont_std, size=(n_MC, len(y)))
+    Flux_prtb = np.trapz(y=y_prtb, x=x, axis=1)
+    
+    # 1 sigma range of Flux
+    Flux_lo, Flux_hi = np.quantile(Flux_prtb, [0.16, 0.84])
+    
+    if plot:
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10,4))
+        ax.step(wavl, spec, where="mid", color="k",alpha=0.9)
+        ax.step(x, y, where="mid")
+        for i in range(n_MC):
+            ax.step(x, y_prtb[i], color='gray', where="mid", lw=1, alpha=0.05, zorder=0)
+        ax.axhline(cont,color="seagreen",alpha=0.8)
+        x_text = 0.7 if z < 0.24 else 0.1
+        ax.text(x_text, 0.8, r"$\rm {%.2f}^{+%.2f}_{-%.2f}\times{%s}$"%(Flux, Flux-Flux_lo, Flux_hi-Flux, unit),
+                color='k', fontsize=13, transform=ax.transAxes, alpha=0.95)
+        ax.set_xlabel('Wavelength ($\AA$)',fontsize=16)
+        ax.set_ylabel(r'Flux ($\rm 10^{-17}\,erg/cm^2/s/\AA$)',fontsize=16) 
+        
+    return Flux, Flux_lo, Flux_hi
+
+
+def measure_Flux_pipe(datacube, table, hdu_spec):
+    """ Measure continua-normed Ha+NII Flux of candidates in table """
+    name = datacube.name
+    
+    hdu_spec=fits.open(hdu_spec)
+    obj_spec = hdu_spec[2].data
+
+    Ind = table.to_pandas()['ID'].str.strip(name[-1]).astype(int)-1
+    redshift = table['z']
+    wavl = datacube.wavl
+    
+    Flux, Flux_lo, Flux_hi, Cont = [np.zeros_like(Ind, dtype=float) for i in range(4)]
+
+    for i in range(len(Ind)):
+        spec = obj_spec[Ind][i]
+        res, w_rebin, c_fit = fit_continuum(spec, wavl, norm=False, plot=False)
+        Flux[i], Flux_lo[i], Flux_hi[i] = estimate_Flux(res, w_rebin, z=redshift[i], plot=False)
+        Cont[i] = np.median(c_fit)
+    
+    Cont[Cont<0] = np.nan
+    Flux_lo[Flux_lo<=0] = 1e-2
+    
+    # Add to table
+    table['flux'], table['continuum'] = Flux, Cont
+    table['flux_lo'], table['flux_hi'] = Flux_lo, Flux_hi
+    table['flux_normed'] = Flux/Cont        
+    table['flux_lo_normed'], table['flux_hi_normed'] = Flux_lo/Cont, Flux_hi/Cont
+
 
     
 def save_ds9_region(name, obj_pos, size, color="green", origin=1, save_path=''):
@@ -1401,7 +1474,7 @@ def measure_offset_isoF(seg_obj, img_em, img_con,
 
 def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
                         std_map_em=None, std_map_con=None, sn_thre=1.5,
-                        niter_iso=5, ctol_iso=0.01, n_dilation=1, fwhm=3):
+                        niter_iso=5, ctol_iso=0.01, n_closing=1, fwhm=3):
     
     """ Measure centroid with deformable isophote """
     
@@ -1462,8 +1535,8 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
             if reach_ctol:
                 break
             else:
-                for i in range(n_dilation):
-                    mask_new = dilation(mask_new)
+                for i in range(n_closing):
+                    mask_new = closing(mask_new)
                     
                 # new mask is the new segmentation removing nearby sources
                 mask = np.logical_not(mask_new * obj.seg_tot)
@@ -1551,8 +1624,8 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             niter_iso=15, ctol_iso=0.01,
                             sn_thre=2.0, n_dilation=1, morph_cen=False,
                             line_stddev=3, line_ratio=None, mag0=25.2,
-                            affil_map=None,
-                            plot=True, verbose=True,
+                            affil_map=None, field='',
+                            plot=True, plot_style='2', verbose=True,
                             fwhm=3, smooth=False,
                             uncertainty=True, 
                             return_image=False, **kwargs):    
@@ -1585,7 +1658,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         cube = obj.cube_thumb
     
     # Make emission image and continuum image from datacube
-    cube_con_clip = sigma_clip(cube[con,:,:], sigma=3, maxiters=20, axis=0)
+    cube_con_clip = sigma_clip(cube[con,:,:], sigma=3, maxiters=0, axis=0)
     img_con = np.mean(cube_con_clip, axis=0).data
     
     if sum_type=="mean":
@@ -1687,114 +1760,221 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         if centroid_type=="APER":
             aper_em, aper_con = res_cen["aper_em"], res_cen["aper_con"]
             aper_ems_eff, aper_cons_eff = res_cen["aper_ems_eff"], res_cen["aper_cons_eff"]
-        
-        plt.figure(figsize=(14,10))
-        
-        ax0 = plt.subplot2grid((5, 1), (0, 0), colspan=1, rowspan=2)
-        ax0.hlines(0, xmin=wavl[0], xmax=wavl[-1], color='k',
-                   linewidth=2,linestyle='--', alpha=0.9)
-        ax0.step(wavl, spec, color="k",  where='mid', alpha=0.7,lw=4)
-        ax0.step(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))],
-                 color="firebrick", where='mid', alpha=0.9,lw=5)
-        ax0.step(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))],
-                 color="firebrick", where='mid', alpha=0.9,lw=5)
-        ax0.fill_between(wavl[con & (wavl>6563.*(1+z_cc))],
-                         spec[con & (wavl>6563.*(1+z_cc))], 0,
-                         step='mid', color="firebrick", alpha=0.3)
-        ax0.fill_between(wavl[con & (wavl<6563.*(1+z_cc))],
-                         spec[con & (wavl<6563.*(1+z_cc))], 0,
-                         step='mid', color="firebrick", alpha=0.3)
-        em_dl = convolve(em, kernel=[1,1,1]).astype(bool)
-        ax0.step(wavl[em_dl],spec[em_dl],color="steelblue", where='mid', alpha=1,lw=5.5)
-        ax0.fill_between(wavl[em_dl],spec[em_dl],0, step='mid', color="steelblue", alpha=0.3)
-        
-#         ax0.axvline(np.max([wavl[0], wavl[em_dl][0]]), color="steelblue", lw=2., ls="-.", alpha=0.7)
-#         ax0.axvline(np.min([wavl[-1], wavl[em_dl][-1]]), color="steelblue", lw=2., ls="-.", alpha=0.7)
-        ax0.set_xlabel('Wavelength ($\AA$)',fontsize=20)
-        ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2$)',fontsize=20)
-        ax0.text(0.8,0.85,"z = %.3f"%z_cc,color="k",fontsize=22,transform=ax0.transAxes)
-        ax0.text(0.05,0.85,"#%sE"%obj.number,color="k",fontsize=22,transform=ax0.transAxes)
-
-        ax1 = plt.subplot2grid((5, 9), (2, 0), colspan=3, rowspan=3)
-        s1 = ax1.imshow(img_em, origin="lower",cmap="viridis",
-                        vmin=0.0, vmax=0.1, norm=AsinhNorm(a=0.1))
-#         colorbar(s1, pad=0., direction='in', length=12, labelsize=14)
-
-        ax2 = plt.subplot2grid((5, 9), (2, 3), colspan=3, rowspan=3)
-        s2 = ax2.imshow(img_con, origin="lower",cmap="hot",
-                        vmin=0.00, vmax=0.1, norm=AsinhNorm(a=0.1))
-#         colorbar(s2, pad=0., direction='in', length=12, labelsize=14)
-        
-        ax3 = plt.subplot2grid((5, 9), (2, 6), colspan=3, rowspan=3)
-        
-        if hasattr(obj, 'deep_thumb'):
-            s=ax3.imshow(obj.deep_thumb, origin="lower", cmap="gray",
-                         vmin=0.5, vmax=500, norm=AsinhNorm(a=0.01))
-#             colorbar(s, pad=0., direction='in', length=12, labelsize=14)
-        xlim,ylim = ax3.get_xlim(), ax3.get_ylim()
-        if centroid_type == "APER":
-            for k, (aper1, aper2) in enumerate(zip(aper_ems_eff,aper_cons_eff)):
-                try:
-                    aper1.plot(color='violet',lw=1,axes=ax1,alpha=0.7)
-                    aper2.plot(color='w',lw=1,axes=ax2,alpha=0.7) 
-                except AttributeError:
-                    pass                    
-            aper_em.plot(color='violet',lw=3,axes=ax1,alpha=0.95)
-            aper_con.plot(color='w',lw=3,axes=ax2,alpha=0.95)
-        else:
-            if centroid_type == 'ISO-D':
-                ax1.contour(res_cen["seg_em"], colors="violet", levels = [0.5], alpha=0.9, linewidths=3)
-                ax2.contour(res_cen["seg_con"], colors="w", levels = [0.5], alpha=0.9, linewidths=3)
-#             ax1.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
-#             ax2.contour(seg_obj, colors="gold", levels = [0.5], alpha=0.9, linewidths=2)
-        
-        val_em_max = data_em.max()
-        ax3.contour(data_em, colors="skyblue", alpha=0.9, linewidths=2,
-                    levels=np.array([0.1,0.4,0.7,1]) * val_em_max)
-
-        # Ticks
-        tick_base = 10 if img_em.shape[0]<100 else 20
-        loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
-        for ax in (ax1, ax2, ax3):
-            ax.grid()
-            plt.setp(ax.spines.values(), color='w')
-            plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
-            ax.xaxis.set_major_locator(loc)
-            ax.yaxis.set_major_locator(loc)
-            ax.tick_params(axis="y", color='w', width=2, direction="in", length=5, labelsize=0)
-            ax.tick_params(axis="x", color='w', width=2, direction="in", length=5, labelsize=0)
             
-            ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=0)
-            ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=0)
-            ax.set_xlabel("X (pix)",fontsize=0)
-            ax.set_ylabel("Y (pix)",fontsize=0)
-            ax.plot(x1, y1, color="violet", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=4)
-            ax.plot(x2, y2, color="w", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=3)
+        # style 1
+        if plot_style=='1':
+            plt.figure(figsize=(15,10))
+
+            ax0 = plt.subplot2grid((5, 1), (0, 0), colspan=1, rowspan=2)
+            ax0.hlines(0, xmin=wavl[0]-50, xmax=wavl[-1]+50, color='k',
+                       linewidth=2,linestyle='--', alpha=0.9)
+            ax0.step(wavl, spec, color="k",  where='mid', alpha=0.7,lw=4)
+            ax0.step(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))],
+                     color="firebrick", where='mid', alpha=0.9,lw=5)
+            ax0.step(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))],
+                     color="firebrick", where='mid', alpha=0.9,lw=5)
+            ax0.fill_between(wavl[con & (wavl>6563.*(1+z_cc))],
+                             spec[con & (wavl>6563.*(1+z_cc))], 0,
+                             step='mid', color="firebrick", alpha=0.3)
+            ax0.fill_between(wavl[con & (wavl<6563.*(1+z_cc))],
+                             spec[con & (wavl<6563.*(1+z_cc))], 0,
+                             step='mid', color="firebrick", alpha=0.3)
+            em_dl = convolve(em, kernel=[1,1,1]).astype(bool)
+            ax0.step(wavl[em_dl],spec[em_dl],color="steelblue", where='mid', alpha=1,lw=5.5)
+            ax0.fill_between(wavl[em_dl],spec[em_dl],0, step='mid', color="steelblue", alpha=0.3)
+
+            ax0.set_xlabel('Wavelength ($\AA$)',fontsize=20)
+            ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2/\AA$)',fontsize=20)
+            ax0.set_xlim(wavl[0]-20, wavl[-1]+20)
+            ax0.text(0.8,0.85,"z = %.4f"%z_cc,color="k",fontsize=22,transform=ax0.transAxes)
+            ax0.text(0.05,0.85,"#%s%s"%(obj.number,field),color="k",fontsize=22,transform=ax0.transAxes)
+
+            i,j = img_em.shape[0] // 10, img_em.shape[1] // 10
+
+            ax1 = plt.subplot2grid((5, 9), (2, 0), colspan=3, rowspan=3)
+            s1 = ax1.imshow(img_em[i:-i, j:-j], origin="lower",cmap="viridis",
+                            vmin=0.0, vmax=0.1, norm=AsinhNorm(a=0.5))
+            colorbar(s1, pad=0.1, direction='in', length=10, labelsize=14)
+
+            ax2 = plt.subplot2grid((5, 9), (2, 3), colspan=3, rowspan=3)
+            s2 = ax2.imshow(img_con[i:-i, j:-j], origin="lower",cmap="hot",
+                            vmin=0.00, vmax=0.1, norm=AsinhNorm(a=0.5))
+            colorbar(s2, pad=0.1, direction='in', length=10, labelsize=14)
+
+            ax3 = plt.subplot2grid((5, 9), (2, 6), colspan=3, rowspan=3)
+
+            if hasattr(obj, 'deep_thumb'):
+                s=ax3.imshow(obj.deep_thumb[i:-i, j:-j], origin="lower", cmap="gray",
+                             vmin=0.5, vmax=200, norm=AsinhNorm(a=0.5))
+                colorbar(s, pad=0.1, direction='in', length=10, labelsize=14)
+            xlim,ylim = ax3.get_xlim(), ax3.get_ylim()
+            if centroid_type == "APER":
+                for k, (aper1, aper2) in enumerate(zip(aper_ems_eff,aper_cons_eff)):
+                    try:
+                        aper1.plot(color='violet',lw=1,axes=ax1,alpha=0.7)
+                        aper2.plot(color='w',lw=1,axes=ax2,alpha=0.7) 
+                    except AttributeError:
+                        pass                    
+                aper_em.plot(color='violet',lw=3,axes=ax1,alpha=0.95)
+                aper_con.plot(color='w',lw=3,axes=ax2,alpha=0.95)
+            else:
+                if centroid_type == 'ISO-D':
+                    ax1.contour(res_cen["seg_em"][i:-i, j:-j], colors="violet", levels = [0.5], alpha=0.9, linewidths=2)
+                    ax2.contour(res_cen["seg_con"][i:-i, j:-j], colors="w", levels = [0.5], alpha=0.9, linewidths=2)
+
+            val_em_max = data_em.max()
+            ax3.contour(data_em[i:-i, j:-j], colors="skyblue", alpha=0.9, linewidths=2,
+                        levels=np.array([0.1,0.4,0.7,1]) * val_em_max)
+
+            # Ticks
+            tick_base = 10 if img_em.shape[0]<100 else 20
+            loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
+            for ax in (ax1, ax2, ax3):
+                ax.grid()
+                plt.setp(ax.spines.values(), color='w')
+                plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
+                ax.xaxis.set_major_locator(loc)
+                ax.yaxis.set_major_locator(loc)
+                ax.tick_params(axis="y", color='k', width=2, direction="in", length=5, labelsize=20)
+                ax.tick_params(axis="x", color='k', width=2, direction="in", length=5, labelsize=20)
+
+                ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=14)
+                ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=14)
+                ax.set_xlabel("X (pix)",fontsize=16)
+                ax.set_xlim(xlim)
+                ax.set_ylim(ylim)
+
+                cen_aper1 = EllipticalAperture(positions=(x1,y1), a=std_pos1[0], b=std_pos1[1], theta=0)   
+                cen_aper1.plot(color='violet',lw=1,ls="--",axes=ax,alpha=0.7)
+                cen_aper2 = EllipticalAperture(positions=(x2,y2), a=std_pos2[0], b=std_pos2[1], theta=0)   
+                cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
+
+                ax1.plot(x1-j, y1-i, color="violet", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=4)
+                ax2.plot(x2-j, y2-i, color="w", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=3)
+                ax3.plot(x1-j, y1-i, color="violet", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=4)
+                ax3.plot(x2-j, y2-i, color="w", marker="o", ms=6, mew=2, mec="k", alpha=0.95, zorder=3)
+
+            ax1.set_ylabel("Y (pix)",fontsize=16)
+
+            ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
+                      edgecolor="orange", facecolor='none',
+                      head_width=0.03, head_length=0.03,lw=3,transform=ax2.transAxes,alpha=0.95)
+            ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,
+                      edgecolor="lightblue", facecolor='none',
+                     head_width=0.03, head_length=0.03,lw=3,transform=ax2.transAxes,alpha=0.95)
+
+            ax1.text(0.05,0.9, r"$\bf Emission$",color="violet",fontsize=18,transform=ax1.transAxes, zorder=4)
+            ax2.text(0.05,0.9, r"$\bf Continuum$",color="w",fontsize=18,transform=ax2.transAxes, zorder=4)
+            ax3.text(0.05,0.9, r"$\bf Deep$",color="gold",fontsize=18,transform=ax3.transAxes, zorder=4)
+
+            ax2.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax2.transAxes)
+            ax2.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=15,transform=ax2.transAxes)
+            #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
+            #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
+            if np.ndim(coord_BCG)>0:
+                text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
+                ax2.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
+            plt.subplots_adjust(left=0.08,right=0.95,top=0.95, bottom=0.02, wspace=2.5, hspace=0.1)
             
-            cen_aper1 = EllipticalAperture(positions=(x1,y1), a=std_pos1[0], b=std_pos1[1], theta=0)   
-            cen_aper1.plot(color='violet',lw=1,ls="--",axes=ax,alpha=0.7)
-            cen_aper2 = EllipticalAperture(positions=(x2,y2), a=std_pos2[0], b=std_pos2[1], theta=0)   
-            cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
-        
-        
-        ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
-                  edgecolor="orange", facecolor='none',
-                  head_width=0.03, head_length=0.03,lw=3,transform=ax2.transAxes,alpha=0.95)
-        ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,
-                  edgecolor="lightblue", facecolor='none',
-                 head_width=0.03, head_length=0.03,lw=3,transform=ax2.transAxes,alpha=0.95)
-        
-        
-        
-        ax3.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax3.transAxes)
-        ax3.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=14,transform=ax3.transAxes)
-        #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
-        #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
-        if np.ndim(coord_BCG)>0:
-            text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
-            ax2.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
-        plt.subplots_adjust(left=0.08,right=0.95,top=0.95, bottom=0.02, wspace=2, hspace=0.2)
-    
+        elif plot_style=='2':
+            plt.figure(figsize=(25,5))
+
+            ax0 = plt.subplot2grid((1, 16), (0, 0), colspan=8, rowspan=1)
+            ax0.hlines(0, xmin=wavl[0]-50, xmax=wavl[-1]+50, color='k',
+                       linewidth=2,linestyle='--', alpha=0.9)
+            ax0.step(wavl, spec, color="k",  where='mid', alpha=0.7,lw=4)
+            ax0.step(wavl[con & (wavl<6563.*(1+z_cc))], spec[con & (wavl<6563.*(1+z_cc))],
+                     color="firebrick", where='mid', alpha=0.9,lw=5)
+            ax0.step(wavl[con & (wavl>6563.*(1+z_cc))], spec[con & (wavl>6563.*(1+z_cc))],
+                     color="firebrick", where='mid', alpha=0.9,lw=5)
+            ax0.fill_between(wavl[con & (wavl>6563.*(1+z_cc))],
+                             spec[con & (wavl>6563.*(1+z_cc))], 0,
+                             step='mid', color="firebrick", alpha=0.3)
+            ax0.fill_between(wavl[con & (wavl<6563.*(1+z_cc))],
+                             spec[con & (wavl<6563.*(1+z_cc))], 0,
+                             step='mid', color="firebrick", alpha=0.3)
+            em_dl = convolve(em, kernel=[1,1,1]).astype(bool)
+            ax0.step(wavl[em_dl],spec[em_dl],color="steelblue", where='mid', alpha=1,lw=5.5)
+            ax0.fill_between(wavl[em_dl],spec[em_dl],0, step='mid', color="steelblue", alpha=0.3)
+
+            ax0.set_xlabel('Wavelength ($\AA$)',fontsize=24)
+            ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2/\AA$)',fontsize=22)
+            ax0.set_xlim(wavl[0]-20, wavl[-1]+20)
+            ax0.text(0.8,0.85,"z = %.4f"%z_cc,color="k",fontsize=24,transform=ax0.transAxes)
+            ax0.text(0.03,0.85,"#%s%s"%(obj.number,field),color="k",fontsize=24,transform=ax0.transAxes)
+
+            i,j = img_em.shape[0] // 10, img_em.shape[1] // 10
+            
+            ax1 = plt.subplot2grid((1, 16), (0, 9), colspan=3, rowspan=1)
+            s1 = ax1.imshow(img_em[i:-i, j:-j], origin="lower",cmap="viridis",
+                            vmin=0.0, vmax=0.15)
+            colorbar(s1, pad=0.05, direction='in', length=10, labelsize=16)
+
+            ax1.contour(res_cen["seg_em"][i:-i, j:-j], colors="violet", levels = [0.5], alpha=0.9, linewidths=3.5)
+            
+            ax2 = plt.subplot2grid((1, 16), (0, 13), colspan=3, rowspan=1)
+            s2 = ax2.imshow(img_con[i:-i, j:-j], origin="lower",cmap="hot",
+                            vmin=0.00, vmax=0.1)
+            colorbar(s2, pad=0.05, direction='in', length=10,labelsize=16)
+
+            if centroid_type == "APER":
+                for k, (aper1, aper2) in enumerate(zip(aper_ems_eff,aper_cons_eff)):
+                    try:
+                        aper1.plot(color='violet',lw=1,axes=ax1,alpha=0.7)
+                        aper2.plot(color='w',lw=1,axes=ax2,alpha=0.7) 
+                    except AttributeError:
+                        pass                    
+                aper_em.plot(color='violet',lw=3,axes=ax1,alpha=0.95)
+                aper_con.plot(color='w',lw=3,axes=ax2,alpha=0.95)
+            else:
+                if centroid_type == 'ISO-D':
+                    ax2.contour(res_cen["seg_con"][i:-i, j:-j], colors="w", levels = [0.5], alpha=0.9, linewidths=3)
+
+            val_em_max = data_em.max()
+            ax2.contour(data_em[i:-i, j:-j], colors="skyblue", alpha=0.9, linewidths=3.5,
+                        levels=np.array([0.1,0.4,0.7,0.99]) * val_em_max)
+
+            # Ticks
+            tick_base = 10 if img_em.shape[0]<100 else 20
+            loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
+            for ax in ([ax1, ax2]):
+                ax.grid()
+                plt.setp(ax.spines.values(), color='w')
+                plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
+                ax.xaxis.set_major_locator(loc)
+                ax.yaxis.set_major_locator(loc)
+                ax.tick_params(axis="y", color='k', width=2, direction="in", length=5, labelsize=18)
+                ax.tick_params(axis="x", color='k', width=2, direction="in", length=5, labelsize=18)
+
+                ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=18)
+                ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=18)
+                ax.set_xlabel("X (pix)",fontsize=22)
+                
+                cen_aper1 = EllipticalAperture(positions=(x1,y1), a=std_pos1[0], b=std_pos1[1], theta=0)   
+                cen_aper1.plot(color='violet',lw=1,ls="--",axes=ax,alpha=0.7)
+                cen_aper2 = EllipticalAperture(positions=(x2,y2), a=std_pos2[0], b=std_pos2[1], theta=0)   
+                cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
+
+                ax.plot(x1-j, y1-i, color="violet", marker="o", ms=8, mew=3, mec="k", alpha=0.95, zorder=4)
+                ax.plot(x2-j, y2-i, color="w", marker="o", ms=8, mew=3, mec="k", alpha=0.95, zorder=3)
+
+            ax1.set_ylabel("Y (pix)",fontsize=22)
+            ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
+                      edgecolor="orange", facecolor='none',
+                      head_width=0.03, head_length=0.03,lw=4,transform=ax2.transAxes,alpha=0.95)
+            ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,
+                      edgecolor="lightblue", facecolor='none',
+                     head_width=0.03, head_length=0.03,lw=4,transform=ax2.transAxes,alpha=0.95)
+
+            ax2.text(0.05,0.05,r"$\bf \theta:{\ }%.1f^{\circ}$"%diff_angle,color="whitesmoke",fontsize=20,transform=ax2.transAxes)
+            ax2.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="whitesmoke",fontsize=20,transform=ax2.transAxes)
+            #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
+            #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
+            if np.ndim(coord_BCG)>0:
+                text, color = (r'$\bf NE$', 'thistle') if lab==1 else (r'$\bf SW$', 'thistle')
+                ax2.text(0.8, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
+            plt.subplots_adjust(left=0.05,right=0.95,top=0.95, bottom=0.2, wspace=0.1, hspace=0.1)
+            
     return res_measure
 
     
@@ -1813,12 +1993,14 @@ def measure_pa_offset(pos1, pos2, std_pos1=None, std_pos2=None, origin=0):
         std_y1_y2 = math.sqrt(std_y1**2+std_y2**2)
         
         # std<Y/X> = (Xstd<Y>-Ystd<X>) / X^2
-        # std<atan(Y/X)> = std<Y/X> / (Y/X)^2+1) = (Xstd<Y>-Ystd<X>)/(X^2+Y^2)
-        pa_rad_std = math.sqrt((x2-x1)**2*(std_y1_y2**2) + (y2-y1)**2*(std_x1_x2**2)) / offset**2
+        # std<atan(Y/X)> = std<Y/X> / (Y/X)^2+1) = std<Xstd<Y>-Ystd<X>>/(X^2+Y^2)
+#         pa_rad_std = math.sqrt((x2-x1)**2*(std_y1_y2**2) + (y2-y1)**2*(std_x1_x2**2)) / offset**2
+        pa_rad_std = math.sqrt(((x1-x2)*std_y1_y2)**2 + ((y1-y2)*std_x1_x2)**2) / offset**2
         pa_std = pa_rad_std * (180/np.pi)
         # offset^2 = (x1-x2)^2+(y1-y2)^2
-        # => std<offset> = ((x1-x2)*std<x1+x2>+(y1-y2)*std<y1+y2>) / offset
-        offset_std = math.sqrt((x1-x2)**2*(std_x1_x2**2) + (y1-y2)**2*(std_y1_y2**2)) / offset
+        # => std<offset> = std<(x1-x2)*std<x1+x2>+(y1-y2)*std<y1+y2>> / offset
+#         offset_std = math.sqrt((x1-x2)**2*(std_x1_x2**2) + (y1-y2)**2*(std_y1_y2**2)) / offset
+        offset_std = math.sqrt(((x1-x2)*std_x1_x2)**2 + ((y1-y2)*std_y1_y2)**2) / offset
     else:
         pa_std, offset_std = 0, 0
         
@@ -1965,7 +2147,7 @@ def set_sextractor_radius(table, sex_table):
     # assign radii of source to table from sextractor tables (for plotting)
     radius = sex_table['equivalent_radius'].data
     num = sex_table["NUMBER"].astype(str)
-    table['radius'] = np.array([radius[num==re.findall(r'\d+', ID)[0][0]]
+    table['radius'] = np.array([radius[num==re.findall(r'\d+', str(ID))[0][0]]
                               for ID in table['ID']]).ravel()
     
 def stack_tables(tables, sex_tables=None, sep=3*u.arcsec):
@@ -2023,17 +2205,18 @@ def remove_by_ID(table, ID_rm=None):
 def calculate_coverage(coords_field, coord_BCG,
                        field_radius, wcs, plot=True):
     # calculate field coverages (size x size in pixel) in fraction
-
+    
+    if len(wcs.pixel_shape) == 3: wcs.pixel_shape = wcs.pixel_shape[:2]
+        
     p1, p2, p3, p4 = wcs.calc_footprint()
-
+    
     rv_ra = stats.uniform(loc=p3[0], scale=p1[0]-p3[0])
     rv_dec = stats.uniform(loc=p1[1], scale=p2[1]-p1[1])
 
     rvs_ra, rvs_dec = rv_ra.rvs(100000), rv_dec.rvs(100000)
     
-    cond_cover = [np.hypot(rvs_ra-coord[0], 
-                           rvs_dec-coord[1]) <= field_radius
-                  for coord in coords_field]
+    cond_cover = [(abs(rvs_ra-coord[0])<= field_radius) & (abs(rvs_dec-coord[1])<= field_radius)
+                  for coord in np.atleast_2d(coords_field)]
     covered = np.logical_or.reduce(cond_cover, axis=0)
     
     bins = np.linspace(0, 3.5*field_radius, 50)
@@ -2047,14 +2230,48 @@ def calculate_coverage(coords_field, coord_BCG,
         plt.figure(figsize=(6,6))
         plt.scatter(rvs_ra[~covered], rvs_dec[~covered], s=1, alpha=0.8)
         plt.scatter(rvs_ra[covered], rvs_dec[covered], c="r", s=1, alpha=0.8)
+        plt.scatter(coord_BCG[0], coord_BCG[1], c="violet", marker='p', edgecolors='k', s=200, alpha=0.8)
         plt.figure(figsize=(6,4))
         plt.plot(r_bin, frac_cover, "k-")
         plt.ylabel("Fraction of Spatial Coverage")
         plt.xlabel("Radius (deg)")
         
     return r_bin, frac_cover
+
+
+def display_image(image_filename, width='600px'):
+    from IPython.display import Image, HTML, display
+    Image="<img style='width: {:s};' src='{:s}' />".format(width, image_filename)
+    display(HTML(Image))
+    
+def display_images(image_filenames, width='600px'):
+    from IPython.display import Image, HTML, display
+    ImagesList=''.join( ["<img style='width: {:s}; margin: 0px; float: left; border: 1px solid black;' src='{:s}' />".format(width, filename) 
+                         for filename in sorted(image_filenames)])
+    display(HTML(ImagesList))
     
 
+def make_pdf(dir_name, name='A2390C', save_dir='./'):
+    # collect images in dir_name and converted into a single pdf
+    from fpdf import FPDF
+    
+    image_list = glob.glob(dir_name)
+
+    pdf = FPDF('P', 'cm', 'A4') # 21x27.9
+    pdf.set_font('Arial', '', 10)
+    # imagelist is the list with all image filenames
+    for k, fn in enumerate(image_list[:20]):
+        d = k%3
+        if d==0:
+            pdf.add_page()
+        pdf.image(fn, x=3.22, y=9.75*d+0.15, w=14.55, h=9.7)
+
+        ind = os.path.basename(fn).lstrip(name).rstrip('.png')
+        pdf.text(x=3.22, y=9.75*d+0.25, txt=ind)
+
+    pdf.output(os.path.join(save_dir, '%s_candidates.pdf'%(name)), "F")
+
+    
 class HidePrints:
     def __enter__(self):
         self._original_stdout = sys.stdout

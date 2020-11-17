@@ -900,8 +900,8 @@ class Read_Datacube:
                 else:
                     spurious_detection = (self.table[iloc]["PETRO_RADIUS"] <=0) | (self.table[iloc]["FLUX_AUTO"] <=0)
 
-                blank_array = np.zeros(len(self.wavl)+1)
-                random_array = np.random.rand(len(self.wavl)+1)
+                blank_array = np.zeros(len(self.wavl))
+                random_array = np.random.rand(len(self.wavl))
 
                 if spurious_detection:
                     if verbose:
@@ -1647,7 +1647,7 @@ class Read_Datacube:
         
         
     def centroid_analysis(self, num, z=None,
-                          centroid_type="APER", sum_type="weighted",
+                          centroid_type="ISO-D", sum_type="weighted",
                           subtract_continuum=True, from_SE=False,
                           line_width=None, multi_aper=True, **kwargs):
         """Centroid analysis for one candidate.
@@ -1686,7 +1686,6 @@ class Read_Datacube:
         
         if line_width is None:
             line_width = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss', nums=num)[0]
-#         try:
         affil_map = getattr(self, 'boundary_map', None)
         res_measure = compute_centroid_offset(obj, spec=spec, wavl=self.wavl,
                                               z_cc=z, wcs=self.wcs,
@@ -1780,11 +1779,11 @@ class Read_Datacube:
                 nums = nums.astype(str)
             return np.array([result[num].get(prop, fill_value) for num in nums])
     
-    def save_centroid_measurement(self, Num_v, save_path='./', suffix="", ID_field=""):
+    def save_centroid_measurement(self, Num_v, save_path='./', suffix="", identifier=""):
         if hasattr(self, 'result_centroid'):
             check_save_path(save_path)
             
-            ID = [str(num) + ID_field for num in Num_v]
+            ID = [str(num) + identifier for num in Num_v]
             pos = np.array([self.get_centroid(num) for num in Num_v])
             
             coords = np.around(self.wcs.all_pix2world(pos, 0),4)
