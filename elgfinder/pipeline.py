@@ -16,7 +16,8 @@ import warnings
 from astropy.wcs import FITSFixedWarning
 from photutils.utils import NoDetectionsWarning
     
-from utils import *
+from .utils import *
+from .plot import *
 
 
 def Read_SITELLE_DeepFrame(file_path, name, SE_catalog=None, seg_map=None, mask_edge=None):

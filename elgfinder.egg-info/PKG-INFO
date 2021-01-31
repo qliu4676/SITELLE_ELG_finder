@@ -1,0 +1,12 @@
+Metadata-Version: 1.2
+Name: elgfinder
+Version: 1.0
+Summary: Searching for Emission Line Galaxy in SITELLE Cube
+Home-page: https://github.com/NGC4676/SITELLE_ELG_finder
+Author: Qing Liu
+Author-email: qliu@astro.utoronto.ca
+License: UNKNOWN
+Description: # Cluster_SITELLE
+Keywords: astronomy
+Platform: UNKNOWN
+Requires-Python: >=3.5

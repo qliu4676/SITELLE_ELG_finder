@@ -1,5 +1,5 @@
-from pipeline import *
-from utils import *
+from .pipeline import *
+from .utils import *
 import getopt
 import warnings
 warnings.simplefilter('ignore', RuntimeWarning)
@@ -49,7 +49,7 @@ wavl_mask = [[7950,8006], [8020,8040], [8230,8280]]
 try:
     optlists, args = getopt.getopt(sys.argv[2:], "z:",
                                    ["SN_THRE=", "SUM_TYPE=", "SUB_CONT", "LPF",
-                                    "SAVE", 'PLOT', 'ID=', "OUT_DIR="])
+                                    "SAVE", "PLOT", "ID=", "OUT_DIR="])
     opts = [opt for opt, arg in optlists]        
 except getopt.GetoptError:
     print('Wrong Option.')

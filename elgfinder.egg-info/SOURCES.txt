@@ -1,0 +1,10 @@
+.DS_Store
+Find_Emission_Candidate.ipynb
+Find_Emission_Candidate.py
+Measure_Centroid.py
+README.md
+setup.py
+elgfinder.egg-info/PKG-INFO
+elgfinder.egg-info/SOURCES.txt
+elgfinder.egg-info/dependency_links.txt
+elgfinder.egg-info/top_level.txt
