@@ -1,5 +1,5 @@
 """ 
-Search Emission-line Galaxy (ELG) candidates in the cluster using the SITELLE datacube
+Search for Emission-line Galaxy (ELG) candidates in the SITELLE datacube
 
 Usage: 
 1. from jupyter notebook

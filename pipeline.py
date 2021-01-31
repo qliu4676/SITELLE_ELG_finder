@@ -155,9 +155,10 @@ class DeepFrame:
         
         self.field_sub = field_sub    
         
-    def calculate_seeing(self, tab_SDSS=None, R_pix=15, cut=[95,99.5], sep=1 * u.arcsec, sigma_guess=1., plot=False):
+    def calculate_seeing(self, SE_table=None, tab_SDSS=None, R_pix=15, cut=[95,99.5], 
+                         sep=1 * u.arcsec, sigma_guess=1., plot=False):
         """ 
-        Use central SDSS stars or brigh star-like objects (class_star>0.7) to calculate 
+        Use central SDSS stars or brigh star-like objects based on SExtractor (class_star>0.7) to calculate 
         median seeing fwhm by fitting gaussian profiles.
             
         Parameters
@@ -168,12 +169,12 @@ class DeepFrame:
         plot : plot radial profile for each object in use
         
         """
+        if SE_table is None:
+            table = self.table 
         
-        if self.table is None:
-            print("No SE measurement. Pass.")
+        if (table is None):
+            print("No measurement table provided. Exit.")
             return None
-        else:
-            table = self.table
             
         if tab_SDSS is None:
             # Cut in CLASS_STAR, roundness and brightness
@@ -751,31 +752,6 @@ class Read_Datacube:
         
         self.obj_nums = labels
         
-    def calculate_seeing(self, R_pix = 15, cut=[95,99.5], sigma_guess=1., plot=False):
-        """ 
-        Use the brigh star-like objects (class_star>0.7) to calculate 
-        median seeing fwhm by fitting gaussian profiles.
-            
-        Parameters
-        ----------
-        R_pix : max range of profiles to be fitted (in pixel)
-        cut : percentage of cut in isophotal magnitude
-        sigma_guess : initial guess of sigma of gaussian profile (in pixel) 
-        plot : plot radial profile for each object in use
-        
-        """
-        
-        # Cut in CLASS_STAR, measurable, roundness and mag threshold
-        star_cond = (self.table["CLASS_STAR"]>0.7) & (self.table["PETRO_RADIUS"]>0) \
-                    & (self.table["B_IMAGE"]/self.table["A_IMAGE"]>0.7) & (table["FLAGS"] <4)
-        tab_star = self.table[star_cond]
-        F_limit = np.percentile(tab_star["FLUX_AUTO"], cut)
-        tab_star = tab_star[(tab_star["FLUX_AUTO"]>F_limit[0])&(tab_star["FLUX_AUTO"]<F_limit[1])]
-        
-        FWHM = calculate_seeing(tab_star, self.stack_field, self.seg_map, 
-                                R_pix=R_pix, sigma_guess=sigma_guess, min_num=5, plot=True)
-        self.seeing_fwhm = np.median(FWHM)
-        print("Median seeing FWHM in arcsec: %.3f"%self.seeing_fwhm)
         
     def spec_extraction(self, num, ext_type='opt', 
                         ks = np.arange(1.,4.5,0.2), k1=5., k2=8.,
@@ -1453,6 +1429,7 @@ class Read_Datacube:
         Get the best matched value of a property from CC results.
         
         prop: 'sigma_best', 'ratio_best', 'z_best', 'SNR', 'R', ...
+        typ_mod: "Ha-NII_gauss", ...
         """
         
         if nums is None:
@@ -1647,9 +1624,9 @@ class Read_Datacube:
         
         
     def centroid_analysis(self, num, z=None,
-                          centroid_type="ISO-D", sum_type="weighted",
+                          centroid_type="ISO-D", sum_type="mean",
                           subtract_continuum=True, from_SE=False,
-                          line_width=None, multi_aper=True, **kwargs):
+                          line_width=5, multi_aper=True, **kwargs):
         """Centroid analysis for one candidate.
         
         Parameters
@@ -1659,7 +1636,7 @@ class Read_Datacube:
         centroid_type : method of computing centroid position for emission and continua
             "APER" : centroid computing within a fixed aperture, aperture from iterative photometry on the combined image
             "ISO-D" : centroid computing within isophotes (connected pixel map), isophotes from the combined image
-        line_width : width of emission window. Fixed for non-candidate.
+        line_width : width of emission-line window. Fixed for non-candidate.
         
         Returns
         ----------
@@ -1672,7 +1649,7 @@ class Read_Datacube:
         obj = Obj_detection(self.table[ind], dilation(self.seg_map), cube=self.cube,
                             deep_frame=self.deep_frame, mask_edge=self.mask_edge)
 
-        spec = self.obj_specs_det[ind]
+        spec = self.obj_specs_det[ind] # use LPF processed cube (fringe matters!)
 
         if from_SE is True:
             k_aper =  self.k_apers_det[ind][0]
@@ -1684,8 +1661,8 @@ class Read_Datacube:
         
         boundary_map = getattr(self, 'boundary_map', None)
         
-        if line_width is None:
-            line_width = self.get_CC_result_best('sigma_best', 'Ha-NII_gauss', nums=num)[0]
+        if line_width is None: line_width = 5
+            
         affil_map = getattr(self, 'boundary_map', None)
         res_measure = compute_centroid_offset(obj, spec=spec, wavl=self.wavl,
                                               z_cc=z, wcs=self.wcs,
@@ -1693,7 +1670,7 @@ class Read_Datacube:
                                               centroid_type=centroid_type,
                                               sum_type=sum_type, affil_map=affil_map,
                                               k_aper=k_aper, multi_aper=multi_aper,
-                                              line_stddev=line_width, 
+                                              line_width=line_width,
                                               subtract=subtract_continuum, **kwargs)
             
         return res_measure
@@ -1701,7 +1678,7 @@ class Read_Datacube:
     
     def centroid_analysis_all(self, Num_V, nums_obj=None,
                               centroid_type="APER", sum_type="weighted",
-                              sub_cont=True, morph_cen=False,
+                              sub_cont=True, fix_line_width=True, morph_cen=False,
                               plot=False, verbose=True, smooth=False, **kwargs):
         """Compute centroid offset and angle for all SE detections
         
@@ -1733,14 +1710,17 @@ class Read_Datacube:
 
             if num in Num_V:  # Candidate
                 z = self.z_best[ind]
-                line_width = self.sigma_best[ind]
+                if fix_line_width:
+                    line_width = 5
+                else:
+                    line_width = self.sigma_best[ind]
                 multi_aper = True
                 
             else:  # For non-emission galaxies, pick a random window excluding the edge 
                 z = np.random.uniform(low=(self.wavl[0]+25)/6563.-1, 
                                       high=(self.wavl[-1]-25)/6563.-1)
                 use_good = False
-                line_width = 3
+                line_width = 5
                 sub_cont = False
                 multi_aper = False
                 
@@ -1841,9 +1821,9 @@ class Read_Datacube:
         Num_c = np.intersect1d(Num_c_all, Num_mag_ctrl)
         
         # area cut
-        thre_iso_area = 10.
+        thre_iso_area = 8.
         print("Isophotal area threshold: ", thre_iso_area)
-        Num_area_ctrl = self.table["NUMBER"][self.table["ISOAREA_IMAGE"]>thre_iso_area]
+        Num_area_ctrl = self.table["NUMBER"][self.table["ISOAREA_IMAGE"]>=thre_iso_area]
         
         Num_c = np.intersect1d(Num_c, Num_area_ctrl)
         

@@ -95,6 +95,27 @@ def colorbar(mappable, pad=0.2, size="5%", loc="right",
     cb.ax.tick_params(direction=direction, length=length, labelsize=labelsize) 
     return cb
 
+def draw_scale_bar(ax, X_bar=20, Y_bar=15, y_text=10,
+                   scale=2*u.arcsec, pixel_scale=0.322,
+                   lw=4, fontsize=10, color='w',
+                   border_color='k', border_lw=0.5, alpha=1):
+    """ Draw a scale bar """
+    import matplotlib.patheffects as PathEffects
+    if (scale).unit.is_equivalent(u.arcsec):
+        L_bar = scale.to(u.arcsec).value/pixel_scale
+        txt = "%d''"%(scale.value)
+    elif (scale).unit.is_equivalent(u.kpc):
+        L_bar = scale.to(u.kpc).value/pixel_scale
+        txt = "%d kpc"%(scale.value)
+        
+    ax.plot([X_bar-L_bar/2, X_bar+L_bar/2], [Y_bar,Y_bar],
+            color=color, alpha=alpha, lw=lw,
+            path_effects=[PathEffects.SimpleLineShadow(), PathEffects.Normal()])
+    ax.text(X_bar, y_text, txt, color=color, alpha=alpha,
+            ha='center', va='center', fontweight='bold', fontsize=fontsize,
+            path_effects=[PathEffects.SimpleLineShadow(),
+            PathEffects.withStroke(linewidth=border_lw, foreground=border_color)])
+
 def LogNorm():
     from astropy.visualization import LogStretch
     return ImageNormalize(stretch=LogStretch())
@@ -1236,7 +1257,7 @@ def measure_Flux_pipe(datacube, table, hdu_spec):
     name = datacube.name
     
     hdu_spec=fits.open(hdu_spec)
-    obj_spec = hdu_spec[2].data
+    obj_spec = hdu_spec[2].data  # spectrum from LPF processed cube
 
     Ind = table.to_pandas()['ID'].str.strip(name[-1]).astype(int)-1
     redshift = table['z']
@@ -1504,9 +1525,8 @@ def measure_offset_isoD(obj, img_em, img_con, morph_cen=False,
                 warnings.simplefilter('ignore', NoDetectionsWarning)
                 segm = detect_sources(img, thre, npixels=5, mask=mask)
             
-#             #verify
+            #verify
 #             img2 = img.copy()
-#             img2[mask] = 0
 #             plt.imshow(img2, vmin=0, vmax=0.5,
 #                        norm=norm0, cmap='viridis' if d==0 else 'hot')
 #             plt.show()
@@ -1617,13 +1637,13 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                             coord_BCG=None,
                             edge=20, n_rand=99,
                             centroid_type="APER",
-                            subtract=True, sum_type="weighted", 
+                            subtract=True, sum_type="mean", 
                             k_apers=[2,5,8], multi_aper=True,
                             aper_size=[0.7,0.85,1.15,1.3,1.],
                             niter_aper=15, ctol_aper=0.01,
                             niter_iso=15, ctol_iso=0.01,
-                            sn_thre=2.0, n_dilation=1, morph_cen=False,
-                            line_stddev=3, line_ratio=None, mag0=25.2,
+                            sn_thre=2.5, n_dilation=1, morph_cen=False,
+                            line_width=5, line_ratio=None, mag0=25.2,
                             affil_map=None, field='',
                             plot=True, plot_style='2', verbose=True,
                             fwhm=3, smooth=False,
@@ -1632,9 +1652,9 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     """ Compute the centroid of emission and continua, and plot """
     
     # Window width of lines
-    w_l = 5
+    w_l = line_width
     em_range = ((6563.-w_l)*(1+z_cc), (6563.+w_l)*(1+z_cc))
-        
+    
     # Emission channels
     em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
     # Deal with edge effect
@@ -1644,8 +1664,9 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
         em = (wavl > max(em_range[0], wavl[0]+edge)) & (wavl < min(em_range[1], wavl[-1]-edge))
     
     # Continuum channels
+    w_c = max(10, min(3*w_l,15))
     con = (~em) & (wavl > wavl[0]+edge) & (wavl < wavl[-1]-edge) \
-                & ((wavl > (6584.+3*w_l)*(1+z_cc)) | (wavl < (6548.-3*w_l)*(1+z_cc)))
+                & ((wavl > (6584.+w_c)*(1+z_cc)) | (wavl < (6548.-w_c)*(1+z_cc)))
     
     if smooth:
         sigma = fwhm * gaussian_fwhm_to_sigma
@@ -1676,12 +1697,12 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
     
     if subtract:
         img_em = img_em - img_con
-
+    
     # Generate stddev map (only account for uncertainty in sky)
     std_em, std_con = measure_local_sky_noise(obj, [img_em, img_con], k1=k_apers[1], k2=k_apers[2])
     std_map_em, std_map_con = std_em * np.ones_like(img_em), std_con * np.ones_like(img_con)
     if verbose:
-        print("stddev emission: %.3f / continuum: %.3f"%(std_em, std_con))
+        print("image stddev emission: %.3f / continuum: %.3f"%(std_em, std_con))
     
 #     std_map_em, std_map_con = np.sqrt(abs(img_em) + std_map_em**2), np.sqrt(abs(img_con) + std_map_con**2)
 
@@ -1694,8 +1715,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                                       std_map_em=std_map_em, std_map_con=std_map_con, sn_thre=sn_thre)
        
     elif centroid_type == 'ISO-F':
-        seg_obj = dilation(obj.seg_obj)
-        res_cen = measure_offset_isoF(seg_obj, img_em, img_con, 
+        res_cen = measure_offset_isoF(obj.seg_obj, img_em, img_con, 
                                      std_map_em=std_map_em, std_map_con=std_map_con)
     else:
         raise NameError('Not given centorid_type')
@@ -1741,10 +1761,18 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                    "diff_angle_std":pa_std, "cen_offset_std":offset_std,
                    "pa":pa, "clus_cen_angle":clus_cen_angle,
                    "dist_clus_cen":dist_clus_cen}
+    res_measure['pos_em'] = [x1, y1]
+    res_measure['pos_con'] = [x2, y2]
+    res_measure['std_em'] = std_em
+    res_measure['std_con'] = std_con
     
     if return_image:
-        res_measure['img_em'] = img_em
-        res_measure['img_con'] = img_con
+        res_measure['img_em'] = img_em * res_cen['seg_em']
+        res_measure['img_con'] = img_con * res_cen['seg_con']
+    
+    # SNR of source on the image
+    res_measure['snr_em'] = np.sum(img_em * res_cen['seg_em'])/(std_em*np.sum(res_cen['seg_em']>0))
+    res_measure['snr_con'] = np.sum(img_con * res_cen['seg_con'])/(std_con*np.sum(res_cen['seg_con']>0))
     
     ###-----------------------------------###
     
@@ -1787,7 +1815,7 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2/\AA$)',fontsize=20)
             ax0.set_xlim(wavl[0]-20, wavl[-1]+20)
             ax0.text(0.8,0.85,"z = %.4f"%z_cc,color="k",fontsize=22,transform=ax0.transAxes)
-            ax0.text(0.05,0.85,"#%s%s"%(obj.number,field),color="k",fontsize=22,transform=ax0.transAxes)
+            ax0.text(0.05,0.85,"$\#%s%s$"%(obj.number,field),color="k",fontsize=22,transform=ax0.transAxes)
 
             i,j = img_em.shape[0] // 10, img_em.shape[1] // 10
 
@@ -1867,19 +1895,22 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             ax2.text(0.05,0.9, r"$\bf Continuum$",color="w",fontsize=18,transform=ax2.transAxes, zorder=4)
             ax3.text(0.05,0.9, r"$\bf Deep$",color="gold",fontsize=18,transform=ax3.transAxes, zorder=4)
 
-            ax2.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax2.transAxes)
-            ax2.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="lavender",fontsize=15,transform=ax2.transAxes)
             #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
             #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
             if np.ndim(coord_BCG)>0:
                 text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
                 ax2.text(0.85, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
+                pixel_scale = 1.24 # kpc/pix
+            else:
+                pixel_scale = 1.18 # kpc/pix
+            ax2.text(0.05,0.05,r"$\bf \theta:{\ }%.1f$"%diff_angle,color="lavender",fontsize=15,transform=ax2.transAxes)
+            ax2.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%(offset*pixel_scale),color="lavender",fontsize=15,transform=ax2.transAxes)
             plt.subplots_adjust(left=0.08,right=0.95,top=0.95, bottom=0.02, wspace=2.5, hspace=0.1)
             
         elif plot_style=='2':
-            plt.figure(figsize=(25,5))
+            gs_kw = dict(width_ratios=[8, 3, 3])
+            fig, (ax0,ax1,ax2) = plt.subplots(ncols=3, nrows=1, figsize=(24,5), constrained_layout=False, gridspec_kw=gs_kw)
 
-            ax0 = plt.subplot2grid((1, 16), (0, 0), colspan=8, rowspan=1)
             ax0.hlines(0, xmin=wavl[0]-50, xmax=wavl[-1]+50, color='k',
                        linewidth=2,linestyle='--', alpha=0.9)
             ax0.step(wavl, spec, color="k",  where='mid', alpha=0.7,lw=4)
@@ -1901,21 +1932,23 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
             ax0.set_ylabel('Flux (10$^{-17}$erg/s/cm$^2/\AA$)',fontsize=22)
             ax0.set_xlim(wavl[0]-20, wavl[-1]+20)
             ax0.text(0.8,0.85,"z = %.4f"%z_cc,color="k",fontsize=24,transform=ax0.transAxes)
-            ax0.text(0.03,0.85,"#%s%s"%(obj.number,field),color="k",fontsize=24,transform=ax0.transAxes)
+            ax0.text(0.03,0.85,r"$\#%s{\rm %s}$"%(obj.number, field),color="k",fontsize=24,transform=ax0.transAxes)
 
-            i,j = img_em.shape[0] // 10, img_em.shape[1] // 10
+            i,j = img_em.shape[0] // 4, img_em.shape[1] // 4
+            shape = img_em[i:-i+1, j:-j+1].shape
             
-            ax1 = plt.subplot2grid((1, 16), (0, 9), colspan=3, rowspan=1)
-            s1 = ax1.imshow(img_em[i:-i, j:-j], origin="lower",cmap="viridis",
-                            vmin=0.0, vmax=0.15)
-            colorbar(s1, pad=0.05, direction='in', length=10, labelsize=16)
+            s1 = ax1.imshow(img_em[i:-i+1, j:-j+1], origin="lower",cmap="viridis", aspect='equal',
+                            vmin=0.0, vmax=1.2*vmax_5sig(img_em[i:-i+1, j:-j+1]))
+            cb1 = colorbar(s1, pad=0.05, direction='in', length=10, labelsize=18)
+#             cb.ax.set_yticklabels(np.linspace(0, 2*vmax_5sig(img_con[i:-i, j:-j])),5)
+            cb1.set_ticks(np.around(np.linspace(0, 1.1*vmax_5sig(img_em[i:-i+1, j:-j+1]), 5),2))
 
-            ax1.contour(res_cen["seg_em"][i:-i, j:-j], colors="violet", levels = [0.5], alpha=0.9, linewidths=3.5)
+            ax1.contour(res_cen["seg_em"][i:-i+1, j:-j+1], colors="violet", levels = [0.5], alpha=0.95, linewidths=3.5)
             
-            ax2 = plt.subplot2grid((1, 16), (0, 13), colspan=3, rowspan=1)
-            s2 = ax2.imshow(img_con[i:-i, j:-j], origin="lower",cmap="hot",
-                            vmin=0.00, vmax=0.1)
-            colorbar(s2, pad=0.05, direction='in', length=10,labelsize=16)
+            s2 = ax2.imshow(img_con[i:-i+1, j:-j+1], origin="lower",cmap="inferno", aspect='equal',
+                            vmin=0.0, vmax=1.5*vmax_5sig(img_con[i:-i+1, j:-j+1]))
+            cb2 = colorbar(s2, pad=0.05, direction='in', length=10, labelsize=18)
+            cb2.set_ticks(np.around(np.linspace(0, 1.4*vmax_5sig(img_con[i:-i+1, j:-j+1]), 5),2))
 
             if centroid_type == "APER":
                 for k, (aper1, aper2) in enumerate(zip(aper_ems_eff,aper_cons_eff)):
@@ -1928,51 +1961,65 @@ def compute_centroid_offset(obj, spec, wavl, z_cc, wcs,
                 aper_con.plot(color='w',lw=3,axes=ax2,alpha=0.95)
             else:
                 if centroid_type == 'ISO-D':
-                    ax2.contour(res_cen["seg_con"][i:-i, j:-j], colors="w", levels = [0.5], alpha=0.9, linewidths=3)
+                    ax2.contour(res_cen["seg_con"][i:-i+1, j:-j+1], colors="w", levels = [0.5], alpha=0.95, linewidths=3)
 
             val_em_max = data_em.max()
-            ax2.contour(data_em[i:-i, j:-j], colors="skyblue", alpha=0.9, linewidths=3.5,
-                        levels=np.array([0.1,0.4,0.7,0.99]) * val_em_max)
+            ax2.contour(data_em[i:-i+1, j:-j+1], colors="skyblue", alpha=0.9, linewidths=2,
+                        levels=np.array([0.7]) * val_em_max)
+            ax2.contour(data_em[i:-i+1, j:-j+1], colors="skyblue", alpha=0.92, linewidths=2.5,
+                        levels=np.array([0.5]) * val_em_max)
+            ax2.contour(data_em[i:-i+1, j:-j+1], colors="skyblue", alpha=0.95, linewidths=3.,
+                        levels=np.array([0.1]) * val_em_max)
+            
+            # A2390/A2465
+            if np.ndim(coord_BCG)>0:
+                text, color = (r'$\bf NE$', 'lightcoral') if lab==1 else (r'$\bf SW$', 'thistle')
+                ax2.text(0.8, 0.88, text, color=color, fontsize=25, transform=ax2.transAxes)
+                pixel_scale = 1.24 # kpc/pix
+            else:
+                pixel_scale = 1.18 # kpc/pix
 
             # Ticks
-            tick_base = 10 if img_em.shape[0]<100 else 20
-            loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
+#             tick_base = 10 if img_em.shape[0]<100 else 20
+#             loc = plticker.MultipleLocator(base=tick_base) # puts ticks at regular intervals
             for ax in ([ax1, ax2]):
-                ax.grid()
-                plt.setp(ax.spines.values(), color='w')
-                plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
-                ax.xaxis.set_major_locator(loc)
-                ax.yaxis.set_major_locator(loc)
-                ax.tick_params(axis="y", color='k', width=2, direction="in", length=5, labelsize=18)
-                ax.tick_params(axis="x", color='k', width=2, direction="in", length=5, labelsize=18)
+#                 plt.setp(ax.spines.values(), color='w')
+#                 plt.setp([ax.get_xticklines(), ax.get_yticklines()], color='w')
+#                 ax.xaxis.set_major_locator(loc)
+#                 ax.yaxis.set_major_locator(loc)
+                ax.tick_params(axis="y", color='k', width=2, direction="in", length=5, labelsize=0)
+                ax.tick_params(axis="x", color='k', width=2, direction="in", length=5, labelsize=0)
 
-                ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=18)
-                ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=18)
-                ax.set_xlabel("X (pix)",fontsize=22)
+#                 ax.set_xticklabels(ax.get_xticks().astype("int")+obj.X_min,fontsize=18)
+#                 ax.set_yticklabels(ax.get_yticks().astype("int")+obj.Y_min,fontsize=18)
+#                 ax.set_xlabel("X (pix)",fontsize=22)
                 
                 cen_aper1 = EllipticalAperture(positions=(x1,y1), a=std_pos1[0], b=std_pos1[1], theta=0)   
                 cen_aper1.plot(color='violet',lw=1,ls="--",axes=ax,alpha=0.7)
                 cen_aper2 = EllipticalAperture(positions=(x2,y2), a=std_pos2[0], b=std_pos2[1], theta=0)   
                 cen_aper2.plot(color='w',lw=1,ls="--",axes=ax,alpha=0.7)   
 
-                ax.plot(x1-j, y1-i, color="violet", marker="o", ms=8, mew=3, mec="k", alpha=0.95, zorder=4)
-                ax.plot(x2-j, y2-i, color="w", marker="o", ms=8, mew=3, mec="k", alpha=0.95, zorder=3)
+                ax.plot(x1-j, y1-i, color="violet", marker="o", ms=8, mew=2, mec='k', alpha=0.95, zorder=4)
+                ax.plot(x2-j, y2-i, color="w", marker="o", ms=8, mew=2, mec='k', alpha=0.95, zorder=3)
+                a_ = np.linspace(-0.5, shape[1]-0.5,10)
+                b_ = np.linspace(-0.5, shape[0]-0.5,10)
+                ax.plot(a_, np.ones_like(a_)*(y1-i), '-', color="violet", alpha=0.95, zorder=1)
+                ax.plot(np.ones_like(b_)*(x1-j), b_, '-', color="violet", alpha=0.95, zorder=1)
+                ax.plot(a_, np.ones_like(a_)*(y2-i), '-', color="w", alpha=0.95, zorder=1)
+                ax.plot(np.ones_like(b_)*(x2-j), b_, '-', color="w", alpha=0.95, zorder=1)
+                draw_scale_bar(ax, X_bar=int(0.2*shape[1]), Y_bar=int(0.9*shape[0]), y_text=int(0.85*shape[0]),
+                               scale=5*u.kpc, pixel_scale=pixel_scale, fontsize=18, lw=6)
 
-            ax1.set_ylabel("Y (pix)",fontsize=22)
-            ax2.arrow(0.85,0.15,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
+#             ax1.set_ylabel("Y (pix)",fontsize=22)
+            ax2.arrow(0.2,0.16,-np.sin(clus_cen_angle*np.pi/180)/10,np.cos(clus_cen_angle*np.pi/180)/10,
                       edgecolor="orange", facecolor='none',
                       head_width=0.03, head_length=0.03,lw=4,transform=ax2.transAxes,alpha=0.95)
-            ax2.arrow(0.85,0.15,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,
+            ax2.arrow(0.2,0.16,-np.sin(pa*np.pi/180)/10,np.cos(pa*np.pi/180)/10,
                       edgecolor="lightblue", facecolor='none',
                      head_width=0.03, head_length=0.03,lw=4,transform=ax2.transAxes,alpha=0.95)
-
-            ax2.text(0.05,0.05,r"$\bf \theta:{\ }%.1f^{\circ}$"%diff_angle,color="whitesmoke",fontsize=20,transform=ax2.transAxes)
-            ax2.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%offset,color="whitesmoke",fontsize=20,transform=ax2.transAxes)
-            #mag_auto = -2.5*np.log10(obj.flux_auto) + mag0
-            #ax.text(0.05,0.9,"mag: %.1f"%mag_auto,color="lavender",fontsize=15,transform=ax.transAxes)
-            if np.ndim(coord_BCG)>0:
-                text, color = (r'$\bf NE$', 'thistle') if lab==1 else (r'$\bf SW$', 'thistle')
-                ax2.text(0.8, 0.9, text, color=color, fontsize=25, transform=ax.transAxes)
+        
+            ax1.text(0.05,0.05,r"$\bf \theta:{\ }%.1f^{\circ}$"%diff_angle,color="whitesmoke",fontsize=20,transform=ax1.transAxes)
+            ax1.text(0.05,0.15,r"$\bf \Delta\,d:{\ }%.2f$"%(offset*pixel_scale),color="whitesmoke",fontsize=20,transform=ax1.transAxes)
             plt.subplots_adjust(left=0.05,right=0.95,top=0.95, bottom=0.2, wspace=0.1, hspace=0.1)
             
     return res_measure
@@ -2002,7 +2049,7 @@ def measure_pa_offset(pos1, pos2, std_pos1=None, std_pos2=None, origin=0):
 #         offset_std = math.sqrt((x1-x2)**2*(std_x1_x2**2) + (y1-y2)**2*(std_y1_y2**2)) / offset
         offset_std = math.sqrt(((x1-x2)*std_x1_x2)**2 + ((y1-y2)*std_y1_y2)**2) / offset
     else:
-        pa_std, offset_std = 0, 0
+        pa_std, offset_std = 99, 99
         
     return (pa, pa_std), (offset, offset_std)
 
@@ -2150,7 +2197,7 @@ def set_sextractor_radius(table, sex_table):
     table['radius'] = np.array([radius[num==re.findall(r'\d+', str(ID))[0][0]]
                               for ID in table['ID']]).ravel()
     
-def stack_tables(tables, sex_tables=None, sep=3*u.arcsec):
+def stack_tables(tables, sex_tables=None, sep=2*u.arcsec):
     # stack measurement tables of different fields
     # tables : tables to stack, first one needs to be central
     # sex_tables : sextractor tables, the same order as tables

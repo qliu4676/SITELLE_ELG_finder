@@ -72,21 +72,6 @@ sub_cont = True if ("--SUB_CONT" in opts) else False
 save = True if ("--SAVE" in opts) else False
 plot = True if ("--PLOT" in opts) else False
 
-# if ("--SUB_CONT" in opts):
-#     sub_cont = True
-# else:
-#     sub_cont = False
-    
-# if ("--SAVE" in opts):
-#     save = True
-# else:
-#     save = False
-    
-# if ("--PLOT" in opts):
-#     plot = True
-# else:
-#     plot = False
-
 print("S/N = %.1f"%(sn_thre))
 print("Emission: %s"%(sum_type))
 print("Continuum Subtracted?: %s"%(sub_cont))
@@ -100,9 +85,7 @@ suffix += '_NB'
 
 # Collect File Path
 save_path = os.path.join(output_dir, name)
-centroid_path = os.path.join(output_dir, 'centroid', name)
 check_save_path(save_path)
-check_save_path(centroid_path)
     
 table_path = os.path.join(save_path, '%s_%s_lpf.dat'%(name, mode))
 seg_path = os.path.join(save_path, '%s_segm_%s_lpf.fits'%(name, mode))
@@ -194,3 +177,4 @@ if plot:
     ax2.hist(d_angle_d2-2, bins=np.linspace(0,180,8)-2,histtype="step",hatch="/", lw=4, alpha=0.7,label='ISO-2')
     ax2.hist(d_angle_dm2, bins=np.linspace(0,180,8),histtype="step", lw=4, hatch="", alpha=0.7,label='morph-2')
     ax2.legend()
+    plt.show()
