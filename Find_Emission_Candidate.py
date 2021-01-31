@@ -1,19 +1,31 @@
 """ 
 Search for Emission-line Galaxy (ELG) candidates in the SITELLE datacube
 
-Usage: 
-1. from jupyter notebook
-%run Find_Emission_Candidate.py "A2390C4new.fits" --NAME 'A2390C' -z 0.228 -m 'MMA' -v --OUT_DIR './output' --DEEP_FRAME "A2390C_deep.fits"
+======Usage======
+1. jupyter notebook/lab
+%run Find_Emission_Candidate.py "A2390C4new.fits" --NAME 'A2390C' -z 0.228 -v --OUT_DIR './output' --DEEP_FRAME "A2390C_deep.fits"
 
-2. from terminal
-python 
-python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -m MMA -v --OUT_DIR ./output --DEEP_FRAME A2390C_deep.fits
+2. terminal
+python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -v --OUT_DIR ./output --DEEP_FRAME A2390C_deep.fits
+
+======Keyword======
+
+-z: Redshift of the cluster.
+-v: Verbose print.
+-v: Verbose plot.
+--NAME: Name of the cluster (arbitrary string for identification).
+--OUT_DIR (optional): Output directory.
+--DEEP_FRAME (optional): Path of the deep frame.
+--WAVL_MASK (optional): Wavelength masked for sky lines (default: [[7950,8006], [8020,8040], [8230,8280]]).
+--sn_thre (optional): S/N threshold for source detection (default: 3).
+
 """
 
 import sys
 import getopt
-from pipeline import *
-from utils import *
+
+from elgfidner.pipeline import *
+from elgfidner.utils import *
     
 def main(argv):
     # Example File Path
