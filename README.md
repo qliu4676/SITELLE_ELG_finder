@@ -1,6 +1,6 @@
 # SITELLE ELG Finder
 
-Search for Emission-line Galaxy (ELG) candidates in the SITELLE datacube.
+Search for Emission-line Galaxy (ELG) candidates in SITELLE datacubes using cross-correlation.
 
 Installation
 ------------
