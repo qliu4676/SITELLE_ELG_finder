@@ -44,11 +44,13 @@ Keyword
 
 -z: Redshift of the cluster.
 
--v: Verbose print.
-
--v: Verbose plot.
-
 --NAME: Name of the cluster (arbitrary string for identification).
+
+-v: Verbose print (default: False).
+
+-p: Verbose plot (default: False).
+
+-w: write ELG list to txt table
 
 --OUT_DIR (optional): Output directory.
 
