@@ -12,7 +12,7 @@ python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -v --OU
 
 -z: Redshift of the cluster.
 -v: Verbose print.
--v: Verbose plot.
+-p: Verbose plot.
 --NAME: Name of the cluster (arbitrary string for identification).
 --OUT_DIR (optional): Output directory.
 --DEEP_FRAME (optional): Path of the deep frame.
