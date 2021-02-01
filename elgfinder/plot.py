@@ -9,7 +9,6 @@ from matplotlib import patches
 
 plt.rcParams['text.usetex'] = True
 plt.rcParams['image.origin'] = 'lower'
-plt.rcParams["font.serif"] = "Times New Roman"
 rcParams.update({'xtick.major.pad': '6.0'})
 rcParams.update({'xtick.major.size': '8'})
 rcParams.update({'xtick.major.width': '1.2'})
@@ -22,8 +21,8 @@ rcParams.update({'ytick.major.width': '1.2'})
 rcParams.update({'ytick.minor.pad': '6.0'})
 rcParams.update({'ytick.minor.size': '6'})
 rcParams.update({'ytick.minor.width': '1.0'})
-rcParams.update({'axes.labelsize': 20})
-rcParams.update({'font.size': 20})
+rcParams.update({'axes.labelsize': 14})
+rcParams.update({'font.size': 14})
 
 def colorbar(mappable, pad=0.2, size="5%", loc="right",
              direction='out', labelsize=10, length=10, **kwargs):

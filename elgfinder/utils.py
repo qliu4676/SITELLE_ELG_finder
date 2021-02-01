@@ -92,11 +92,11 @@ def coord_Array2Im(x_arr, y_arr, origin=1):
 
 def check_save_path(dir_name, clear=False):
     if not os.path.exists(dir_name):
-        print("%s does not exist. Make a new directory."%dir_name)
+        print("     Directory %s does not exist. Make a new directory."%dir_name)
         os.makedirs(dir_name)
     else:
         if clear:
-            print("%s exists. Remove all the content."%dir_name)
+            print("     Directory %s exists. Remove all the content."%dir_name)
             filelist = glob.glob(os.path.join(dir_name,'*'))
             [os.remove(f) for f in filelist]
 

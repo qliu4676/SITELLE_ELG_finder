@@ -16,13 +16,14 @@ python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -v --OU
 --NAME: Name of the cluster (arbitrary string for identification).
 --OUT_DIR (optional): Output directory.
 --DEEP_FRAME (optional): Path of the deep frame.
---WAVL_MASK (optional): Wavelength masked for sky lines (default: [[7950,8006], [8020,8040], [8230,8280]]).
 --sn_thre (optional): S/N threshold for source detection (default: 3).
-
+--WAVL_MASK (optional): Wavelength masked for sky lines (default: [[7950,8006], [8020,8040], [8230,8280]]).
+--SAVE_PRODUCTS (optional): Whether to save intermediate products for check (default: False).
 """
 
 import sys
 import getopt
+import logging
 
 from elgfinder.pipeline import *
 from elgfinder.utils import *
@@ -55,6 +56,7 @@ def main(argv):
     # Default Arguments
     plot_verbose = False
     verbose = False
+    save_products = False
     
     # Initial Full Run
     PROC_RAW, EXTR_SPEC, MAKE_TEMP, CROS_CORR, PLOT_CAND = [True] * 5
@@ -67,7 +69,8 @@ def main(argv):
                                         "OUT_DIR=", "DEEP_FRAME=", "skip=",
                                         "BOX_SIZE=", "KERNEL_SIZE=", "SN_THRE=", 
                                         "N_LEVELS=", "CONTRAST=", "MMA_BOX=", 
-                                        "VERBOSE", "PLOT_VERBOSE", "WRITE", "suffix"])
+                                        "VERBOSE", "PLOT_VERBOSE", "WRITE",
+                                        "SAVE_PRODUCTS", "suffix"])
         opts = [opt for opt, arg in optlists]        
         
     except getopt.GetoptError:
@@ -98,7 +101,6 @@ def main(argv):
             box_size = np.int(arg)
         elif opt in ("-K","--KERNEL_SIZE"):
             kernel_size = np.array(re.findall(r"\d*\.\d+|\d+", arg), dtype=int)
-            print(kernel_size)
         elif opt in ("--SN_THRE"):
             sn_thre = np.float(arg)
         elif opt in ("--N_LEVELS"):
@@ -112,6 +114,7 @@ def main(argv):
             
     if ("--VERBOSE" in opts)|('-v' in opts): verbose = True
     if ("--PLOT_VERBOSE" in opts)|('-p' in opts): plot_verbose = True
+    if "--SAVE_PRODUCTS" in opts: save_products = True
     if ("--WRITE" in opts)|('-w' in opts):
         PROC_RAW, EXTR_SPEC, MAKE_TEMP, CROS_CORR, PLOT_CAND = [False] * 5
         WRITE_TABLE = True
@@ -127,7 +130,17 @@ def main(argv):
     template_path = os.path.join(output_dir, 'template')
     CC_res_path = os.path.join(save_path, '%s-cc-%s_lpf.pkl'%(name, mode))
     candidate_path = os.path.join(save_path, 'pic/candidate_%s_lpf'%mode)
-
+    
+    if WRITE_TABLE:
+        log_filename = filename='{0}_write_table.log'.format(name)
+    else:
+        log_filename = filename='{0}.log'.format(name)
+    logging.basicConfig(level=logging.INFO,
+                        handlers=[logging.StreamHandler(sys.stdout),
+                        logging.FileHandler(log_filename, mode='w')])
+    logger = logging.getLogger(log_filename)
+    print("Wavelength", wavl_mask, "will be masked & flagged.")
+    
     #################################################
     # 1. Read raw cube and remove background + fringe
     #################################################
@@ -237,7 +250,7 @@ def main(argv):
         for line in ["Ha-NII", "Hb-OIII", "OII"]:
             datacube.cross_correlation_all(temp_type=line, temp_model="gauss",
                                            edge=20, verbose=False)
-        print("Cross-correlation Finished!\n")
+        logger.info("Cross-correlation Finished!\n")
  
         # Save CC results
         datacube.save_cc_result(save_path=save_path, suffix="_lpf")
@@ -307,7 +320,7 @@ def main(argv):
                     & (SNR_best_OII_gauss > 3) & (z_best_OIII_gauss > zmin_OIII)
 
         # Plot
-        print("\nSeparate candidates into three subsamples based on S/N.")
+        logger.info("\nSeparate candidates into three subsamples based on S/N.")
         SN_cond_v = {'A':SNR_cond_A, 'B':SNR_cond_B, 'C':SNR_cond_C}
         type_v = {'A':"Ha-NII", 'B':"Ha-NII", 'C':"Hb-OIII"}
 
@@ -319,7 +332,7 @@ def main(argv):
             num_c = np.setdiff1d(num_c, np.concatenate([cat_match["NUMBER"].data,
                                                         datacube.num_spurious]))
             if verbose:
-                print("%s: %d candidates:\n"%(v, len(num_c)), num_c)
+                print("%s: %d candidates:\n"%(v, len(num_c)))
 
             if save:
                 check_save_path(candidate_path+'/%s'%v, clear=True)
@@ -339,6 +352,12 @@ def main(argv):
 
         if save:
             check_save_path(candidate_path+'/V', clear=True)
+        
+        if not save_products:
+            for file in os.listdir(save_path):
+                if file.endswith(".fits"):
+                    os.remove(os.path.join(save_path, file))
+            
     
     #################################################
     # 5. Save list to table
@@ -356,10 +375,11 @@ def main(argv):
         Num_V = np.sort(np.array([re.compile(r'\d+').findall(el)[-1] for el in dir_V]).astype("int"))
         
         if len(Num_V)==0:
-            use_all = input("%s is empty. Apply visual inspection? [y/n]"%candidate_path_V)
+            use_all = input("Directory %s is empty. Apply visual inspection? [y/n]"%candidate_path_V)
             if use_all == 'y':
-                sys.exit("Check %s and manually copy candidate png to %s/V/"\
+                logger.warning("Check %s and manually copy candidate png to %s/V/"\
                          %(candidate_path, candidate_path))
+                return None
             else:
                 candidate_path_sub = os.path.join(candidate_path,"?/%s#*.png"%name)
                 dir_V = glob.glob(candidate_path_sub)
@@ -374,14 +394,14 @@ def main(argv):
         
         f_name = os.path.join(save_path,'%s_ELG_list%s.txt'%(name,suffix))
         table_target.write(f_name, format='ascii', overwrite=True)
-        print("Save candidate list as :", f_name)
+        logging.info("Save candidate list to: %s"%f_name)
         
     # Execute
-    process_raw_cube() if PROC_RAW else print("Skip processing raw datacube.")
-    extract_spectra() if EXTR_SPEC else print("Skip extraction of spectra.")
-    build_template() if MAKE_TEMP else print("Skip building template.")
-    cross_correlation() if CROS_CORR else print("Skip cross-correlation.")
-    save_candidate(save=True) if PLOT_CAND else print("Skip ploting ELG candidate.")
+    process_raw_cube() if PROC_RAW else logger.info("Skip processing raw datacube.")
+    extract_spectra() if EXTR_SPEC else logger.info("Skip extraction of spectra.")
+    build_template() if MAKE_TEMP else logger.info("Skip building template.")
+    cross_correlation() if CROS_CORR else logger.info("Skip cross-correlation.")
+    save_candidate(save=True) if PLOT_CAND else logger.info("Skip ploting ELG candidate.")
         
     if WRITE_TABLE: write_table(suffix)
 
