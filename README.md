@@ -24,7 +24,13 @@ Usage
 python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -v --OUT_DIR ./output --DEEP_FRAME A2390C_deep.fits
 ```
 
-Three ELG samples are generated:   A - high S/N Hα+NII candidates   B - low S/N Hα+NII candidates   C - (possible) OII+Hβ
+Three ELG samples are generated:   
+
+A - high S/N Hα+NII candidates   
+
+B - low S/N Hα+NII candidates   
+
+C - (possible) OII+Hβ
 
 When cross-correlation is done, visual inspection is needed by removing dubious objects (delete png) in the directories. Then copy all objects to V and run (e.g. in jupyter notebook):
 ```python
