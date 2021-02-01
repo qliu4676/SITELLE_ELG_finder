@@ -24,8 +24,8 @@ python Find_Emission_Candidate.py A2390C4new.fits --NAME A2390C -z 0.228 -v --OU
 import sys
 import getopt
 
-from elgfidner.pipeline import *
-from elgfidner.utils import *
+from elgfinder.pipeline import *
+from elgfinder.utils import *
     
 def main(argv):
     # Example File Path
@@ -37,7 +37,7 @@ def main(argv):
     name = 'A2390C'
     z0 = 0.228
     
-    # masked wavelength not in use (with strong sky emission)
+    # Masked wavelength not in use (with strong sky emission)
     wavl_mask = [[7950,8006], [8020,8040], [8230,8280]]
     
     # Parameter for Processing Raw Datacube
@@ -56,11 +56,8 @@ def main(argv):
     plot_verbose = False
     verbose = False
     
-    PROC_RAW = True
-    EXTR_SPEC = True
-    MAKE_TEMP = True
-    CROS_CORR = True
-    PLOT_CAND = True
+    # Initial Full Run
+    PROC_RAW, EXTR_SPEC, MAKE_TEMP, CROS_CORR, PLOT_CAND = [True] * 5
     WRITE_TABLE = False
     
     # Get Script Options
@@ -344,7 +341,7 @@ def main(argv):
             check_save_path(candidate_path+'/V', clear=True)
     
     #################################################
-    # 5. Save to table
+    # 5. Save list to table
     #################################################
     
     def write_table(suffix=""):
@@ -359,9 +356,9 @@ def main(argv):
         Num_V = np.sort(np.array([re.compile(r'\d+').findall(el)[-1] for el in dir_V]).astype("int"))
         
         if len(Num_V)==0:
-            use_all = input("%s is empty. Use visual inspection? [y/n]"%candidate_path_V)
+            use_all = input("%s is empty. Apply visual inspection? [y/n]"%candidate_path_V)
             if use_all == 'y':
-                sys.exit("Check %s and manually move candidate to %s/V/"\
+                sys.exit("Check %s and manually copy candidate png to %s/V/"\
                          %(candidate_path, candidate_path))
             else:
                 candidate_path_sub = os.path.join(candidate_path,"?/%s#*.png"%name)

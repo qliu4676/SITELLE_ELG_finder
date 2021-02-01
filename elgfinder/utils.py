@@ -43,7 +43,7 @@ rand_cmap.colors[0] = [0,0,0]
 import warnings
 from photutils.utils import NoDetectionsWarning
 
-from plot import *
+from .plot import *
 
 ############################################
 # Basic

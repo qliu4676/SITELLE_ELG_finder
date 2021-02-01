@@ -317,7 +317,7 @@ class Raw_Datacube:
         self.datacube_bkg_sub = np.empty_like(raw_cube)
         
         if parallel:
-            from parallel import parallel_compute
+            from .parallel import parallel_compute
             from functools import partial
             print('(Run background subtraction in parallel)')
             p_bkg_sub_SE = partial(background_sub_SE, mask=mask, return_rms=False,
@@ -407,7 +407,7 @@ class Raw_Datacube:
         n_source = 0
         
         if (method=="LPF") & parallel:
-            from parallel import parallel_compute
+            from .parallel import parallel_compute
             from functools import partial
             if verbose:
                 print("(Run low-pass filtering in parallel, recommended when running it on > 20 channels)")
@@ -658,7 +658,7 @@ class Read_Datacube:
             if parallel:
                 print("Run MMA in parallel. Might be slower using few cores.")
                 
-                from parallel import parallel_compute
+                from .parallel import parallel_compute
                 from functools import partial
                 
                 
@@ -1210,7 +1210,7 @@ class Read_Datacube:
                                const_window=False, 
                                cores=None, verbose=True):
         
-        from parallel import parallel_compute
+        from .parallel import parallel_compute
         from functools import partial
         
         CC_result = {}
