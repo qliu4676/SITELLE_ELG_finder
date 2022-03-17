@@ -282,7 +282,8 @@ class Raw_Datacube:
         # Display a image
         plt.figure(figsize=(12,12))
         norm = ImageNormalize(stretch=AsinhStretch(a=a))
-        plt.imshow(img, vmin=0.,vmax=vmax, norm=norm, origin="lower",cmap="gray")
+        #plt.imshow(img, vmin=0.,vmax=vmax, norm=norm, origin="lower",cmap="gray")
+        plt.imshow(img, vmin=0.,vmax=vmax, origin="lower",cmap="gray")
         
     def save_mask_edge(self, save_path = './'):
         # Save the edge mask to be read later
@@ -1194,7 +1195,7 @@ class Read_Datacube:
                              const_window=const_window, 
                              plot=plot, fig=fig, axes=axes)
         
-        if plot: plt.tight_layout()
+        # if plot: plt.tight_layout()
             
         if verbose:
             print ("Detection #%d  z: %.3f  sigma: %.3f  Peak R: %.3f  Detction S/N: %.3f Peak S/N: %.3f" \
@@ -1495,11 +1496,10 @@ class Read_Datacube:
         nums = self.obj_nums
         EWs = np.zeros(len(nums))
         EW_stds = np.zeros(len(nums))
-        
-        if sigma is None:
-            sigma = sigma_bests[k]
             
         for k, num in enumerate(nums):
+            if sigma is None:
+                sigma = sigma_bests[k]
             EWs[k], EW_stds[k] = self.estimate_EW(num, z=z_bests[k],
                                                   temp_type=temp_type,
                                                   temp_model=temp_model,
@@ -1507,7 +1507,6 @@ class Read_Datacube:
                                                   edge=edge, sigma=sigma,
                                                   use_cont_fit=use_cont_fit,
                                                   plot=False)
-
         self.EWs = EWs
         self.EW_stds = EW_stds
         
@@ -1572,14 +1571,17 @@ class Read_Datacube:
 
         if hasattr(self, "src_map"):
             cutout = self.get_cutout(num, self.src_map, bounds=bounds, cen_pos=(X_cen, Y_cen))
-            ax4.imshow(cutout, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.src_map), vmax=2*vmax_5sig(self.src_map))
+            #ax4.imshow(cutout, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.src_map), vmax=2*vmax_5sig(self.src_map))
+            ax4.imshow(cutout, origin="lower", vmin=np.median(self.src_map), vmax=2*vmax_5sig(self.src_map))
         
         cutout_stack = self.get_cutout(num, self.stack_field, bounds=bounds, cen_pos=(X_cen, Y_cen))
-        ax5.imshow(cutout_stack, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.stack_field), vmax=2*vmax_5sig(self.stack_field))
+        #ax5.imshow(cutout_stack, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.stack_field), vmax=2*vmax_5sig(self.stack_field))
+        ax5.imshow(cutout_stack, origin="lower", vmin=np.median(self.stack_field), vmax=2*vmax_5sig(self.stack_field))
         
         if self.deep_frame is not None:
             cutout_deep = self.get_cutout(num, self.deep_frame, bounds=bounds, cen_pos=(X_cen, Y_cen))
-            ax6.imshow(cutout_deep, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.deep_frame)-1, vmax=5e3)
+            #ax6.imshow(cutout_deep, norm=AsinhNorm(a=0.01), origin="lower", vmin=np.median(self.deep_frame)-1, vmax=5e3)
+            ax6.imshow(cutout_deep, origin="lower", vmin=np.median(self.deep_frame)-1, vmax=5e3)
         else:
             ax6.set_visible(False)
 
@@ -1593,7 +1595,7 @@ class Read_Datacube:
             ax.set_xlabel("X (pix)")
             ax.set_ylabel("Y (pix)")
             
-        plt.tight_layout()
+        # plt.tight_layout()
 
     
     def read_cluster_boundary(self, filepath):

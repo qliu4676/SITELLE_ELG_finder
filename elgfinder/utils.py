@@ -122,7 +122,7 @@ def query_vizier(catalog_name, RA, DEC, radius, columns, column_filters, unit=(u
     viz_filt = Vizier(columns=columns, column_filters=column_filters)
     viz_filt.ROW_LIMIT = -1
 
-    field_coords = SkyCoord(RA + " " + DEC , unit=unit)
+    field_coords = SkyCoord(RA,DEC, unit=unit)
 
     result = viz_filt.query_region(field_coords, 
                                    radius=radius, 
